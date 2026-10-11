@@ -6,6 +6,11 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **`gsplat_photos` no longer drops photos a pixel off the common size.**
+  Photos whose scaled size is within 1% of the most common one are resized
+  to it instead of being dropped. ETH3D courtyard's undistorted images come
+  in four sizes a few pixels apart, and 14 of its 38 photos were lost,
+  splitting the scene into fragments.
 - **`gsplat_photos` panicked on large photo sets** (wgpu: descriptor bank
   over `max_storage_buffer_binding_size`, e.g. 1,940 photos x 4,000 SIFT);
   it now matches in blocks. The trainer's logged L1 no longer rounds to 0

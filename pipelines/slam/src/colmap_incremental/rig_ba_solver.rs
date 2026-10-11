@@ -478,6 +478,25 @@ fn pcg_relative_tolerance() -> f64 {
             .unwrap_or(PCG_RELATIVE_TOLERANCE)
     })
 }
+/// Edge chunks of the bundle-adjustment PCG product, each with its own
+/// accumulator; fixed so the summation order does not depend on the thread
+/// count.
+const PCG_MATVEC_CHUNKS: usize = 64;
+/// Whether the bundle-adjustment PCG product reads its off-diagonal blocks
+/// in f32 (the default) instead of f64; `VISLOC_PORT_PCG_F64_BLOCKS=1`
+/// keeps f64. The product is memory-bound, so halving the bytes nearly
+/// halves its time. The diagonal, the preconditioner and every vector stay
+/// f64, and the per-entry rounding (~6e-8 relative) is far below the 1e-2
+/// residual the solve stops at. On a SmallCity mapper replay a PCG
+/// iteration took 5.6 ms instead of 11.8 ms. Iteration counts matched
+/// while the runs stayed on the same path, and the mapper took 836 s
+/// instead of 1,122 s for the f64 product that read both triangles. It
+/// registered 5,581 images instead of 5,599, with a median camera-centre
+/// difference of 0.19 % of the scene extent.
+fn pcg_f32_blocks() -> bool {
+    static F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F32.get_or_init(|| std::env::var("VISLOC_PORT_PCG_F64_BLOCKS").map_or(true, |v| v != "1"))
+}
 /// Iteration cap of [`pcg_blocks6`] (Ceres' `max_linear_solver_iterations`).
 const PCG_MAX_ITERATIONS: usize = 500;
 
@@ -1484,55 +1503,41 @@ fn solve_step(
     }
 
     if n_free >= iterative_min_free_frames() && order.is_none() {
-        // Iterative solve: the symmetric block rows straight from the edge
-        // list, built per row in parallel. Row `i` is its left blocks
-        // (edges `(a, i)`, ascending a), the diagonal, then its right
-        // blocks (edges `(i, b)`, ascending b, transposed): the rows, in
-        // the order, that `pcg_blocks6` derives from the column map.
-        let mut left_off = vec![0usize; n_free + 1];
-        for &(_, b) in edges {
-            left_off[b as usize + 1] += 1;
-        }
-        for i in 0..n_free {
-            left_off[i + 1] += left_off[i];
-        }
-        let mut left = vec![0u32; edges.len()];
-        let mut fill = left_off.clone();
-        for (e, &(_, b)) in edges.iter().enumerate() {
-            left[fill[b as usize]] = e as u32;
-            fill[b as usize] += 1;
-        }
-        // Edges ascend by (a, b): row a's right blocks are contiguous.
-        let mut right_off = vec![0usize; n_free + 1];
-        for &(a, _) in edges {
-            right_off[a as usize + 1] += 1;
-        }
-        for i in 0..n_free {
-            right_off[i + 1] += right_off[i];
-        }
-        let rows: Vec<Vec<(usize, Matrix6<f64>)>> = (0..n_free)
-            .into_par_iter()
-            .map(|i| {
-                let lefts = &left[left_off[i]..left_off[i + 1]];
-                let mut row = Vec::with_capacity(lefts.len() + 1 + right_off[i + 1] - right_off[i]);
-                row.extend(
-                    lefts
-                        .iter()
-                        .map(|&e| (edges[e as usize].0 as usize, flat_offdiag[e as usize])),
-                );
-                row.push((i, frame_diag[i]));
-                row.extend(
-                    (right_off[i]..right_off[i + 1])
-                        .map(|e| (edges[e].1 as usize, flat_offdiag[e].transpose())),
-                );
-                row
-            })
-            .collect();
+        // Iterative solve straight from the edge list: each off-diagonal
+        // block is read once per product, contributing to both of its
+        // rows (`y_b += A x_a`, `y_a += Aᵀ x_b`). The product is limited by
+        // memory traffic, and storing both triangles read every block
+        // twice. The edges are cut into a fixed number of chunks, each
+        // accumulating into its own vector, summed in chunk order, so the
+        // result does not depend on the thread count. The blocks are read
+        // in f32 unless `VISLOC_PORT_PCG_F64_BLOCKS=1` ([`pcg_f32_blocks`]).
+        let blocks32: Option<Vec<nalgebra::Matrix6<f32>>> =
+            pcg_f32_blocks().then(|| flat_offdiag.par_iter().map(|m| m.cast::<f32>()).collect());
+        let n_chunks = PCG_MATVEC_CHUNKS.min(edges.len().max(1));
+        let bounds: Vec<usize> = (0..=n_chunks).map(|c| c * edges.len() / n_chunks).collect();
         let matvec = |x: &[Vector6<f64>]| -> Vec<Vector6<f64>> {
-            rows.par_iter()
-                .map(|row| {
-                    row.iter()
-                        .fold(Vector6::zeros(), |acc, (j, blk)| acc + blk * x[*j])
+            let parts: Vec<Vec<Vector6<f64>>> = (0..n_chunks)
+                .into_par_iter()
+                .map(|c| {
+                    let mut y = vec![Vector6::zeros(); n_free];
+                    for e in bounds[c]..bounds[c + 1] {
+                        let (a, b) = (edges[e].0 as usize, edges[e].1 as usize);
+                        let blk = match &blocks32 {
+                            Some(blocks) => blocks[e].cast::<f64>(),
+                            None => flat_offdiag[e],
+                        };
+                        y[b] += blk * x[a];
+                        y[a] += blk.tr_mul(&x[b]);
+                    }
+                    y
+                })
+                .collect();
+            (0..n_free)
+                .into_par_iter()
+                .map(|i| {
+                    parts
+                        .iter()
+                        .fold(frame_diag[i] * x[i], |acc, part| acc + part[i])
                 })
                 .collect()
         };

@@ -179,6 +179,13 @@ All notable changes to `visloc-rs` will be documented here.
     camera-centre difference of 0.2% of the scene extent, which is within
     the spread of the other solver variants tried.
     `VISLOC_PORT_PCG_TOL=1e-3` restores the previous tolerance.
+  - The PCG product reads each camera-pair block once, in f32, instead of
+    reading both triangles in f64. On a SmallCity mapper replay a PCG
+    iteration takes 5.6 ms instead of 18.5 ms, PCG time drops from 414 s
+    to 144 s and the mapper from 1,122 s to 836 s. The main model
+    registers 5,581 images instead of 5,599, with a median camera-centre
+    difference of 0.19% of the scene extent.
+    `VISLOC_PORT_PCG_F64_BLOCKS=1` keeps f64 blocks.
 
   On SmallCity the main model keeps 5,569 of 5,583 images (scattered
   marginal frames swap in and out) and 956,701 of 957,418 points, with

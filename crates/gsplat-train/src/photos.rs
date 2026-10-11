@@ -363,14 +363,31 @@ pub fn build_photo_dataset(
         .max_by_key(|c| c.len())
         .map(|c| c[0])
         .expect("at least 3 images");
+    // Sizes within 1% of it (undistorted crops a few pixels apart, which can
+    // round to a different size after scaling) are resized to it; the rest
+    // are dropped.
+    let near = |(w, h): (u32, u32)| {
+        w.abs_diff(width) as f64 <= 0.01 * width as f64
+            && h.abs_diff(height) as f64 <= 0.01 * height as f64
+    };
+    let mut resized = 0usize;
     let (files, decoded): (Vec<_>, Vec<_>) = files
         .into_iter()
         .zip(decoded)
-        .filter(|(_, d)| d.0.dimensions() == (width, height))
+        .filter(|(_, d)| near(d.0.dimensions()))
+        .map(|(f, (img, f35))| {
+            if img.dimensions() == (width, height) {
+                return (f, (img, f35));
+            }
+            resized += 1;
+            let img =
+                image::imageops::resize(&img, width, height, image::imageops::FilterType::Triangle);
+            (f, (img, f35))
+        })
         .unzip();
     let n = files.len();
     log(&format!(
-        "{n} images at {width}x{height} (others dropped: {})",
+        "{n} images at {width}x{height} ({resized} resized from within 1%; others dropped: {})",
         sizes.len() - n
     ));
     let long = width.max(height) as f64;

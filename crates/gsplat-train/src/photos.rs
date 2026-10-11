@@ -52,9 +52,11 @@ pub struct PhotoSfmConfig {
     /// bundle adjustments dominate the SfM time on large models).
     pub refine_intrinsics_max_images: usize,
     /// Past `exhaustive_max`, also match every image with its `retrieval_k`
-    /// most similar images by VLAD appearance (0: window only). Connects
-    /// revisits that are far apart in file order, e.g. several passes
-    /// through the same streets.
+    /// most similar images by VLAD appearance (0: window only), among the
+    /// images more than `window` positions away in file order. The window
+    /// already pairs the near ones, which would otherwise take most of the
+    /// `k` slots. Connects revisits that are far apart in file order, e.g.
+    /// several passes through the same streets.
     pub retrieval_k: usize,
     /// Extra SIFT `key=value` settings (see `euroc::apply_sift_override`),
     /// e.g. `affine=1` / `domain_size_pooling=1` for wide-baseline captures.
@@ -115,9 +117,10 @@ type MatchedChunk<'a> = (&'a [(usize, usize)], Vec<Vec<DescriptorMatch>>);
 const IMAGE_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "JPG"];
 
 /// Image pairs `(i, j)`, `i < j`, joining every image to its `k` most similar
-/// images by the cosine similarity of VLAD descriptors over a 64-word
-/// vocabulary built from a subsample of all descriptors.
-fn retrieval_pairs(features: &[FeatureSet], k: usize) -> Vec<(usize, usize)> {
+/// images more than `skip_within` positions away, by the cosine similarity
+/// of VLAD descriptors over a 64-word vocabulary built from a subsample of
+/// all descriptors.
+fn retrieval_pairs(features: &[FeatureSet], k: usize, skip_within: usize) -> Vec<(usize, usize)> {
     use visloc_vision::place_recognition::{vlad, Vocabulary};
     // About 100k descriptors for the vocabulary, evenly from every image.
     let total: usize = features.iter().map(|f| f.descriptors.len()).sum();
@@ -133,15 +136,16 @@ fn retrieval_pairs(features: &[FeatureSet], k: usize) -> Vec<(usize, usize)> {
         .par_iter()
         .map(|f| vlad(&f.descriptors, &vocab))
         .collect();
-    top_k_similar_pairs(&global, k)
+    top_k_similar_pairs(&global, k, skip_within)
 }
 
 /// Pairs `(i, j)`, `i < j`, joining every row of `global` to the `k` rows
-/// with the largest dot product. The similarities are computed as blocks of
+/// more than `skip_within` rows away with the largest dot product. The
+/// similarities are computed as blocks of
 /// `global · globalᵀ` (a GEMM per block of rows), not row by row: a
 /// row-by-row scan streams every descriptor once per image, which is
 /// memory-bound past a few thousand images.
-fn top_k_similar_pairs(global: &[Vec<f32>], k: usize) -> Vec<(usize, usize)> {
+fn top_k_similar_pairs(global: &[Vec<f32>], k: usize, skip_within: usize) -> Vec<(usize, usize)> {
     const ROWS: usize = 64;
     let n = global.len();
     let dim = global.first().map_or(0, Vec::len);
@@ -160,7 +164,7 @@ fn top_k_similar_pairs(global: &[Vec<f32>], k: usize) -> Vec<(usize, usize)> {
             (r0..r1)
                 .flat_map(|i| {
                     let mut row: Vec<(f32, usize)> = (0..n)
-                        .filter(|&j| j != i)
+                        .filter(|&j| i.abs_diff(j) > skip_within)
                         .map(|j| (sims[(i - r0, j)], j))
                         .collect();
                     let kk = k.min(row.len());
@@ -504,7 +508,7 @@ pub fn build_photo_dataset(
             .collect();
         if cfg.retrieval_k > 0 {
             let t = std::time::Instant::now();
-            let extra = retrieval_pairs(&features, cfg.retrieval_k);
+            let extra = retrieval_pairs(&features, cfg.retrieval_k, cfg.window);
             let before = pairs.len();
             pairs.extend(extra);
             log(&format!(
@@ -667,6 +671,14 @@ pub fn build_photo_dataset(
         pairwise.extend(v);
         verify_s += secs;
     }
+    log(&format!(
+        "verified pairs beyond the {}-image window: {}",
+        cfg.window,
+        pairwise
+            .iter()
+            .filter(|p| p.image_i.abs_diff(p.image_j) > cfg.window)
+            .count()
+    ));
     log(&format!(
         "{} verified of {} candidate pairs ({:.1} s; overlapped: match {:.1} s, verify {:.1} s)",
         pairwise.len(),
@@ -934,12 +946,24 @@ mod tests {
         let global = pseudo_random_rows(150, 96);
         for k in [1, 5, 30] {
             assert_eq!(
-                super::top_k_similar_pairs(&global, k),
+                super::top_k_similar_pairs(&global, k, 0),
                 naive_top_k(&global, k),
                 "k = {k}"
             );
         }
-        assert!(super::top_k_similar_pairs(&global[..1], 5).is_empty());
+        assert!(super::top_k_similar_pairs(&global[..1], 5, 0).is_empty());
+    }
+
+    #[test]
+    fn top_k_skips_rows_within_the_window() {
+        let global = pseudo_random_rows(150, 96);
+        let pairs = super::top_k_similar_pairs(&global, 5, 20);
+        assert!(pairs.iter().all(|&(i, j)| j - i > 20));
+        // Every row still gets its 5 picks (each pair may serve both rows).
+        for i in 0..150 {
+            let own = pairs.iter().filter(|&&(a, b)| a == i || b == i).count();
+            assert!(own >= 5, "row {i}: {own} pairs");
+        }
     }
 
     /// SmallCity-sized similarity search (5,822 VLAD vectors of 64 x 128).
@@ -950,7 +974,7 @@ mod tests {
     fn retrieval_bench() {
         let global = pseudo_random_rows(5822, 64 * 128);
         let t = std::time::Instant::now();
-        let fast = super::top_k_similar_pairs(&global, 30);
+        let fast = super::top_k_similar_pairs(&global, 30, 0);
         let tf = t.elapsed().as_secs_f64();
         let t = std::time::Instant::now();
         let slow = naive_top_k(&global, 30);

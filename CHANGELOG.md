@@ -136,6 +136,19 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **`gsplat_photos --retrieval` skips the window's own neighbours.** The
+  VLAD top-k used to rank every image. On the SmallCity capture, three
+  quarters of the k slots went to images already paired by the sliding
+  window, leaving the four passes around the block weakly tied. They drifted
+  apart in scale by up to 11%, and passes 2 and 3 bent by metres. Retrieval
+  now picks its k among images more than `--window` positions away, which
+  adds 126,641 pairs instead of 44,063, with matching time unchanged. Scored
+  against the release's own COLMAP model by camera centres after a Sim(3)
+  alignment: median error 1.82 m -> 0.88 m, p90 3.49 m -> 2.03 m, max
+  8.71 m -> 3.36 m. Within-pass error drops from 1.80 m / 1.11 m to
+  0.15 m / 0.05 m on passes 2 and 3. 5,549 instead of 5,581 photos are
+  registered. `scripts/score_smallcity_reference.py` fetches that reference
+  (about 300 MB of the 3 GB release, by HTTP range) and scores a model.
 - **`gsplat_photos` matches COLMAP-style u8 descriptors on the GPU by
   default** (`FeatureBank::upload_u8`: round(512 x) clamped to 255, exact
   integer dot products), 2.2x faster than the previous f32 kernel on an

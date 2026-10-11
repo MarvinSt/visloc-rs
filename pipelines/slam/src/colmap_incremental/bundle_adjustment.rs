@@ -125,7 +125,8 @@ use crate::bundle::{BaConfig, BaRigObservation, BundleAdjustment};
 use visloc_core::geometry::{Pose, SE3};
 
 use super::reconstruction::Reconstruction;
-use super::types::{FrameT, ImageT, Point3DT, SensorT};
+use super::rig_ba_solver::{RigBaInput, RigObs};
+use super::types::{CameraT, FrameT, ImageT, Point3DT, SensorT};
 
 /// Port of `BundleAdjustmentGauge` (`bundle_adjustment.h:47-48`). See module
 /// doc deviation 4.
@@ -540,23 +541,28 @@ pub fn solve(
     // points ascending with their pulled-in observations.
     use rayon::prelude::*;
     let image_ids: Vec<ImageT> = config.image_ids.iter().copied().collect();
-    let per_image: Vec<Vec<BaRigObservation>> = image_ids
+    let per_image: Vec<Vec<(RigObs, CameraT)>> = image_ids
         .par_iter()
         .map(|&image_id| {
             let image = recon.image(image_id);
             let frame_id = image.frame_id;
-            let camera = recon.camera(image.camera_id);
+            let intrinsics = recon.camera(image.camera_id).intrinsics();
             let sensor_from_rig = sensor_from_rig_for_image(recon, image_id);
             image
                 .points2d
                 .iter()
                 .filter_map(|point2d| {
-                    point2d.point3d_id.map(|point3d_id| BaRigObservation {
-                        keyframe_id: frame_id,
-                        landmark_id: point3d_id,
-                        xy: point2d.xy,
-                        camera: camera.clone(),
-                        sensor_from_rig: sensor_from_rig.clone(),
+                    point2d.point3d_id.map(|point3d_id| {
+                        (
+                            RigObs {
+                                keyframe_id: frame_id,
+                                landmark_id: point3d_id,
+                                xy: point2d.xy,
+                                intrinsics,
+                                sensor_from_rig: sensor_from_rig.clone(),
+                            },
+                            image.camera_id,
+                        )
                     })
                 })
                 .collect()
@@ -569,16 +575,20 @@ pub fn solve(
     let mut added_points: Vec<Point3DT> = per_image
         .iter()
         .flatten()
-        .map(|o| o.landmark_id)
+        .map(|(o, _)| o.landmark_id)
         .chain(config.variable_point3d_ids.iter().copied())
         .chain(config.constant_point3d_ids.iter().copied())
         .collect();
     added_points.par_sort_unstable();
     added_points.dedup();
+    // The observations in problem order, each with its camera. They go to
+    // the solver as compact [`RigObs`]; full `BaRigObservation`s (a `Camera`
+    // clone each) are built only for the backends that read
+    // `ba.rig_observations`.
+    let mut rig_obs: Vec<(RigObs, CameraT)> =
+        Vec::with_capacity(per_image.iter().map(Vec::len).sum());
     for obs in per_image {
-        for o in obs {
-            ba.add_rig_observation(o);
-        }
+        rig_obs.extend(obs);
     }
 
     // Frames pulled in purely to hold a fixed, baked-constant pose for a
@@ -591,7 +601,7 @@ pub fn solve(
         xyz: Point3<f64>,
         variable: bool,
         /// `(frame_id, observation)` pulled in from outside the window.
-        pulled: Vec<(FrameT, BaRigObservation)>,
+        pulled: Vec<(FrameT, (RigObs, CameraT))>,
     }
     let plans: Vec<PointPlan> = added_points
         .par_iter()
@@ -646,13 +656,16 @@ pub fn solve(
                     let image = recon.image(el.image_id);
                     pulled.push((
                         image.frame_id,
-                        BaRigObservation {
-                            keyframe_id: image.frame_id,
-                            landmark_id: point3d_id,
-                            xy: image.points2d[el.point2d_idx].xy,
-                            camera: recon.camera(image.camera_id).clone(),
-                            sensor_from_rig: sensor_from_rig_for_image(recon, el.image_id),
-                        },
+                        (
+                            RigObs {
+                                keyframe_id: image.frame_id,
+                                landmark_id: point3d_id,
+                                xy: image.points2d[el.point2d_idx].xy,
+                                intrinsics: recon.camera(image.camera_id).intrinsics(),
+                                sensor_from_rig: sensor_from_rig_for_image(recon, el.image_id),
+                            },
+                            image.camera_id,
+                        ),
                     ));
                 }
             }
@@ -663,10 +676,15 @@ pub fn solve(
             }
         })
         .collect();
-    for (&point3d_id, plan) in added_points.iter().zip(plans) {
-        ba.add_landmark(point3d_id, plan.xyz);
+    // Points in `added_points` order (ascending ids). They reach the
+    // native solver as these arrays; `ba`'s landmark maps are filled only
+    // for the backends that read them.
+    let mut point_xyz: Vec<Point3<f64>> = Vec::with_capacity(added_points.len());
+    let mut point_fixed: Vec<bool> = Vec::with_capacity(added_points.len());
+    for plan in plans {
+        point_xyz.push(plan.xyz);
+        point_fixed.push(!plan.variable);
         if !plan.variable {
-            ba.fix_landmark(point3d_id);
             continue;
         }
         for (frame_id, o) in plan.pulled {
@@ -680,11 +698,11 @@ pub fn solve(
                 );
                 ba.fix_pose(frame_id);
             }
-            ba.add_rig_observation(o);
+            rig_obs.push(o);
         }
     }
 
-    if ba.rig_observations.is_empty() || ba.landmarks.is_empty() {
+    if rig_obs.is_empty() || added_points.is_empty() {
         return false;
     }
 
@@ -713,14 +731,8 @@ pub fn solve(
             }
         }
         Gauge::ThreePoints => {
-            let candidates: Vec<Point3DT> = added_points
-                .iter()
-                .copied()
-                .filter(|id| !ba.fixed_landmarks.contains(id))
-                .take(3)
-                .collect();
-            for id in candidates {
-                ba.fix_landmark(id);
+            for fixed in point_fixed.iter_mut().filter(|fixed| !**fixed).take(3) {
+                *fixed = true;
             }
         }
     }
@@ -738,9 +750,57 @@ pub fn solve(
     };
 
     let started = std::time::Instant::now();
-    let n_obs = ba.rig_observations.len();
-    let n_lm = ba.landmarks.len();
-    let n_fixed_lm = ba.fixed_landmarks.len();
+    let n_obs = rig_obs.len();
+    let accelerate = options.loss_function == LossFunction::Trivial
+        && std::env::var_os("VISLOC_PORT_GPU_BA").is_some();
+    // Only the native solver reads compact observations.
+    let native_direct = options.backend == BaBackend::Native && !accelerate;
+    let n_lm = added_points.len();
+    let n_fixed_lm = point_fixed.iter().filter(|&&fixed| fixed).count();
+    let mut direct: Option<RigBaInput> = None;
+    let rig_obs: Vec<RigObs> = if native_direct {
+        direct = Some(RigBaInput {
+            frame_ids: ba.poses.keys().copied().collect(),
+            frame_fixed: ba
+                .poses
+                .keys()
+                .map(|id| ba.fixed_poses.contains(id))
+                .collect(),
+            poses: ba
+                .poses
+                .values()
+                .map(|p| p.world_to_camera.clone())
+                .collect(),
+            point_ids: added_points.clone(),
+            point_fixed,
+            points: point_xyz,
+        });
+        rig_obs.into_iter().map(|(o, _)| o).collect()
+    } else {
+        // Ascending ids: both collections build in bulk.
+        ba.landmarks = added_points
+            .iter()
+            .copied()
+            .zip(point_xyz.iter().copied())
+            .collect();
+        ba.fixed_landmarks = added_points
+            .iter()
+            .zip(&point_fixed)
+            .filter(|(_, &fixed)| fixed)
+            .map(|(&id, _)| id)
+            .collect();
+        ba.rig_observations = rig_obs
+            .into_iter()
+            .map(|(o, camera_id)| BaRigObservation {
+                keyframe_id: o.keyframe_id,
+                landmark_id: o.landmark_id,
+                xy: o.xy,
+                camera: recon.camera(camera_id).clone(),
+                sensor_from_rig: o.sensor_from_rig,
+            })
+            .collect();
+        Vec::new()
+    };
     // Optional accelerator (e.g. GPU LM) for trivial-loss (global) problems
     // of a single camera: identity sensor-from-rig observations are ordinary
     // monocular observations. Anything else stays on the native solver.
@@ -749,44 +809,43 @@ pub fn solve(
     // (per-call setup dominates) and, without the native relative-gradient
     // stop, hurt accuracy (MH_05 2.58 -> 3.06 cm; V1_01 collapsed at a
     // 4-iteration cap), so the native solver stays the default.
-    let accelerated = (options.loss_function == LossFunction::Trivial
-        && std::env::var_os("VISLOC_PORT_GPU_BA").is_some())
-    .then(crate::ba_accel::ba_accelerator)
-    .flatten()
-    .and_then(|accel| {
-        let monocular = ba.rig_observations.iter().all(|o| {
-            o.camera == ba.camera
-                && o.sensor_from_rig.translation.norm() == 0.0
-                && o.sensor_from_rig.rotation.angle() == 0.0
+    let accelerated = accelerate
+        .then(crate::ba_accel::ba_accelerator)
+        .flatten()
+        .and_then(|accel| {
+            let monocular = ba.rig_observations.iter().all(|o| {
+                o.camera == ba.camera
+                    && o.sensor_from_rig.translation.norm() == 0.0
+                    && o.sensor_from_rig.rotation.angle() == 0.0
+            });
+            if !monocular {
+                return None;
+            }
+            let rig = std::mem::take(&mut ba.rig_observations);
+            ba.observations = rig
+                .iter()
+                .map(|o| visloc_slam_bundle_observation(o.keyframe_id, o.landmark_id, o.xy))
+                .collect();
+            // The native solver stops on Ceres' relative gradient tolerance
+            // after ~1-3 iterations; the accelerator has no such criterion,
+            // so cap it (VISLOC_PORT_GPU_BA_ITERS, default 2).
+            let iters = std::env::var("VISLOC_PORT_GPU_BA_ITERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2usize);
+            let gpu_config = BaConfig {
+                max_iterations: iters.min(options.max_num_iterations),
+                relative_cost_tolerance: Some(1.0e-6),
+                ..BaConfig::default()
+            };
+            let result = accel.optimize(&mut ba, &gpu_config, crate::ba_accel::BaScope::Global);
+            if result.is_none() {
+                // Declined: restore the rig form for the native solver.
+                ba.observations.clear();
+                ba.rig_observations = rig;
+            }
+            result
         });
-        if !monocular {
-            return None;
-        }
-        let rig = std::mem::take(&mut ba.rig_observations);
-        ba.observations = rig
-            .iter()
-            .map(|o| visloc_slam_bundle_observation(o.keyframe_id, o.landmark_id, o.xy))
-            .collect();
-        // The native solver stops on Ceres' relative gradient tolerance
-        // after ~1-3 iterations; the accelerator has no such criterion,
-        // so cap it (VISLOC_PORT_GPU_BA_ITERS, default 2).
-        let iters = std::env::var("VISLOC_PORT_GPU_BA_ITERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2usize);
-        let gpu_config = BaConfig {
-            max_iterations: iters.min(options.max_num_iterations),
-            relative_cost_tolerance: Some(1.0e-6),
-            ..BaConfig::default()
-        };
-        let result = accel.optimize(&mut ba, &gpu_config, crate::ba_accel::BaScope::Global);
-        if result.is_none() {
-            // Declined: restore the rig form for the native solver.
-            ba.observations.clear();
-            ba.rig_observations = rig;
-        }
-        result
-    });
     let solved = if let Some(result) = accelerated {
         result
     } else {
@@ -809,6 +868,13 @@ pub fn solve(
                 }
                 ba.optimize(&ba_config)
             }
+            BaBackend::Native if native_direct => super::rig_ba_solver::optimize_rig_input(
+                direct.as_mut().expect("built for the direct path"),
+                &rig_obs,
+                options.max_num_iterations,
+                options.loss_function,
+                options.gradient_tolerance_rel,
+            ),
             BaBackend::Native => super::rig_ba_solver::optimize_with_tolerance(
                 &mut ba,
                 options.max_num_iterations,
@@ -828,15 +894,30 @@ pub fn solve(
         started.elapsed().as_millis()
     );
 
-    for &frame_id in &frame_ids {
-        let pose = &ba.poses[&frame_id];
-        recon
-            .frame_mut(frame_id)
-            .set_rig_from_world(pose.world_to_camera.clone());
-    }
-    for &point3d_id in &added_points {
-        let xyz: Point3<f64> = ba.landmarks[&point3d_id];
-        recon.point3d_mut(point3d_id).xyz = xyz;
+    if let Some(input) = direct {
+        for &frame_id in &frame_ids {
+            let idx = input
+                .frame_ids
+                .binary_search(&frame_id)
+                .expect("frame id present");
+            recon
+                .frame_mut(frame_id)
+                .set_rig_from_world(input.poses[idx].clone());
+        }
+        for (&point3d_id, &xyz) in added_points.iter().zip(&input.points) {
+            recon.point3d_mut(point3d_id).xyz = xyz;
+        }
+    } else {
+        for &frame_id in &frame_ids {
+            let pose = &ba.poses[&frame_id];
+            recon
+                .frame_mut(frame_id)
+                .set_rig_from_world(pose.world_to_camera.clone());
+        }
+        for &point3d_id in &added_points {
+            let xyz: Point3<f64> = ba.landmarks[&point3d_id];
+            recon.point3d_mut(point3d_id).xyz = xyz;
+        }
     }
     eprintln!(
         "TIMING ba_solve_total frames={} elapsed_ms={}",

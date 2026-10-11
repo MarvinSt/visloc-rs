@@ -142,7 +142,7 @@ use rayon::prelude::*;
 use visloc_core::geometry::SE3;
 
 use crate::block_cholesky::{solve_spd_blocks6_cached, BlockSymbolic};
-use crate::bundle::{BaError, BaIterationStats, BaResult, BundleAdjustment};
+use crate::bundle::{BaError, BaIterationStats, BaResult, BaRigObservation, BundleAdjustment};
 
 use super::bundle_adjustment::LossFunction;
 
@@ -171,14 +171,12 @@ struct Obs {
 }
 
 struct Problem {
-    frame_ids: Vec<u64>,
     /// `Some(slot)` for free frames (`slot` indexes the reduced camera
     /// system, `0..n_free_frames`), `None` for fixed frames.
     free_frame_slot: Vec<Option<u32>>,
     n_free_frames: usize,
     poses: Vec<SE3>,
 
-    point_ids: Vec<u64>,
     point_fixed: Vec<bool>,
     points: Vec<Point3<f64>>,
 
@@ -634,24 +632,90 @@ fn pcg_core(
 /// local BA) keep the natural order, where fill is negligible.
 const REORDER_MIN_FREE_FRAMES: usize = 64;
 
-fn build_problem(ba: &BundleAdjustment) -> Result<Problem, BaError> {
-    if ba.poses.is_empty() {
+/// One rig observation as [`build_problem`] reads it: a
+/// [`BaRigObservation`] with the camera reduced to its pinhole intrinsics
+/// (`None` for a model this solver does not support), so building one costs
+/// no allocation. Global BAs carry millions of observations, and cloning a
+/// `Camera` (a heap-allocated parameter vector) per observation, then
+/// freeing it, cost as much as a third of the solve.
+#[derive(Clone, Debug)]
+pub(crate) struct RigObs {
+    pub keyframe_id: u64,
+    pub landmark_id: u64,
+    pub xy: Point2<f64>,
+    pub intrinsics: Option<(f64, f64, f64, f64)>,
+    pub sensor_from_rig: SE3,
+}
+
+impl From<&BaRigObservation> for RigObs {
+    fn from(o: &BaRigObservation) -> Self {
+        Self {
+            keyframe_id: o.keyframe_id,
+            landmark_id: o.landmark_id,
+            xy: o.xy,
+            intrinsics: o.camera.intrinsics(),
+            sensor_from_rig: o.sensor_from_rig.clone(),
+        }
+    }
+}
+
+/// Frames and points of a solve as flat arrays, ids ascending: what
+/// [`build_problem`] reads from a [`BundleAdjustment`]'s maps, so a caller
+/// with the data in hand need not build those maps (on a global BA, a
+/// `BTreeMap` of a million landmarks that is converted straight back).
+/// [`optimize_rig_input`] leaves the optimized poses and points here.
+pub(crate) struct RigBaInput {
+    pub frame_ids: Vec<u64>,
+    pub frame_fixed: Vec<bool>,
+    pub poses: Vec<SE3>,
+    pub point_ids: Vec<u64>,
+    pub point_fixed: Vec<bool>,
+    pub points: Vec<Point3<f64>>,
+}
+
+impl RigBaInput {
+    /// The poses and landmarks of `ba` (its maps iterate ids ascending).
+    fn from_ba(ba: &BundleAdjustment) -> Self {
+        let frame_ids: Vec<u64> = ba.poses.keys().copied().collect();
+        let point_ids: Vec<u64> = ba.landmarks.keys().copied().collect();
+        Self {
+            frame_fixed: frame_ids
+                .iter()
+                .map(|id| ba.fixed_poses.contains(id))
+                .collect(),
+            poses: ba
+                .poses
+                .values()
+                .map(|p| p.world_to_camera.clone())
+                .collect(),
+            point_fixed: point_ids
+                .iter()
+                .map(|id| ba.fixed_landmarks.contains(id))
+                .collect(),
+            points: ba.landmarks.values().copied().collect(),
+            frame_ids,
+            point_ids,
+        }
+    }
+}
+
+/// The solver's problem from `input`'s frames and points and the
+/// observations `rig_obs`.
+fn build_problem(input: &RigBaInput, rig_obs: &[RigObs]) -> Result<Problem, BaError> {
+    if input.frame_ids.is_empty() {
         return Err(BaError::NoPoses);
     }
-    if ba.landmarks.is_empty() {
+    if input.point_ids.is_empty() {
         return Err(BaError::NoLandmarks);
     }
-    if ba.rig_observations.is_empty() {
+    if rig_obs.is_empty() {
         return Err(BaError::NoObservations);
     }
 
     let t_start = Instant::now();
-    // `BTreeMap` keys are ascending, so ids map to indices by binary search.
-    let frame_ids: Vec<u64> = ba.poses.keys().copied().collect();
-    let frame_fixed: Vec<bool> = frame_ids
-        .iter()
-        .map(|id| ba.fixed_poses.contains(id))
-        .collect();
+    // Ids are ascending, so they map to indices by binary search.
+    let frame_ids = &input.frame_ids;
+    let frame_fixed: Vec<bool> = input.frame_fixed.clone();
     let mut free_frame_slot = vec![None; frame_ids.len()];
     let mut n_free_frames = 0usize;
     for (i, &fixed) in frame_fixed.iter().enumerate() {
@@ -663,23 +727,16 @@ fn build_problem(ba: &BundleAdjustment) -> Result<Problem, BaError> {
     if n_free_frames == 0 {
         return Err(BaError::AllPosesFixed);
     }
-    let poses: Vec<SE3> = frame_ids
-        .iter()
-        .map(|id| ba.poses[id].world_to_camera.clone())
-        .collect();
+    let poses: Vec<SE3> = input.poses.clone();
 
-    let point_ids: Vec<u64> = ba.landmarks.keys().copied().collect();
-    let point_fixed: Vec<bool> = point_ids
-        .iter()
-        .map(|id| ba.fixed_landmarks.contains(id))
-        .collect();
-    let points: Vec<Point3<f64>> = ba.landmarks.values().copied().collect();
+    let point_ids = &input.point_ids;
+    let point_fixed: Vec<bool> = input.point_fixed.clone();
+    let points: Vec<Point3<f64>> = input.points.clone();
 
     let setup_ms = t_start.elapsed().as_secs_f64() * 1e3;
     // (frame index, point index) per observation, in parallel; the first
     // failing observation (in input order) decides the error, as before.
-    let indices: Vec<Result<(u32, u32), BaError>> = ba
-        .rig_observations
+    let indices: Vec<Result<(u32, u32), BaError>> = rig_obs
         .par_iter()
         .map(|o| {
             let frame_idx = frame_ids
@@ -688,16 +745,14 @@ fn build_problem(ba: &BundleAdjustment) -> Result<Problem, BaError> {
             let point_idx = point_ids
                 .binary_search(&o.landmark_id)
                 .map_err(|_| BaError::MissingLandmark(o.landmark_id))?;
-            o.camera
-                .intrinsics()
-                .ok_or(BaError::UnsupportedCameraModel)?;
+            o.intrinsics.ok_or(BaError::UnsupportedCameraModel)?;
             Ok((frame_idx as u32, point_idx as u32))
         })
         .collect();
     let indices: Vec<(u32, u32)> = indices.into_iter().collect::<Result<_, _>>()?;
 
     // Stable counting sort by point index: observations of a point keep the
-    // caller's (`ba.rig_observations`) order, exactly like the stable
+    // caller's (`rig_obs`) order, exactly like the stable
     // `sort_by_key` this replaces, without moving the large `Obs` records.
     let mut point_obs_range = vec![(0u32, 0u32); point_ids.len()];
     for &(_, p) in &indices {
@@ -718,9 +773,9 @@ fn build_problem(ba: &BundleAdjustment) -> Result<Problem, BaError> {
     let obs: Vec<Obs> = order
         .par_iter()
         .map(|&i| {
-            let o = &ba.rig_observations[i as usize];
+            let o = &rig_obs[i as usize];
             let (frame_idx, _) = indices[i as usize];
-            let (fx, fy, cx, cy) = o.camera.intrinsics().expect("checked above");
+            let (fx, fy, cx, cy) = o.intrinsics.expect("checked above");
             Obs {
                 frame_idx,
                 xy: o.xy,
@@ -758,11 +813,9 @@ fn build_problem(ba: &BundleAdjustment) -> Result<Problem, BaError> {
     }
 
     Ok(Problem {
-        frame_ids,
         free_frame_slot,
         n_free_frames,
         poses,
-        point_ids,
         point_fixed,
         points,
         obs,
@@ -1786,8 +1839,57 @@ pub(crate) fn optimize_with_tolerance(
     loss: LossFunction,
     gradient_tolerance_rel: Option<f64>,
 ) -> Result<BaResult, BaError> {
+    let rig_obs: Vec<RigObs> = ba.rig_observations.par_iter().map(RigObs::from).collect();
+    optimize_rig_obs(
+        ba,
+        &rig_obs,
+        max_num_iterations,
+        loss,
+        gradient_tolerance_rel,
+    )
+}
+
+/// [`optimize_with_tolerance`] with the observations given as `rig_obs`;
+/// `ba.rig_observations` is ignored.
+fn optimize_rig_obs(
+    ba: &mut BundleAdjustment,
+    rig_obs: &[RigObs],
+    max_num_iterations: usize,
+    loss: LossFunction,
+    gradient_tolerance_rel: Option<f64>,
+) -> Result<BaResult, BaError> {
+    let mut input = RigBaInput::from_ba(ba);
+    let result = optimize_rig_input(
+        &mut input,
+        rig_obs,
+        max_num_iterations,
+        loss,
+        gradient_tolerance_rel,
+    )?;
+    for (id, pose) in input.frame_ids.iter().zip(input.poses) {
+        ba.poses
+            .get_mut(id)
+            .expect("frame id present")
+            .world_to_camera = pose;
+    }
+    for (id, point) in input.point_ids.iter().zip(input.points) {
+        *ba.landmarks.get_mut(id).expect("point id present") = point;
+    }
+    Ok(result)
+}
+
+/// [`optimize_with_tolerance`] on frames and points given as arrays
+/// ([`RigBaInput`]) and observations `rig_obs`; the optimized poses and
+/// points replace `input.poses` and `input.points`.
+pub(crate) fn optimize_rig_input(
+    input: &mut RigBaInput,
+    rig_obs: &[RigObs],
+    max_num_iterations: usize,
+    loss: LossFunction,
+    gradient_tolerance_rel: Option<f64>,
+) -> Result<BaResult, BaError> {
     let t_build = Instant::now();
-    let mut problem = build_problem(ba)?;
+    let mut problem = build_problem(input, rig_obs)?;
     let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
     let mut timings = PhaseTimings::default();
     let mut apply_ms = 0.0;
@@ -1957,15 +2059,8 @@ pub(crate) fn optimize_with_tolerance(
         }
     }
 
-    for (i, &id) in problem.frame_ids.iter().enumerate() {
-        ba.poses
-            .get_mut(&id)
-            .expect("frame id present")
-            .world_to_camera = problem.poses[i].clone();
-    }
-    for (i, &id) in problem.point_ids.iter().enumerate() {
-        *ba.landmarks.get_mut(&id).expect("point id present") = problem.points[i];
-    }
+    input.poses = problem.poses.clone();
+    input.points = problem.points.clone();
 
     eprintln!(
         "BA_PHASES trials={} linearize_calls={} n_free_frames={} n_points={} edges={} shards={} linearize_ms={:.1} eliminate_ms={:.1} assemble_ms={:.1} linsolve_ms={:.1} backsub_ms={:.1} evaluate_cost_ms={:.1} build_ms={build_ms:.1} apply_ms={apply_ms:.1} reorder_ms={:.1} pcg_iterations={}",

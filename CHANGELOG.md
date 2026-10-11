@@ -156,6 +156,14 @@ All notable changes to `visloc-rs` will be documented here.
   global BA solves the reduced camera system with preconditioned CG
   (relative residual 1e-2; Ceres' `ITERATIVE_SCHUR` default is 0.1);
   smaller problems are unchanged.
+- **COLMAP-port bundle adjustment hands the solver arrays, not maps.**
+  Byte-identical models. The problem used to be built as a
+  `BundleAdjustment`, with a `Camera` clone (a heap-allocated parameter
+  vector) per observation and `BTreeMap`s of every pose and landmark, which
+  the native solver then converted back into arrays. It is now built
+  directly as compact observations plus frame and point arrays. The
+  Courthouse mapper takes 24.9 s instead of 29.1 s (mean of two runs, 4
+  cores, iterative solve forced on).
 - **COLMAP-port mapper 2.2x faster on SmallCity** (5,822 photos: 3,866 ->
   1,782 s). Most of it keeps the model byte-identical. Global BA's Schur
   elimination now runs row by row, in parallel over its outputs, and its

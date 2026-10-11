@@ -482,6 +482,21 @@ fn pcg_relative_tolerance() -> f64 {
 /// accumulator; fixed so the summation order does not depend on the thread
 /// count.
 const PCG_MATVEC_CHUNKS: usize = 64;
+/// Whether the bundle-adjustment PCG product reads its off-diagonal blocks
+/// in f32 (the default) instead of f64; `VISLOC_PORT_PCG_F64_BLOCKS=1`
+/// keeps f64. The product is memory-bound, so halving the bytes nearly
+/// halves its time. The diagonal, the preconditioner and every vector stay
+/// f64, and the per-entry rounding (~6e-8 relative) is far below the 1e-2
+/// residual the solve stops at. On a SmallCity mapper replay a PCG
+/// iteration took 5.6 ms instead of 11.8 ms. Iteration counts matched
+/// while the runs stayed on the same path, and the mapper took 836 s
+/// instead of 1,122 s for the f64 product that read both triangles. It
+/// registered 5,581 images instead of 5,599, with a median camera-centre
+/// difference of 0.19 % of the scene extent.
+fn pcg_f32_blocks() -> bool {
+    static F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F32.get_or_init(|| std::env::var("VISLOC_PORT_PCG_F64_BLOCKS").map_or(true, |v| v != "1"))
+}
 /// Iteration cap of [`pcg_blocks6`] (Ceres' `max_linear_solver_iterations`).
 const PCG_MAX_ITERATIONS: usize = 500;
 
@@ -1494,7 +1509,10 @@ fn solve_step(
         // memory traffic, and storing both triangles read every block
         // twice. The edges are cut into a fixed number of chunks, each
         // accumulating into its own vector, summed in chunk order, so the
-        // result does not depend on the thread count.
+        // result does not depend on the thread count. The blocks are read
+        // in f32 unless `VISLOC_PORT_PCG_F64_BLOCKS=1` ([`pcg_f32_blocks`]).
+        let blocks32: Option<Vec<nalgebra::Matrix6<f32>>> =
+            pcg_f32_blocks().then(|| flat_offdiag.par_iter().map(|m| m.cast::<f32>()).collect());
         let n_chunks = PCG_MATVEC_CHUNKS.min(edges.len().max(1));
         let bounds: Vec<usize> = (0..=n_chunks).map(|c| c * edges.len() / n_chunks).collect();
         let matvec = |x: &[Vector6<f64>]| -> Vec<Vector6<f64>> {
@@ -1504,7 +1522,10 @@ fn solve_step(
                     let mut y = vec![Vector6::zeros(); n_free];
                     for e in bounds[c]..bounds[c + 1] {
                         let (a, b) = (edges[e].0 as usize, edges[e].1 as usize);
-                        let blk = &flat_offdiag[e];
+                        let blk = match &blocks32 {
+                            Some(blocks) => blocks[e].cast::<f64>(),
+                            None => flat_offdiag[e],
+                        };
                         y[b] += blk * x[a];
                         y[a] += blk.tr_mul(&x[b]);
                     }

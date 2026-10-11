@@ -305,6 +305,8 @@ pub(crate) fn run_colmap_port(
     std::fs::File::create(dir.join("pairs.bin"))
         .and_then(|mut f| f.write_all(&bin))
         .map_err(|e| err(e.to_string()))?;
+    // Read back below; do not hold the buffer through the mapper.
+    drop(bin);
 
     let db = DatabaseCache::from_generalized_rig_export(
         &dir.join("manifest.txt"),

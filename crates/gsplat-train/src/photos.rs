@@ -437,14 +437,13 @@ pub fn build_photo_dataset(
     {
         apply_sift_override(&mut sift_cfg, o).map_err(EurocError::Sift)?;
     }
-    let grays: Vec<Vec<f32>> = decoded
-        .par_iter()
-        .map(|(img, _)| {
-            img.pixels()
-                .map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
-                .collect()
-        })
-        .collect();
+    // f32 grey images are SIFT's input, made a chunk at a time: all of them
+    // at once (4 bytes a pixel) are 16.5 GB for SmallCity's 5,822 photos.
+    let gray_of = |img: &image::RgbImage| -> Vec<f32> {
+        img.pixels()
+            .map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
+            .collect()
+    };
     let to_features = |kps: Vec<visloc_vision::features::sift::SiftKeypoint>, desc| FeatureSet {
         keypoints: kps.iter().map(|k| Point2::new(k.x, k.y)).collect(),
         descriptors: desc,
@@ -468,22 +467,26 @@ pub fn build_photo_dataset(
     let features: Vec<FeatureSet> = if on_gpu {
         let mut features = Vec::with_capacity(n);
         #[cfg(feature = "gpu")]
-        for g in &grays {
-            let gray = GrayImage::new(width as usize, height as usize, g)
-                .map_err(|e| EurocError::Sift(format!("{e}")))?;
-            let (kps, desc) = gpu_sift
-                .as_mut()
-                .expect("on_gpu")
-                .extract(&gray, &sift_cfg)
-                .map_err(|e| EurocError::Sift(format!("{e}")))?;
-            features.push(to_features(kps, desc));
+        for chunk in decoded.chunks(256) {
+            let grays: Vec<Vec<f32>> = chunk.par_iter().map(|(img, _)| gray_of(img)).collect();
+            for g in &grays {
+                let gray = GrayImage::new(width as usize, height as usize, g)
+                    .map_err(|e| EurocError::Sift(format!("{e}")))?;
+                let (kps, desc) = gpu_sift
+                    .as_mut()
+                    .expect("on_gpu")
+                    .extract(&gray, &sift_cfg)
+                    .map_err(|e| EurocError::Sift(format!("{e}")))?;
+                features.push(to_features(kps, desc));
+            }
         }
         features
     } else {
-        grays
+        decoded
             .par_iter()
-            .map(|g| {
-                let gray = GrayImage::new(width as usize, height as usize, g)
+            .map(|(img, _)| {
+                let g = gray_of(img);
+                let gray = GrayImage::new(width as usize, height as usize, &g)
                     .map_err(|e| EurocError::Sift(format!("{e}")))?;
                 let (kps, desc) =
                     extract_sift(&gray, &sift_cfg).map_err(|e| EurocError::Sift(format!("{e}")))?;
@@ -687,6 +690,16 @@ pub fn build_photo_dataset(
         match_s,
         verify_s
     ));
+
+    // Past matching only the intrinsics refinement reads the descriptors
+    // (13 GB for SmallCity at 4,000 SIFT); without it, free them before the
+    // mapper.
+    let mut features = features;
+    if !cfg.refine_intrinsics {
+        for f in &mut features {
+            f.descriptors = Vec::new();
+        }
+    }
 
     // Mapper, then a global BA that also refines the intrinsics.
     let t0 = std::time::Instant::now();

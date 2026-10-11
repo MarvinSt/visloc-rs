@@ -136,6 +136,14 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **`gsplat_photos` frees SfM inputs it no longer needs.** Byte-identical
+  models. Grey images for SIFT are made 256 at a time instead of all at
+  once (4 bytes a pixel: 16.5 GB for SmallCity's 5,822 photos). With
+  `--no-refine-intrinsics` the SIFT descriptors are freed before the mapper
+  (13 GB at 4,000 keypoints). The port's in-memory `pairs.bin` is dropped
+  once written. A 553-image Courthouse run (CPU, 800 keypoints) peaks at
+  972 MB instead of 1,479 MB. SmallCity with `--retrieval 60` had been
+  killed on a 50 GB machine right after matching.
 - **`gsplat_photos --retrieval` skips the window's own neighbours.** The
   VLAD top-k used to rank every image. On the SmallCity capture, three
   quarters of the k slots went to images already paired by the sliding

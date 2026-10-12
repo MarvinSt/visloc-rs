@@ -121,6 +121,7 @@
 //! unrelated M1.1-adjacent change. Flagged as a follow-up.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 
 use super::colmap_verification::ConfigurationType;
 
@@ -267,13 +268,37 @@ impl ImageEntry {
     }
 }
 
+/// FxHash-style hasher for image ids (small trusted integers; SipHash's DoS
+/// resistance buys nothing here and dominated `find_correspondences`).
+#[derive(Debug, Default, Clone, Copy)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_usize(&mut self, x: usize) {
+        self.write_u64(x as u64);
+    }
+}
+
 /// The persistent correspondence graph. Port of `CorrespondenceGraph`
 /// (`src/colmap/scene/correspondence_graph.h/.cc`) — see the module doc for
 /// the full ported-surface table and citations.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CorrespondenceGraph {
     finalized: bool,
-    images: HashMap<usize, ImageEntry>,
+    /// Keyed with [`IdHasher`]: `find_correspondences` (the mapper's
+    /// track-completion and merge hot loop) looks an image up per call.
+    images: HashMap<usize, ImageEntry, BuildHasherDefault<IdHasher>>,
     image_pairs: HashMap<(usize, usize), EdgeMetadata>,
 }
 

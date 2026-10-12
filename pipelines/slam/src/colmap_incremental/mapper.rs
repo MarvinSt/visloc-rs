@@ -57,19 +57,26 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use nalgebra::Vector3;
 use visloc_core::geometry::{reproject, SE3};
 use visloc_vision::pnp::{
-    Correspondence2D3D, GaussNewtonPoseRefiner, GeneralizedCameraRig,
-    GeneralizedCorrespondence2D3D, GeneralizedPnPRansac, MinimalSolver, P3PGrunert, RigSensor,
+    estimate_gr6p_ransac_with_config, Correspondence2D3D, GaussNewtonPoseRefiner,
+    GeneralizedCameraObservation, GeneralizedCameraRig, GeneralizedCorrespondence2D3D,
+    GeneralizedPnPRansac, GeneralizedRelativeCorrespondence, GeneralizedRelativePoseRansacConfig,
+    MinimalSolver, P3PGrunert, RigSensor,
 };
 use visloc_vision::ransac::{PnPRansac, RobustPoseEstimator};
 use visloc_vision::two_view::CorrespondenceGraph;
 
-use super::bundle_adjustment::{self, BundleAdjustmentConfig, BundleAdjustmentOptions, Gauge};
-use super::incremental_triangulator::IncrementalTriangulator;
+use super::bundle_adjustment::{
+    self, BundleAdjustmentConfig, BundleAdjustmentOptions, Gauge, LocalBaPointPolicy, LossFunction,
+};
 pub use super::incremental_triangulator::Options as TriangulatorOptions;
+use super::incremental_triangulator::{estimate_triangulation_of_views, IncrementalTriangulator};
 use super::mapper_impl::{self, InitGateOptions};
-use super::observation_manager::{camera_has_bogus_params, ObservationManager};
+use super::observation_manager::{
+    camera_has_bogus_params, image_cam_from_world, ObservationManager,
+};
 use super::reconstruction::{Reconstruction, TrackElement};
 use super::types::{CameraT, FrameT, ImageT, Point3DT, RigT, SensorT};
 
@@ -112,6 +119,12 @@ pub struct Options {
     pub max_focal_length_ratio: f64,
     pub max_extra_param: f64,
     pub random_seed: u64,
+    /// COLMAP 4's `IncrementalPipelineOptions::structure_less_registration_fallback`:
+    /// when no image registers from 2D-3D correspondences, try the
+    /// candidates again from 2D-2D correspondences to registered images
+    /// ([`IncrementalMapper::register_next_structure_less_image`]). Off by
+    /// default here (the port's controls predate it); COLMAP 4 enables it.
+    pub structure_less_registration_fallback: bool,
 }
 
 impl Default for Options {
@@ -135,6 +148,7 @@ impl Default for Options {
             max_focal_length_ratio: 10.0,
             max_extra_param: 1.0,
             random_seed: 0, // control override (§0.1)
+            structure_less_registration_fallback: false,
         }
     }
 }
@@ -166,6 +180,9 @@ impl Options {
             "filter_max_reproj_error" => self.filter_max_reproj_error = num()?,
             "filter_min_tri_angle_deg" => self.filter_min_tri_angle_deg = num()?,
             "max_reg_trials" => self.max_reg_trials = num()? as usize,
+            "structure_less_registration_fallback" => {
+                self.structure_less_registration_fallback = num()? != 0.0;
+            }
             _ => return Err(format!("unknown key {key}")),
         }
         Ok(())
@@ -224,6 +241,7 @@ pub struct IncrementalMapper {
     num_reg_images_per_camera: BTreeMap<CameraT, usize>,
     num_registrations: BTreeMap<ImageT, usize>,
     num_reg_trials: BTreeMap<ImageT, usize>,
+    num_structure_less_reg_trials: BTreeMap<ImageT, usize>,
     filtered_frames: BTreeSet<FrameT>,
     existing_frame_ids: BTreeSet<FrameT>,
 }
@@ -273,6 +291,7 @@ impl IncrementalMapper {
         self.existing_frame_ids = recon.reg_frame_ids().iter().copied().collect();
         self.filtered_frames.clear();
         self.num_reg_trials.clear();
+        self.num_structure_less_reg_trials.clear();
     }
 
     /// Port of `EndReconstruction` (`.cc:135-152`).
@@ -482,6 +501,214 @@ impl IncrementalMapper {
         }
 
         self.register_next_image_path_a(options, recon, graph, image_id)
+    }
+
+    /// Port of COLMAP 4's `RegisterNextStructureLessImage`: register
+    /// `image_id` from its 2D-2D correspondences to registered images when
+    /// it sees too few 3D points for [`Self::register_next_image`].
+    ///
+    /// The registered images form one generalized camera in world
+    /// coordinates (each correspondence a ray from its camera centre), the
+    /// new image a central camera; GR6P RANSAC between the two gives
+    /// `cam_from_world` with metric scale. Inlier correspondences then
+    /// continue an existing track, or triangulate a new one, and a
+    /// Cauchy-loss BA of the image and its new points refines the pose.
+    ///
+    /// Deviations from COLMAP 4: GR6P only (no 5+1 solver, grouped sampler
+    /// or LO step), a bounded trial count, and the angular epipolar
+    /// residual with the pixel threshold divided by the focal length
+    /// instead of the tangent Sampson error. Single-camera frames only.
+    pub fn register_next_structure_less_image(
+        &mut self,
+        options: &Options,
+        recon: &mut Reconstruction,
+        graph: &CorrespondenceGraph,
+        image_id: ImageT,
+    ) -> bool {
+        if recon.num_reg_images() < 2 {
+            return false;
+        }
+        *self
+            .num_structure_less_reg_trials
+            .entry(image_id)
+            .or_insert(0) += 1;
+        let frame_id = recon.image(image_id).frame_id;
+        if recon.frame(frame_id).image_ids().count() != 1 {
+            return false;
+        }
+
+        // A 2D-2D correspondence constrains one degree of freedom, a 2D-3D
+        // one two: twice the inliers.
+        let min_num_inliers = 2 * options.abs_pose_min_num_inliers;
+        if self.obs.num_visible_correspondences(image_id) < min_num_inliers {
+            return false;
+        }
+
+        let camera = recon.camera(recon.image(image_id).camera_id).clone();
+        // (point2d_idx, world image, world point2d_idx) and the GR6P rays.
+        let mut corrs: Vec<(usize, ImageT, usize)> = Vec::new();
+        let mut gr_corrs: Vec<GeneralizedRelativeCorrespondence> = Vec::new();
+        let mut world_poses: BTreeMap<ImageT, Option<(SE3, Vector3<f64>)>> = BTreeMap::new();
+        let num_points2d = recon.image(image_id).num_points2d();
+        for idx in 0..num_points2d {
+            let xy = recon.image(image_id).points2d[idx].xy;
+            let Some(n) = camera.normalize_pixel(&xy) else {
+                continue;
+            };
+            let query_ray = Vector3::new(n.x, n.y, 1.0);
+            for corr in graph.find_correspondences(image_id as usize, idx) {
+                let world_id = corr.image_id as ImageT;
+                if !recon.is_image_registered(world_id) {
+                    continue;
+                }
+                let pose = world_poses.entry(world_id).or_insert_with(|| {
+                    let world_camera = recon.camera(recon.image(world_id).camera_id);
+                    if camera_has_bogus_params(
+                        world_camera,
+                        options.min_focal_length_ratio,
+                        options.max_focal_length_ratio,
+                        options.max_extra_param,
+                    ) {
+                        return None;
+                    }
+                    let cam_from_world = image_cam_from_world(recon, world_id);
+                    let centre = -(cam_from_world.rotation.inverse() * cam_from_world.translation);
+                    Some((cam_from_world, centre))
+                });
+                let Some((cam_from_world, centre)) = pose else {
+                    continue;
+                };
+                let world_image = recon.image(world_id);
+                let world_camera = recon.camera(world_image.camera_id);
+                let Some(wn) =
+                    world_camera.normalize_pixel(&world_image.points2d[corr.point2d_idx].xy)
+                else {
+                    continue;
+                };
+                let world_ray = cam_from_world.rotation.inverse() * Vector3::new(wn.x, wn.y, 1.0);
+                let (Ok(world_obs), Ok(query_obs)) = (
+                    GeneralizedCameraObservation::new(*centre, world_ray),
+                    GeneralizedCameraObservation::new(Vector3::zeros(), query_ray),
+                ) else {
+                    continue;
+                };
+                gr_corrs.push(GeneralizedRelativeCorrespondence {
+                    rig1: world_obs,
+                    rig2: query_obs,
+                });
+                corrs.push((idx, world_id, corr.point2d_idx));
+            }
+        }
+        if corrs.len() < min_num_inliers {
+            return false;
+        }
+        // All rays from one centre (`IsPanoramicCameraSelection`): no scale.
+        let centres: Vec<Vector3<f64>> = world_poses.values().flatten().map(|(_, c)| *c).collect();
+        if centres.iter().all(|c| (c - centres[0]).norm() <= 1e-9) {
+            return false;
+        }
+
+        let (fx, fy, _, _) = camera.intrinsics().unwrap_or((1.0, 1.0, 0.0, 0.0));
+        let cfg = GeneralizedRelativePoseRansacConfig {
+            max_iterations: 2000,
+            min_iterations: 100,
+            confidence: 0.9999,
+            // Epipolar errors gate inliers more tightly (`0.5 *`).
+            inlier_angular_threshold: 0.5 * options.abs_pose_max_error / (0.5 * (fx + fy)),
+            seed: options.random_seed,
+            min_inliers: 6,
+        };
+        let Some(report) = estimate_gr6p_ransac_with_config(&gr_corrs, &cfg)
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        if report.inliers.len() < min_num_inliers {
+            return false;
+        }
+
+        let cam_from_world = SE3::new(report.pose.rotation, report.pose.translation);
+        let camera_id = recon.image(image_id).camera_id;
+        let rig = recon.rig(recon.frame(frame_id).rig_id()).clone();
+        recon
+            .frame_mut(frame_id)
+            .set_cam_from_world(&rig, camera_id, cam_from_world);
+        self.obs.register_frame(recon, graph, frame_id);
+        self.register_frame_event(recon, frame_id);
+        self.log_event(format!(
+            "REGISTER path=SL frame={} image={} inliers={} correspondences={} num_reg_frames={} num_points3d={}",
+            frame_id,
+            image_id,
+            report.inliers.len(),
+            corrs.len(),
+            recon.num_reg_frames(),
+            recon.num_points3d()
+        ));
+
+        // Inlier correspondences per 2D point, in COLMAP's order.
+        let mut inlier_corrs: BTreeMap<usize, Vec<(ImageT, usize)>> = BTreeMap::new();
+        for &i in &report.inliers {
+            let (idx, world_id, world_idx) = corrs[i];
+            inlier_corrs
+                .entry(idx)
+                .or_default()
+                .push((world_id, world_idx));
+        }
+        let mut config = BundleAdjustmentConfig::new();
+        config.add_image(image_id);
+        for (idx, views) in inlier_corrs {
+            // Continue the first triangulated track among the matches.
+            let continued = views.iter().find_map(|&(world_id, world_idx)| {
+                recon.image(world_id).points2d[world_idx].point3d_id
+            });
+            if let Some(point3d_id) = continued {
+                self.obs.add_observation(
+                    recon,
+                    graph,
+                    point3d_id,
+                    TrackElement {
+                        image_id,
+                        point2d_idx: idx,
+                    },
+                );
+                self.triangulator.add_modified_point3d(point3d_id);
+                continue;
+            }
+            // Otherwise triangulate a new track; as in COLMAP, the default
+            // (angular) residual with `abs_pose_max_error` as its bound.
+            let mut tri_views = views.clone();
+            tri_views.push((image_id, idx));
+            let Some((xyz, inliers)) = estimate_triangulation_of_views(
+                recon,
+                &tri_views,
+                options.abs_pose_max_error,
+                options.filter_min_tri_angle_deg.to_radians(),
+            ) else {
+                continue;
+            };
+            if !inliers.last().copied().unwrap_or(false) {
+                continue;
+            }
+            let track: Vec<TrackElement> = tri_views
+                .iter()
+                .zip(&inliers)
+                .filter(|(_, &inlier)| inlier)
+                .map(|(&(image_id, point2d_idx), _)| TrackElement {
+                    image_id,
+                    point2d_idx,
+                })
+                .collect();
+            let point3d_id = self.obs.add_point3d(recon, graph, xyz, track);
+            self.triangulator.add_modified_point3d(point3d_id);
+            config.add_variable_point(point3d_id);
+        }
+
+        // Refine the pose with the triangulated structure.
+        let mut ba_options = BundleAdjustmentOptions::local();
+        ba_options.loss_function = LossFunction::Cauchy(1.0);
+        ba_options.local_ba_point_policy = LocalBaPointPolicy::Colmap;
+        bundle_adjustment::solve(&ba_options, &config, recon)
     }
 
     /// Port of the ordinary single-camera path (`.cc:273-489`).
@@ -1229,17 +1456,26 @@ impl IncrementalMapper {
     }
 
     /// Port of `FindNextImages` (`.cc:182-192`, delegating to
-    /// `mapper_impl.rs`); `structure_less` mode is not ported (see
-    /// `pipeline.rs` module doc's deviation on
-    /// `structure_less_registration_fallback`).
-    pub fn find_next_images(&self, options: &Options, recon: &Reconstruction) -> Vec<ImageT> {
+    /// `mapper_impl.rs`). `structure_less` ranks by 2D-2D correspondences
+    /// to registered images and counts structure-less trials separately.
+    pub fn find_next_images(
+        &self,
+        options: &Options,
+        recon: &Reconstruction,
+        structure_less: bool,
+    ) -> Vec<ImageT> {
         let ranked = mapper_impl::find_next_images(
             options.abs_pose_min_num_inliers,
             options.max_reg_trials,
             recon,
             &self.obs,
             &self.filtered_frames,
-            &self.num_reg_trials,
+            if structure_less {
+                &self.num_structure_less_reg_trials
+            } else {
+                &self.num_reg_trials
+            },
+            structure_less,
         );
 
         // Env-gated boundary diagnostic for the 10k model-splitting
@@ -1288,7 +1524,110 @@ impl IncrementalMapper {
 
 #[cfg(test)]
 mod tests {
-    use super::Options;
+    use super::{IncrementalMapper, Options};
+    use std::collections::BTreeMap;
+
+    use nalgebra::{Point3, UnitQuaternion, Vector3};
+    use visloc_core::geometry::SE3;
+    use visloc_vision::two_view::{ConfigurationType, CorrespondenceGraph};
+
+    use crate::colmap_incremental::database_cache::DatabaseCache;
+    use crate::colmap_incremental::pipeline::reconstruction_from_cache;
+    use crate::colmap_incremental::reconstruction::{Camera, Image, Point2D};
+    use crate::colmap_incremental::types::{DataT, Frame, ImageT, Rig, SensorT};
+
+    /// Structure-less registration places an image that sees no 3D point
+    /// (two registered images, no structure) at its true pose from its
+    /// 2D-2D matches alone, with metric scale, and triangulates its matches.
+    #[test]
+    fn structure_less_registration_recovers_the_pose_without_structure() {
+        let mut rig = Rig::new();
+        rig.set_rig_id(0);
+        rig.add_ref_sensor(SensorT::camera(1));
+        let camera = Camera::pinhole(1, 640, 480, 500.0, 500.0, 320.0, 240.0);
+        let points: Vec<Point3<f64>> = (0..60)
+            .map(|i| {
+                let i = i as f64;
+                Point3::new(
+                    (i * 0.37).sin() * 1.2,
+                    (i * 0.71).cos() * 0.8,
+                    4.0 + (i * 0.53).sin(),
+                )
+            })
+            .collect();
+        let poses = [
+            SE3::new(UnitQuaternion::identity(), Vector3::zeros()),
+            SE3::new(
+                UnitQuaternion::from_euler_angles(0.0, 0.05, 0.0),
+                Vector3::new(-0.6, 0.0, 0.1),
+            ),
+            SE3::new(
+                UnitQuaternion::from_euler_angles(0.02, -0.06, 0.01),
+                Vector3::new(0.5, 0.15, -0.05),
+            ),
+        ];
+        let mut frames = BTreeMap::new();
+        let mut images = BTreeMap::new();
+        for (k, pose) in poses.iter().enumerate() {
+            let id = k as ImageT;
+            let mut frame = Frame::new(id, 0);
+            frame.add_data_id(DataT::camera(1, id));
+            frames.insert(id, frame);
+            let mut image = Image::new(id, 1, id, format!("{k}.png"));
+            image.points2d = points
+                .iter()
+                .map(|p| Point2D::new(camera.project(&pose.transform_point(p)).unwrap()))
+                .collect();
+            images.insert(id, image);
+        }
+        let mut graph = CorrespondenceGraph::new();
+        for id in 0..3 {
+            graph.add_image(id, points.len());
+        }
+        let matches: Vec<(usize, usize)> = (0..points.len()).map(|j| (j, j)).collect();
+        for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+            graph
+                .add_two_view_geometry(a, b, &matches, ConfigurationType::Calibrated)
+                .unwrap();
+        }
+        graph.finalize();
+        let mut cameras = BTreeMap::new();
+        cameras.insert(1, camera);
+        let db =
+            DatabaseCache::from_parts(BTreeMap::from([(0, rig)]), cameras, frames, images, graph);
+        let mut recon = reconstruction_from_cache(&db);
+        for (k, pose) in poses.iter().take(2).enumerate() {
+            recon.frame_mut(k as u64).set_rig_from_world(pose.clone());
+            recon.register_frame(k as u64);
+        }
+
+        let mut mapper = IncrementalMapper::new();
+        mapper.begin_reconstruction(&recon, db.correspondence_graph());
+        let options = Options {
+            abs_pose_min_num_inliers: 20,
+            ..Options::default()
+        };
+        assert_eq!(
+            mapper.find_next_images(&options, &recon, false),
+            Vec::<ImageT>::new(),
+            "no 3D point is visible, so structure-based registration has no candidate"
+        );
+        assert!(mapper.register_next_structure_less_image(
+            &options,
+            &mut recon,
+            db.correspondence_graph(),
+            2
+        ));
+        let got = recon.frame(2).rig_from_world();
+        let rotation_error = (got.rotation.inverse() * poses[2].rotation).angle();
+        let centre_error = (got.inverse().translation - poses[2].inverse().translation).norm();
+        assert!(
+            rotation_error < 1e-6,
+            "rotation off by {rotation_error} rad"
+        );
+        assert!(centre_error < 1e-6, "centre off by {centre_error}");
+        assert_eq!(recon.num_points3d(), points.len());
+    }
 
     #[test]
     fn options_apply_overrides_by_key() {

@@ -83,6 +83,26 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **COLMAP 4's structure-less registration fallback in the COLMAP-port
+  mapper.** When no candidate image registers from 2D-3D correspondences,
+  the mapper now retries the candidates from 2D-2D correspondences to the
+  registered images. The registered cameras form one generalized camera
+  in world coordinates. GR6P RANSAC between it and the new image gives
+  the pose with metric scale. The inlier matches then continue existing
+  tracks or triangulate new ones, and a Cauchy-loss BA refines the pose.
+  `MapperOptions::structure_less_registration_fallback` turns it on.
+  `gsplat_photos` and `gsplat_euroc` enable it, and the port's own controls
+  keep it off. Results with it on, from the same features:
+  - ETH3D pipes registers 14/14 images instead of 11/14, as COLMAP 4.2's
+    mapper does on these matches (COLMAP also registers 11/14 with the
+    fallback off).
+  - The other 12 ETH3D DSLR training scenes are unchanged.
+  - The Courthouse replay with it off is byte-identical.
+
+  Deviations from COLMAP 4: GR6P only, with no 5+1 solver, grouped
+  sampler or LO step; a bounded number of trials; and an angular epipolar
+  threshold in place of the tangent Sampson error.
+
 - **`gsplat_photos --mask-black N` trains around blacked-out pixels.**
   Near-black regions (people and cars some datasets black out) get alpha 0
   in the training images; `TrainConfig::alpha_mask` leaves pixels with alpha

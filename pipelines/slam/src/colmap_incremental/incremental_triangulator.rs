@@ -1673,6 +1673,36 @@ fn local_optimize_triangulation(
     (local_best_support, local_best_model)
 }
 
+/// `EstimateTriangulation` with `EstimateTriangulationOptions`' default
+/// (angular) residual on the 2D points `views` at their images' current
+/// poses: the point and its inlier mask over `views`. Structure-less
+/// registration triangulates its new tracks with this
+/// (`incremental_mapper.cc`, `RegisterNextStructureLessImage`).
+pub(crate) fn estimate_triangulation_of_views(
+    recon: &Reconstruction,
+    views: &[(ImageT, Point2DT)],
+    max_error: f64,
+    min_tri_angle_rad: f64,
+) -> Option<(Point3<f64>, Vec<bool>)> {
+    let corrs: Vec<CorrData> = views
+        .iter()
+        .map(|&(image_id, point2d_idx)| {
+            let image = recon.image(image_id);
+            let point2d = &image.points2d[point2d_idx];
+            CorrData {
+                image_id,
+                point2d_idx,
+                xy: point2d.xy,
+                has_point3d: point2d.has_point3d(),
+                point3d_id: point2d.point3d_id,
+                cam_from_world: image_cam_from_world(recon, image_id),
+                camera: recon.camera(image.camera_id).clone(),
+            }
+        })
+        .collect();
+    estimate_triangulation(&corrs, ResidualType::Angular, max_error, min_tri_angle_rad)
+}
+
 /// Faithful port of `TriangulateTrack` (`sfm/incremental_triangulator.cc:39-66`)
 /// and `EstimateTriangulation` (`estimators/triangulation.cc`):
 /// `LORANSAC<TriangulationEstimator, TriangulationEstimator,

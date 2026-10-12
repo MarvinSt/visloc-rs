@@ -125,8 +125,8 @@ use crate::bundle::{BaConfig, BaRigObservation, BundleAdjustment};
 use visloc_core::geometry::{Pose, SE3};
 
 use super::reconstruction::Reconstruction;
-use super::rig_ba_solver::{RigBaInput, RigObs};
-use super::types::{CameraT, FrameT, ImageT, Point3DT, SensorT};
+use super::rig_ba_solver::{Obs, PointMajorObs, RigBaInput, RigObs};
+use super::types::{CameraT, FrameT, ImageT, Point2DT, Point3DT, SensorT};
 
 /// Port of `BundleAdjustmentGauge` (`bundle_adjustment.h:47-48`). See module
 /// doc deviation 4.
@@ -499,6 +499,336 @@ pub fn points_observed_by(recon: &Reconstruction, images: &BTreeSet<ImageT>) -> 
         .collect()
 }
 
+/// The point policy of [`solve`] for one point: whether it is variable and
+/// whether its out-of-window track observations are pulled in.
+fn point_policy(
+    options: &BundleAdjustmentOptions,
+    config: &BundleAdjustmentConfig,
+    point3d_id: Point3DT,
+    track_fully_in_window: bool,
+) -> (bool, bool) {
+    // Three-way `LocalBaPointPolicy` branch (see each variant's doc):
+    // `Colmap` and `VariableWithoutPullIn` both honor an explicit
+    // `add_variable_point` request unconditionally (the *variable vs.
+    // constant decision* is identical); `WindowOnly` only honors it
+    // when the track is already fully in the window. Only `Colmap`
+    // then pulls in the rest of the track as extra fixed-pose
+    // residuals; `VariableWithoutPullIn` (the actual pre-C2.6 rule,
+    // restored from `git show 053f6e4`) leaves the point free but
+    // optimizes it from only whichever observations already happen to
+    // be in this problem (its in-window observations) — the outside
+    // ones are simply never added, not pulled in with a fixed pose.
+    let explicit_variable = config.variable_point3d_ids.contains(&point3d_id);
+    let honor_explicit_variable = matches!(
+        options.local_ba_point_policy,
+        LocalBaPointPolicy::Colmap | LocalBaPointPolicy::VariableWithoutPullIn
+    );
+    // `ParameterizePoints` (`bundle_adjustment_ceres.cc:546`): a point
+    // is constant when `!refine_points3D` or when its track is longer
+    // than the number of observations added to this problem (the
+    // latter is exactly `!track_fully_in_window`).
+    let variable = options.refine_points3d
+        && !config.constant_point3d_ids.contains(&point3d_id)
+        && (track_fully_in_window || (honor_explicit_variable && explicit_variable));
+    // `AddPointToProblem` (`bundle_adjustment_ceres.cc:819-879`): pull in
+    // every remaining track observation from images outside
+    // `config.Images()`, with that image's pose baked in as fixed data, so
+    // the point sees its *entire* track (matching `ParameterizePoints`'s
+    // `track.Length() == num_observations` free condition exactly instead
+    // of only seeing the in-window subset).
+    let pull_in = variable
+        && options.local_ba_point_policy == LocalBaPointPolicy::Colmap
+        && explicit_variable
+        && !track_fully_in_window;
+    (variable, pull_in)
+}
+
+/// [`solve`] for the native solver: the same problem as [`solve_legacy`]
+/// (frames, points, gauge, and every observation in the same order), built
+/// point by point from the tracks instead of image by image.
+///
+/// [`solve_legacy`] lists the observations image by image (`config.Images()`
+/// ascending, then 2D points ascending), appends the pulled-in ones point by
+/// point in track order, and the solver then groups them by point with a
+/// stable sort. A point's group is therefore its in-window track elements
+/// sorted by `(image_id, point2d_idx)` followed by its pulled-in elements in
+/// track order — which this builds directly from the track, in parallel,
+/// without the image-ordered list (on a global BA, two copies of every
+/// observation and most of the setup time).
+fn solve_native(
+    options: &BundleAdjustmentOptions,
+    config: &BundleAdjustmentConfig,
+    recon: &mut Reconstruction,
+) -> bool {
+    use rayon::prelude::*;
+    let solve_started = std::time::Instant::now();
+
+    let frame_ids: BTreeSet<FrameT> = config
+        .image_ids
+        .iter()
+        .map(|&image_id| recon.image(image_id).frame_id)
+        .collect();
+    let max_image_id = *config.image_ids.last().expect("non-empty");
+    let mut in_window = vec![false; max_image_id as usize + 1];
+    for &image_id in &config.image_ids {
+        in_window[image_id as usize] = true;
+    }
+    let in_window = |image_id: ImageT| in_window.get(image_id as usize).copied().unwrap_or(false);
+
+    // Every point observed in the window, plus the configured ones
+    // (`AddPointToProblem` for `config.VariablePoints()`/`ConstantPoints()`).
+    let image_ids: Vec<ImageT> = config.image_ids.iter().copied().collect();
+    let per_image: Vec<Vec<Point3DT>> = image_ids
+        .par_iter()
+        .map(|&image_id| {
+            recon
+                .image(image_id)
+                .points2d
+                .iter()
+                .filter_map(|point2d| point2d.point3d_id)
+                .collect()
+        })
+        .collect();
+    let mut added_points: Vec<Point3DT> = Vec::with_capacity(
+        per_image.iter().map(Vec::len).sum::<usize>()
+            + config.variable_point3d_ids.len()
+            + config.constant_point3d_ids.len(),
+    );
+    for ids in &per_image {
+        added_points.extend_from_slice(ids);
+    }
+    added_points.extend(&config.variable_point3d_ids);
+    added_points.extend(&config.constant_point3d_ids);
+    drop(per_image);
+    added_points.par_sort_unstable();
+    added_points.dedup();
+
+    struct PointPlan {
+        xyz: Point3<f64>,
+        variable: bool,
+        /// In-window track elements, then pulled-in ones.
+        n_window: usize,
+        n_pulled: usize,
+    }
+    let plans: Vec<PointPlan> = added_points
+        .par_iter()
+        .map(|&point3d_id| {
+            let point = recon.point3d(point3d_id);
+            let n_window = point
+                .track
+                .iter()
+                .filter(|el| in_window(el.image_id))
+                .count();
+            let (variable, pull_in) =
+                point_policy(options, config, point3d_id, n_window == point.track.len());
+            PointPlan {
+                xyz: point.xyz,
+                variable,
+                n_window,
+                n_pulled: if pull_in {
+                    point.track.len() - n_window
+                } else {
+                    0
+                },
+            }
+        })
+        .collect();
+    let mut point_obs_range: Vec<(u32, u32)> = Vec::with_capacity(plans.len());
+    let mut n_obs = 0usize;
+    for plan in &plans {
+        let len = plan.n_window + plan.n_pulled;
+        point_obs_range.push((n_obs as u32, (n_obs + len) as u32));
+        n_obs += len;
+    }
+    if n_obs == 0 || added_points.is_empty() {
+        return false;
+    }
+    // Each point's observations in problem order, filled in place: its
+    // in-window track elements sorted by `(image_id, point2d_idx)`, then
+    // its pulled-in ones in track order.
+    let mut keys: Vec<(ImageT, Point2DT)> = vec![(0, 0); n_obs];
+    let mut chunks: Vec<&mut [(ImageT, Point2DT)]> = Vec::with_capacity(plans.len());
+    let mut rest = keys.as_mut_slice();
+    for plan in &plans {
+        let (chunk, tail) = rest.split_at_mut(plan.n_window + plan.n_pulled);
+        chunks.push(chunk);
+        rest = tail;
+    }
+    chunks
+        .into_par_iter()
+        .zip(&added_points)
+        .zip(&plans)
+        .for_each(|((chunk, &point3d_id), plan)| {
+            let track = &recon.point3d(point3d_id).track;
+            let (window, pulled) = chunk.split_at_mut(plan.n_window);
+            for (slot, el) in window
+                .iter_mut()
+                .zip(track.iter().filter(|el| in_window(el.image_id)))
+            {
+                *slot = (el.image_id, el.point2d_idx);
+            }
+            window.sort_unstable();
+            for (slot, el) in pulled
+                .iter_mut()
+                .zip(track.iter().filter(|el| !in_window(el.image_id)))
+            {
+                *slot = (el.image_id, el.point2d_idx);
+            }
+        });
+
+    // Frames pulled in purely to hold a fixed, baked-constant pose for a
+    // variable point's out-of-window observations; never written back.
+    let mut pulled_frame_ids: BTreeSet<FrameT> = BTreeSet::new();
+    let mut max_obs_image_id = max_image_id;
+    for (plan, &(_, end)) in plans.iter().zip(&point_obs_range) {
+        let end = end as usize;
+        for &(image_id, _) in &keys[end - plan.n_pulled..end] {
+            max_obs_image_id = max_obs_image_id.max(image_id);
+            let frame_id = recon.image(image_id).frame_id;
+            if !frame_ids.contains(&frame_id) {
+                pulled_frame_ids.insert(frame_id);
+            }
+        }
+    }
+
+    // Frames ascending (window and pulled-in), as the solver indexes them.
+    let all_frame_ids: Vec<FrameT> = frame_ids.union(&pulled_frame_ids).copied().collect();
+    let mut frame_fixed: Vec<bool> = all_frame_ids
+        .iter()
+        .map(|id| config.constant_frame_ids.contains(id) || pulled_frame_ids.contains(id))
+        .collect();
+    let mut point_fixed: Vec<bool> = plans.iter().map(|plan| !plan.variable).collect();
+    let n_gauge_frames = match config.gauge {
+        Gauge::OneFrameFromWorld => 1,
+        Gauge::TwoFramesFromWorld => 2,
+        _ => 0,
+    };
+    if n_gauge_frames > 0 {
+        let candidates: Vec<usize> = frame_ids
+            .iter()
+            .map(|id| all_frame_ids.binary_search(id).expect("window frame"))
+            .filter(|&idx| !frame_fixed[idx])
+            .take(n_gauge_frames)
+            .collect();
+        for idx in candidates {
+            frame_fixed[idx] = true;
+        }
+    }
+    if config.gauge == Gauge::ThreePoints {
+        for fixed in point_fixed.iter_mut().filter(|fixed| !**fixed).take(3) {
+            *fixed = true;
+        }
+    }
+
+    // Per observed image: its frame's index and its camera as the solver
+    // reads them. An unsupported camera model fails the solve.
+    struct ImageInfo {
+        frame_idx: u32,
+        intrinsics: (f64, f64, f64, f64),
+        sensor_from_rig: SE3,
+    }
+    let mut observed = vec![false; max_obs_image_id as usize + 1];
+    for &image_id in &config.image_ids {
+        observed[image_id as usize] = true;
+    }
+    for (plan, &(_, end)) in plans.iter().zip(&point_obs_range) {
+        let end = end as usize;
+        for &(image_id, _) in &keys[end - plan.n_pulled..end] {
+            observed[image_id as usize] = true;
+        }
+    }
+    let mut image_info: Vec<Option<ImageInfo>> = Vec::with_capacity(observed.len());
+    for (image_id, &seen) in observed.iter().enumerate() {
+        if !seen {
+            image_info.push(None);
+            continue;
+        }
+        let image_id = image_id as ImageT;
+        let image = recon.image(image_id);
+        let Some(intrinsics) = recon.camera(image.camera_id).intrinsics() else {
+            return false;
+        };
+        image_info.push(Some(ImageInfo {
+            frame_idx: all_frame_ids
+                .binary_search(&image.frame_id)
+                .expect("observed frame") as u32,
+            intrinsics,
+            sensor_from_rig: sensor_from_rig_for_image(recon, image_id),
+        }));
+    }
+    let point_xyz: Vec<Point3<f64>> = plans.iter().map(|plan| plan.xyz).collect();
+    drop(plans);
+    let obs: Vec<Obs> = keys
+        .par_iter()
+        .map(|&(image_id, point2d_idx)| {
+            let info = image_info[image_id as usize]
+                .as_ref()
+                .expect("observed image");
+            Obs::new(
+                info.frame_idx,
+                recon.image(image_id).points2d[point2d_idx].xy,
+                info.intrinsics,
+                info.sensor_from_rig.clone(),
+            )
+        })
+        .collect();
+    drop(keys);
+
+    let n_lm = added_points.len();
+    let n_fixed_lm = point_fixed.iter().filter(|&&fixed| fixed).count();
+    let mut input = RigBaInput {
+        poses: all_frame_ids
+            .iter()
+            .map(|&id| recon.frame(id).rig_from_world().clone())
+            .collect(),
+        frame_ids: all_frame_ids,
+        frame_fixed,
+        point_ids: added_points,
+        point_fixed,
+        points: point_xyz,
+    };
+    let started = std::time::Instant::now();
+    let solved = super::rig_ba_solver::optimize_point_major(
+        &mut input,
+        PointMajorObs {
+            obs,
+            point_obs_range,
+        },
+        options.max_num_iterations,
+        options.loss_function,
+        options.gradient_tolerance_rel,
+    );
+    let Ok(result) = solved else {
+        return false;
+    };
+    eprintln!(
+        "BA_SOLVE backend={:?} frames={} obs={n_obs} landmarks={n_lm} fixed_landmarks={n_fixed_lm} iterations={} elapsed_ms={}",
+        options.backend,
+        frame_ids.len(),
+        result.iterations.len(),
+        started.elapsed().as_millis()
+    );
+
+    for &frame_id in &frame_ids {
+        let idx = input
+            .frame_ids
+            .binary_search(&frame_id)
+            .expect("frame id present");
+        recon
+            .frame_mut(frame_id)
+            .set_rig_from_world(input.poses[idx].clone());
+    }
+    for (&point3d_id, &xyz) in input.point_ids.iter().zip(&input.points) {
+        recon.point3d_mut(point3d_id).xyz = xyz;
+    }
+    eprintln!(
+        "TIMING ba_solve_total frames={} elapsed_ms={}",
+        frame_ids.len(),
+        solve_started.elapsed().as_millis()
+    );
+    true
+}
+
 pub fn solve(
     options: &BundleAdjustmentOptions,
     config: &BundleAdjustmentConfig,
@@ -507,6 +837,23 @@ pub fn solve(
     if config.image_ids.is_empty() {
         return false;
     }
+    let accelerate = options.loss_function == LossFunction::Trivial
+        && std::env::var_os("VISLOC_PORT_GPU_BA").is_some();
+    if options.backend == BaBackend::Native && !accelerate {
+        return solve_native(options, config, recon);
+    }
+    solve_legacy(options, config, recon, accelerate)
+}
+
+/// [`solve`] through a [`BundleAdjustment`] problem: the `Legacy` backend and
+/// the optional accelerator (falling back to the native solver when it
+/// declines).
+fn solve_legacy(
+    options: &BundleAdjustmentOptions,
+    config: &BundleAdjustmentConfig,
+    recon: &mut Reconstruction,
+    accelerate: bool,
+) -> bool {
     let solve_started = std::time::Instant::now();
 
     let default_camera = recon
@@ -613,35 +960,10 @@ pub fn solve(
                 .track
                 .iter()
                 .all(|el| config.image_ids.contains(&el.image_id));
-            // Three-way `LocalBaPointPolicy` branch (see each variant's doc):
-            // `Colmap` and `VariableWithoutPullIn` both honor an explicit
-            // `add_variable_point` request unconditionally (the *variable vs.
-            // constant decision* is identical); `WindowOnly` only honors it
-            // when the track is already fully in the window. Only `Colmap`
-            // then pulls in the rest of the track as extra fixed-pose
-            // residuals; `VariableWithoutPullIn` (the actual pre-C2.6 rule,
-            // restored from `git show 053f6e4`) leaves the point free but
-            // optimizes it from only whichever observations already happen to
-            // be in this problem (its in-window observations) — the outside
-            // ones are simply never added, not pulled in with a fixed pose.
-            let explicit_variable = config.variable_point3d_ids.contains(&point3d_id);
-            let honor_explicit_variable = matches!(
-                options.local_ba_point_policy,
-                LocalBaPointPolicy::Colmap | LocalBaPointPolicy::VariableWithoutPullIn
-            );
-            // `ParameterizePoints` (`bundle_adjustment_ceres.cc:546`): a point
-            // is constant when `!refine_points3D` or when its track is longer
-            // than the number of observations added to this problem (the
-            // latter is exactly `!track_fully_in_window`).
-            let variable = options.refine_points3d
-                && !config.constant_point3d_ids.contains(&point3d_id)
-                && (track_fully_in_window || (honor_explicit_variable && explicit_variable));
+            let (variable, pull_in) =
+                point_policy(options, config, point3d_id, track_fully_in_window);
             let mut pulled = Vec::new();
-            if variable
-                && options.local_ba_point_policy == LocalBaPointPolicy::Colmap
-                && explicit_variable
-                && !track_fully_in_window
-            {
+            if pull_in {
                 // `AddPointToProblem` (`bundle_adjustment_ceres.cc:819-879`):
                 // pull in every remaining track observation from images
                 // outside `config.Images()`, with that image's pose baked in
@@ -751,56 +1073,30 @@ pub fn solve(
 
     let started = std::time::Instant::now();
     let n_obs = rig_obs.len();
-    let accelerate = options.loss_function == LossFunction::Trivial
-        && std::env::var_os("VISLOC_PORT_GPU_BA").is_some();
-    // Only the native solver reads compact observations.
-    let native_direct = options.backend == BaBackend::Native && !accelerate;
     let n_lm = added_points.len();
     let n_fixed_lm = point_fixed.iter().filter(|&&fixed| fixed).count();
-    let mut direct: Option<RigBaInput> = None;
-    let rig_obs: Vec<RigObs> = if native_direct {
-        direct = Some(RigBaInput {
-            frame_ids: ba.poses.keys().copied().collect(),
-            frame_fixed: ba
-                .poses
-                .keys()
-                .map(|id| ba.fixed_poses.contains(id))
-                .collect(),
-            poses: ba
-                .poses
-                .values()
-                .map(|p| p.world_to_camera.clone())
-                .collect(),
-            point_ids: added_points.clone(),
-            point_fixed,
-            points: point_xyz,
-        });
-        rig_obs.into_iter().map(|(o, _)| o).collect()
-    } else {
-        // Ascending ids: both collections build in bulk.
-        ba.landmarks = added_points
-            .iter()
-            .copied()
-            .zip(point_xyz.iter().copied())
-            .collect();
-        ba.fixed_landmarks = added_points
-            .iter()
-            .zip(&point_fixed)
-            .filter(|(_, &fixed)| fixed)
-            .map(|(&id, _)| id)
-            .collect();
-        ba.rig_observations = rig_obs
-            .into_iter()
-            .map(|(o, camera_id)| BaRigObservation {
-                keyframe_id: o.keyframe_id,
-                landmark_id: o.landmark_id,
-                xy: o.xy,
-                camera: recon.camera(camera_id).clone(),
-                sensor_from_rig: o.sensor_from_rig,
-            })
-            .collect();
-        Vec::new()
-    };
+    // Ascending ids: both collections build in bulk.
+    ba.landmarks = added_points
+        .iter()
+        .copied()
+        .zip(point_xyz.iter().copied())
+        .collect();
+    ba.fixed_landmarks = added_points
+        .iter()
+        .zip(&point_fixed)
+        .filter(|(_, &fixed)| fixed)
+        .map(|(&id, _)| id)
+        .collect();
+    ba.rig_observations = rig_obs
+        .into_iter()
+        .map(|(o, camera_id)| BaRigObservation {
+            keyframe_id: o.keyframe_id,
+            landmark_id: o.landmark_id,
+            xy: o.xy,
+            camera: recon.camera(camera_id).clone(),
+            sensor_from_rig: o.sensor_from_rig,
+        })
+        .collect();
     // Optional accelerator (e.g. GPU LM) for trivial-loss (global) problems
     // of a single camera: identity sensor-from-rig observations are ordinary
     // monocular observations. Anything else stays on the native solver.
@@ -868,13 +1164,6 @@ pub fn solve(
                 }
                 ba.optimize(&ba_config)
             }
-            BaBackend::Native if native_direct => super::rig_ba_solver::optimize_rig_input(
-                direct.as_mut().expect("built for the direct path"),
-                &rig_obs,
-                options.max_num_iterations,
-                options.loss_function,
-                options.gradient_tolerance_rel,
-            ),
             BaBackend::Native => super::rig_ba_solver::optimize_with_tolerance(
                 &mut ba,
                 options.max_num_iterations,
@@ -894,30 +1183,15 @@ pub fn solve(
         started.elapsed().as_millis()
     );
 
-    if let Some(input) = direct {
-        for &frame_id in &frame_ids {
-            let idx = input
-                .frame_ids
-                .binary_search(&frame_id)
-                .expect("frame id present");
-            recon
-                .frame_mut(frame_id)
-                .set_rig_from_world(input.poses[idx].clone());
-        }
-        for (&point3d_id, &xyz) in added_points.iter().zip(&input.points) {
-            recon.point3d_mut(point3d_id).xyz = xyz;
-        }
-    } else {
-        for &frame_id in &frame_ids {
-            let pose = &ba.poses[&frame_id];
-            recon
-                .frame_mut(frame_id)
-                .set_rig_from_world(pose.world_to_camera.clone());
-        }
-        for &point3d_id in &added_points {
-            let xyz: Point3<f64> = ba.landmarks[&point3d_id];
-            recon.point3d_mut(point3d_id).xyz = xyz;
-        }
+    for &frame_id in &frame_ids {
+        let pose = &ba.poses[&frame_id];
+        recon
+            .frame_mut(frame_id)
+            .set_rig_from_world(pose.world_to_camera.clone());
+    }
+    for &point3d_id in &added_points {
+        let xyz: Point3<f64> = ba.landmarks[&point3d_id];
+        recon.point3d_mut(point3d_id).xyz = xyz;
     }
     eprintln!(
         "TIMING ba_solve_total frames={} elapsed_ms={}",
@@ -1215,6 +1489,61 @@ mod tests {
             &outside_pose_before,
             "outside frame pulled in only to supply a fixed pose must stay bit-identical"
         );
+    }
+
+    /// The native solve's point-by-point problem build ([`solve_native`])
+    /// produces the image-ordered build's problem exactly ([`solve_legacy`]
+    /// on the native solver): bit-identical results, on a global-style
+    /// scene and on a local window with pulled-in observations, a pulled-in
+    /// frame and the three-point gauge.
+    #[test]
+    fn native_point_major_build_matches_image_order_build() {
+        let options = BundleAdjustmentOptions::global();
+        let (mut a, config, _, _) = build_scene(5);
+        let mut b = a.clone();
+        assert!(solve_native(&options, &config, &mut a));
+        assert!(solve_legacy(&options, &config, &mut b, false));
+        assert_eq!(a, b);
+
+        let scene = build_synthetic_rig_scene(6, 5);
+        let mut recon = reconstruction_from_cache(&scene.db);
+        for (&frame_id, gt) in &scene.ground_truth_rig_from_world {
+            recon.frame_mut(frame_id).set_rig_from_world(gt.clone());
+            recon.register_frame(frame_id);
+        }
+        // Tracks over every image, but in reverse image order, so the
+        // in-window observations must be re-sorted.
+        let mut point_ids = Vec::new();
+        for (idx, gt) in scene.ground_truth_points.iter().enumerate().take(8) {
+            let mut track = Vec::new();
+            for &(i1, i2) in scene.images_per_frame.iter().rev() {
+                for image_id in [i2, i1] {
+                    track.push(TrackElement {
+                        image_id,
+                        point2d_idx: idx,
+                    });
+                }
+            }
+            let id = recon.add_point3d(gt + Vector3::new(0.03, -0.02, 0.01), track);
+            point_ids.push(id);
+        }
+        let mut config = BundleAdjustmentConfig::new();
+        for frame_id in 0..4usize {
+            let (i1, i2) = scene.images_per_frame[frame_id];
+            config.add_image(i1);
+            config.add_image(i2);
+        }
+        config.set_constant_rig_from_world_pose(0);
+        for &id in &point_ids[..5] {
+            config.add_variable_point(id);
+        }
+        config.fix_gauge(Gauge::ThreePoints);
+        let mut options = BundleAdjustmentOptions::local();
+        options.local_ba_point_policy = LocalBaPointPolicy::Colmap;
+        let mut b = recon.clone();
+        assert!(solve_native(&options, &config, &mut recon));
+        assert!(solve_legacy(&options, &config, &mut b, false));
+        assert_eq!(recon, b);
     }
 
     /// C2.5 task item 6(d): frames in `constant_frame_ids` and points in

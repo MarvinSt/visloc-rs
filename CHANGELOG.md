@@ -162,6 +162,20 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **COLMAP-port BA builds its problem point by point.** The native solve
+  used to list every observation image by image (with a camera id each),
+  copy that list twice, and have the solver regroup it by point with a
+  stable sort. It now builds each point's observations straight from its
+  track, in the order the regrouping produced (in-window elements by
+  image and 2D point, then the pulled-in ones), so the problem and the
+  results are bit-identical. On the Courthouse replay this takes BA setup
+  and problem build from 5.7 s to 4.0 s, and peak memory from 618 MB to
+  550 MB. Courthouse output is byte-identical.
+- **The correspondence graph looks images up with an integer hash.** It
+  used SipHash on the image id, which took most of `find_correspondences`,
+  the inner loop of track completion and merging. Courthouse
+  complete/merge in global refinement takes 5.9 s instead of 7.0 s.
+
 - **The COLMAP-port BA's PCG is preconditioned with runs of 32 frames.**
   Block-Jacobi dropped every coupling between cameras. Cameras next to
   each other in capture (frame-id) order share most points, so the

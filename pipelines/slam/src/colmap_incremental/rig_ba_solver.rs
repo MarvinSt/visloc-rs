@@ -162,7 +162,7 @@ const MAX_DIAGONAL: f64 = 1e32;
 /// Grouped by point in [`Problem::obs`] so a point's observations are a
 /// contiguous slice.
 #[derive(Debug, Clone)]
-struct Obs {
+pub(crate) struct Obs {
     frame_idx: u32,
     xy: Point2<f64>,
     fx: f64,
@@ -170,6 +170,36 @@ struct Obs {
     cx: f64,
     cy: f64,
     sensor_from_rig: SE3,
+}
+
+impl Obs {
+    /// An observation of frame `frame_idx` (index into
+    /// [`RigBaInput::frame_ids`]) through pinhole `intrinsics`.
+    pub(crate) const fn new(
+        frame_idx: u32,
+        xy: Point2<f64>,
+        (fx, fy, cx, cy): (f64, f64, f64, f64),
+        sensor_from_rig: SE3,
+    ) -> Self {
+        Self {
+            frame_idx,
+            xy,
+            fx,
+            fy,
+            cx,
+            cy,
+            sensor_from_rig,
+        }
+    }
+}
+
+/// A solve's observations already grouped by point: `obs[start..end]` for
+/// `point_obs_range[p] = (start, end)`, `p` indexing
+/// [`RigBaInput::point_ids`] — the layout [`build_problem`] otherwise
+/// derives from image-ordered [`RigObs`] by a stable sort on the point.
+pub(crate) struct PointMajorObs {
+    pub obs: Vec<Obs>,
+    pub point_obs_range: Vec<(u32, u32)>,
 }
 
 struct Problem {
@@ -798,29 +828,14 @@ fn build_problem(input: &RigBaInput, rig_obs: &[RigObs]) -> Result<Problem, BaEr
     if rig_obs.is_empty() {
         return Err(BaError::NoObservations);
     }
+    if input.frame_fixed.iter().all(|&fixed| fixed) {
+        return Err(BaError::AllPosesFixed);
+    }
 
     let t_start = Instant::now();
     // Ids are ascending, so they map to indices by binary search.
     let frame_ids = &input.frame_ids;
-    let frame_fixed: Vec<bool> = input.frame_fixed.clone();
-    let mut free_frame_slot = vec![None; frame_ids.len()];
-    let mut n_free_frames = 0usize;
-    for (i, &fixed) in frame_fixed.iter().enumerate() {
-        if !fixed {
-            free_frame_slot[i] = Some(n_free_frames as u32);
-            n_free_frames += 1;
-        }
-    }
-    if n_free_frames == 0 {
-        return Err(BaError::AllPosesFixed);
-    }
-    let poses: Vec<SE3> = input.poses.clone();
-
     let point_ids = &input.point_ids;
-    let point_fixed: Vec<bool> = input.point_fixed.clone();
-    let points: Vec<Point3<f64>> = input.points.clone();
-
-    let setup_ms = t_start.elapsed().as_secs_f64() * 1e3;
     // (frame index, point index) per observation, in parallel; the first
     // failing observation (in input order) decides the error, as before.
     let indices: Vec<Result<(u32, u32), BaError>> = rig_obs
@@ -874,11 +889,61 @@ fn build_problem(input: &RigBaInput, rig_obs: &[RigObs]) -> Result<Problem, BaEr
             }
         })
         .collect();
+    let obs_ms = t_start.elapsed().as_secs_f64() * 1e3;
+    assemble_problem(
+        input,
+        PointMajorObs {
+            obs,
+            point_obs_range,
+        },
+        obs_ms,
+    )
+}
 
-    let obs_ms = t_start.elapsed().as_secs_f64() * 1e3 - setup_ms;
+/// The solver's problem from `input`'s frames and points and observations
+/// already grouped by point; `obs_ms` is the time spent grouping them, for
+/// the `BUILD_PARTS` line.
+fn assemble_problem(
+    input: &RigBaInput,
+    point_major: PointMajorObs,
+    obs_ms: f64,
+) -> Result<Problem, BaError> {
+    if input.frame_ids.is_empty() {
+        return Err(BaError::NoPoses);
+    }
+    if input.point_ids.is_empty() {
+        return Err(BaError::NoLandmarks);
+    }
+    let PointMajorObs {
+        obs,
+        point_obs_range,
+    } = point_major;
+    if obs.is_empty() {
+        return Err(BaError::NoObservations);
+    }
+    debug_assert_eq!(point_obs_range.len(), input.point_ids.len());
+
+    let t_start = Instant::now();
+    let frame_fixed: Vec<bool> = input.frame_fixed.clone();
+    let mut free_frame_slot = vec![None; input.frame_ids.len()];
+    let mut n_free_frames = 0usize;
+    for (i, &fixed) in frame_fixed.iter().enumerate() {
+        if !fixed {
+            free_frame_slot[i] = Some(n_free_frames as u32);
+            n_free_frames += 1;
+        }
+    }
+    if n_free_frames == 0 {
+        return Err(BaError::AllPosesFixed);
+    }
+    let poses: Vec<SE3> = input.poses.clone();
+    let point_fixed: Vec<bool> = input.point_fixed.clone();
+    let points: Vec<Point3<f64>> = input.points.clone();
+
+    let setup_ms = t_start.elapsed().as_secs_f64() * 1e3;
     let (point_free_frames, edges, point_pair_edge_idx) =
         build_reduced_system_pattern(&point_obs_range, &obs, &frame_fixed, &free_frame_slot);
-    let pattern_ms = t_start.elapsed().as_secs_f64() * 1e3 - setup_ms - obs_ms;
+    let pattern_ms = t_start.elapsed().as_secs_f64() * 1e3 - setup_ms;
     let n_shards = elimination_shard_count(edges.len());
     let shard_boundaries = balanced_shard_boundaries(&point_free_frames, n_shards);
     let contributions = (n_shards < 8 || n_free_frames >= ITERATIVE_MIN_FREE_FRAMES).then(|| {
@@ -895,7 +960,7 @@ fn build_problem(input: &RigBaInput, rig_obs: &[RigObs]) -> Result<Problem, BaEr
         let total_ms = t_start.elapsed().as_secs_f64() * 1e3;
         eprintln!(
             "BUILD_PARTS setup_ms={setup_ms:.1} obs_ms={obs_ms:.1} pattern_ms={pattern_ms:.1} index_ms={:.1}",
-            total_ms - setup_ms - obs_ms - pattern_ms
+            total_ms - setup_ms - pattern_ms
         );
     }
 
@@ -1978,7 +2043,7 @@ fn optimize_rig_obs(
 /// count elements, not allocator slack. `elimination` is the reduced
 /// system's off-diagonal blocks (f64) built on every trial, `pcg_f32` their
 /// f32 copy on the PCG path.
-fn log_memory(problem: &Problem, rig_obs: &[RigObs], points_lin: &[PointLin]) {
+fn log_memory(problem: &Problem, rig_obs_bytes: usize, points_lin: &[PointLin]) {
     const MB: f64 = 1024.0 * 1024.0;
     let pair_idx: usize = problem.point_pair_edge_idx.iter().map(Vec::len).sum();
     let free_frames: usize = problem.point_free_frames.iter().map(Vec::len).sum();
@@ -1995,7 +2060,7 @@ fn log_memory(problem: &Problem, rig_obs: &[RigObs], points_lin: &[PointLin]) {
         problem.obs.len(),
         problem.points.len(),
         edges,
-        std::mem::size_of_val(rig_obs) as f64 / MB,
+        rig_obs_bytes as f64 / MB,
         std::mem::size_of_val(problem.obs.as_slice()) as f64 / MB,
         (free_frames * 4) as f64 / MB,
         (pair_idx * 4) as f64 / MB,
@@ -2020,7 +2085,52 @@ pub(crate) fn optimize_rig_input(
     gradient_tolerance_rel: Option<f64>,
 ) -> Result<BaResult, BaError> {
     let t_build = Instant::now();
-    let mut problem = build_problem(input, rig_obs)?;
+    let problem = build_problem(input, rig_obs)?;
+    optimize_problem(
+        input,
+        problem,
+        t_build,
+        std::mem::size_of_val(rig_obs),
+        max_num_iterations,
+        loss,
+        gradient_tolerance_rel,
+    )
+}
+
+/// [`optimize_rig_input`] with the observations already grouped by point
+/// ([`PointMajorObs`]), so the caller's own per-point pass replaces the
+/// image-ordered [`RigObs`] list and its regrouping.
+pub(crate) fn optimize_point_major(
+    input: &mut RigBaInput,
+    point_major: PointMajorObs,
+    max_num_iterations: usize,
+    loss: LossFunction,
+    gradient_tolerance_rel: Option<f64>,
+) -> Result<BaResult, BaError> {
+    let t_build = Instant::now();
+    let problem = assemble_problem(input, point_major, 0.0)?;
+    optimize_problem(
+        input,
+        problem,
+        t_build,
+        0,
+        max_num_iterations,
+        loss,
+        gradient_tolerance_rel,
+    )
+}
+
+/// The LM loop of [`optimize_rig_input`] on a built `problem`;
+/// `rig_obs_bytes` only feeds the `BA_MEMORY` line.
+fn optimize_problem(
+    input: &mut RigBaInput,
+    mut problem: Problem,
+    t_build: Instant,
+    rig_obs_bytes: usize,
+    max_num_iterations: usize,
+    loss: LossFunction,
+    gradient_tolerance_rel: Option<f64>,
+) -> Result<BaResult, BaError> {
     let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
     let mut timings = PhaseTimings::default();
     let mut apply_ms = 0.0;
@@ -2036,7 +2146,7 @@ pub(crate) fn optimize_rig_input(
     if problem.n_free_frames >= iterative_min_free_frames()
         || std::env::var_os("VISLOC_BA_MEMORY").is_some()
     {
-        log_memory(&problem, rig_obs, &points_lin);
+        log_memory(&problem, rig_obs_bytes, &points_lin);
     }
 
     let mut radius = INITIAL_RADIUS;

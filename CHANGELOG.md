@@ -206,6 +206,34 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **`gsplat_photos` keeps up to 8192 SIFT detections per image (was
+  4000), COLMAP's `max_num_features`.** On textured scenes 4000 kept
+  about half of COLMAP's features (playground: 5,934 against 10,000-13,500
+  per image), and the photos the port could not register were the ones
+  with the fewest verified matches. COLMAP's own mapper on our matches
+  dropped the same photos, so the gap was in the features. On the 13
+  ETH3D DSLR scenes (1600 px, fixed focal), 8192 registers what COLMAP
+  4.2 registers on every scene:
+
+  | scene | 4000 | 8192 | COLMAP 4.2 |
+  |---|---|---|---|
+  | playground | 35/38, 0.784 cm | 38/38, 0.628 cm | 38/38, 0.619 cm |
+  | facade | 75/76, 6.835 cm | 76/76, 6.688 cm | 76/76, 6.541 cm |
+  | delivery_area | 2.542 cm | 2.354 cm | 2.567 cm |
+  | courtyard | 4.568 cm | 4.431 cm | 4.427 cm |
+  | terrains | 0.551 cm | 0.526 cm | 0.580 cm |
+  | meadow | 5.878 cm | 5.839 cm | 5.009 cm |
+  | terrace | 1.949 cm | 2.049 cm | 1.867 cm |
+  | relief | 0.782 cm | 0.855 cm | 0.800 cm |
+  | electro | 3.431 cm | 3.506 cm | 3.431 cm |
+
+  Centre RMSE after a Sim(3) fit; office, pipes, relief_2 and kicker
+  (under 4000 detections an image) are unchanged. The 13-scene mean RMSE
+  goes from 2.45 to 2.41 cm. An earlier SmallCity run with 8000 (before
+  the PnP fix) cut the median centre error from 1.66 m to 0.65 m. CPU
+  matching takes 2-3.5x longer (facade 317 s -> 1100 s). `--max-keypoints
+  4000` restores the old cap.
+
 - **COLMAP-port BA builds its problem point by point.** The native solve
   used to list every observation image by image (with a camera id each),
   copy that list twice, and have the solver regroup it by point with a

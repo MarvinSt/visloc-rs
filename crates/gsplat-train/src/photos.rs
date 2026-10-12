@@ -42,6 +42,8 @@ pub struct PhotoSfmConfig {
     /// Sliding-window size (images) past `exhaustive_max`.
     pub window: usize,
     pub min_matches: usize,
+    /// SIFT detections kept per image, before the up-to-two orientations
+    /// each (COLMAP's `max_num_features`, 8192).
     pub sift_max_keypoints: usize,
     /// Every n-th registered image is held out for evaluation (0: none).
     pub eval_every: usize,
@@ -81,7 +83,11 @@ impl Default for PhotoSfmConfig {
             exhaustive_max: 300,
             window: 20,
             min_matches: 15,
-            sift_max_keypoints: 4000,
+            // COLMAP's cap. 4000 left about half of COLMAP's features on
+            // textured scenes and dropped photos it registers: ETH3D
+            // playground 35/38 -> 38/38 (0.78 -> 0.63 cm centre RMSE),
+            // facade 75/76 -> 76/76. CPU matching takes 2-3.5x longer.
+            sift_max_keypoints: 8192,
             eval_every: 8,
             gpu: true,
             refine_intrinsics: true,

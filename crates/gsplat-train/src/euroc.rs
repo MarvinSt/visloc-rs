@@ -500,6 +500,9 @@ pub fn apply_sift_override(cfg: &mut SiftConfig, kv: &str) -> Result<(), String>
         "multi_anisotropy" => cfg.multi_anisotropy = flag(),
         "domain_size_pooling" => cfg.domain_size_pooling = flag(),
         "max_keypoints" => cfg.max_keypoints = num()? as usize,
+        "vlfeat_compatible_detector" => cfg.vlfeat_compatible_detector = flag(),
+        "vlfeat_compatible_descriptor" => cfg.vlfeat_compatible_descriptor = flag(),
+        "vlfeat_bilinear_orientations" => cfg.vlfeat_bilinear_orientations = flag(),
         _ => return Err(format!("--sift-opt: unknown key {key}")),
     }
     Ok(())

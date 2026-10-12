@@ -6,6 +6,17 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **`gsplat_photos` SIFT finds matches on high-resolution photos.** It now
+  uses COLMAP's VLFeat detector (subpixel localization) and descriptor, and
+  feeds SIFT grey values in [0, 1] as `GrayImage` documents (it passed
+  0–255, which made the contrast threshold 255× too permissive). The default
+  detector reports integer pixel positions. On one ETH3D courtyard pair with
+  1,749 points in common it found 37 matches; the new path finds 721. ETH3D
+  courtyard (1,600 px) registers 38/38 photos instead of 15, and pipes 11/14
+  instead of 2. The VLFeat path runs on the CPU (matching stays on the GPU);
+  `--sift-opt vlfeat_compatible_detector=0 --sift-opt
+  vlfeat_compatible_descriptor=0 --sift-opt vlfeat_bilinear_orientations=0`
+  restores GPU extraction.
 - **`gsplat_photos` no longer drops photos a pixel off the common size.**
   Photos whose scaled size is within 1% of the most common one are resized
   to it instead of being dropped. ETH3D courtyard's undistorted images come

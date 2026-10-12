@@ -11,7 +11,8 @@ whole per-sequence loop for a track:
          the first 4 MiB of the raw `.vrs`; `--no-imu-rectify` skips it)
       -> pinhole -> Basalt Double-Sphere calibration (variant A noise,
          gyro bias random walk tightened to --gyro-bias-std)
-      -> run the Basalt VIO
+      -> run the Basalt VIO, or with `--slam-exe` the VIO plus the online
+         mapper (`basalt_euroc_online_slam_demo`)
       -> convert the trajectory to the submission estimate
       -> append `slam/<sequence>.txt`, then delete the sequence data
 
@@ -27,7 +28,7 @@ Example:
 
     python scripts/run_lamaria_test_submission.py \
         --tracks 1 \
-        --vio-exe E:/visloc-rs-runs/onlinefix_target/release/examples/basalt_euroc_vio_demo.exe \
+        --slam-exe E:/visloc-rs-runs/onlinefix_target/release/examples/basalt_euroc_online_slam_demo.exe \
         --config configs/basalt/variants/lamaria/euroc_config_big_window_multicam.json \
         --gyro-bias-std 1e-7 \
         --work-dir E:/visloc-rs-runs/lamaria_submission/work \
@@ -48,6 +49,14 @@ training sequence per non-Short track it raises the score by +4.35 on average
 (Medium 37.72 -> 39.47, Long 24.14 -> 28.89, Low light 20.42 -> 26.42, Moving
 27.64 -> 32.56). If the `.vrs` header cannot be fetched or parsed the sequence
 falls back to the raw IMU with a WARN line rather than being dropped.
+
+`--slam-exe` (the online-mapper build, docs/lamaria_online_mapper.md) is the
+recommended estimator: on one training sequence per track it adds +5.44 Score
+on average over the VIO alone (Short +1.66, Medium +13.05, Long +4.82, Low
+light +3.77, Moving +3.93) for about 1.1-1.2x the run time. Its full-frame
+`trajectory_online.tum` is submitted; if a run produces only the uncorrected
+`trajectory_vio.tum`, that is used with a WARN line. `--vio-exe` alone runs the
+VIO only, as before.
 """
 
 import argparse
@@ -128,6 +137,19 @@ def rectify_imu(seq: str, inner: Path, work: Path, calib_dir: Path) -> None:
         f"gyro bias {gyro_bias.round(5).tolist()}, accel bias {accel_bias.round(4).tolist()})")
 
 
+def estimator_command(args, inner: Path, calibration: Path, out_dir: Path):
+    """Return (command, trajectories to try in order) for the configured estimator."""
+    common = ["--euroc-dir", inner, "--calibration", calibration, "--config", args.config,
+              "--out-dir", out_dir, "--threads", args.threads]
+    if args.slam_exe:
+        # Same VIO as basalt_euroc_vio_demo (bit-identical trajectory_vio.tum)
+        # plus the online mapper; trajectory_online.tum has every frame.
+        return ([args.slam_exe, *common, "--no-urgent-keyframes"],
+                [out_dir / "trajectory_online.tum", out_dir / "trajectory_vio.tum"])
+    return ([args.vio_exe, *common, "--pipeline", "--no-trace", "--no-marg-data"],
+            [out_dir / "trajectory.tum"])
+
+
 def verify_and_extract(zip_path: Path, extract_dir: Path) -> Path:
     try:
         with zipfile.ZipFile(zip_path) as archive:
@@ -165,7 +187,11 @@ def main() -> int:
                         choices=sorted(TRACK_COUNTS))
     parser.add_argument("--sequences", nargs="*", default=None,
                         help="explicit sequence names (overrides --tracks)")
-    parser.add_argument("--vio-exe", type=Path, required=True)
+    parser.add_argument("--vio-exe", type=Path,
+                        help="basalt_euroc_vio_demo: VIO only")
+    parser.add_argument("--slam-exe", type=Path,
+                        help="basalt_euroc_online_slam_demo: VIO + online mapper (recommended; "
+                             "takes precedence over --vio-exe)")
     parser.add_argument("--config", type=Path,
                         default=Path("configs/basalt/variants/lamaria/euroc_config_big_window_multicam.json"))
     parser.add_argument("--gyro-bias-std", type=float, default=1e-7,
@@ -182,6 +208,8 @@ def main() -> int:
     parser.add_argument("--keep-data", action="store_true",
                         help="keep downloaded/extracted sequence data after each run")
     args = parser.parse_args()
+    if not (args.slam_exe or args.vio_exe):
+        parser.error("one of --slam-exe or --vio-exe is required")
 
     sequences = args.sequences or track_sequences(args.tracks)
     args.slam_dir.mkdir(parents=True, exist_ok=True)
@@ -229,17 +257,17 @@ def main() -> int:
             variant_a = calib_dir / f"{seq}_calib_variantA_default_noise.json"
             write_variant_a_calib(base_calib, variant_a, args.gyro_bias_std)
 
-            log(f"{seq}: VIO")
+            log(f"{seq}: {'VIO + online mapper' if args.slam_exe else 'VIO'}")
             vio_out = work / "vio"
             vio_out.mkdir(exist_ok=True)
-            run([args.vio_exe, "--euroc-dir", inner, "--calibration", variant_a,
-                 "--config", args.config, "--out-dir", vio_out, "--pipeline",
-                 "--threads", args.threads, "--no-trace", "--no-marg-data"],
-                check=True)
-            trajectory = vio_out / "trajectory.tum"
-            if not trajectory.is_file():
+            command, candidates = estimator_command(args, inner, variant_a, vio_out)
+            run(command, check=True)
+            trajectory = next((t for t in candidates if t.is_file()), None)
+            if trajectory is None:
                 log(f"{seq}: FAIL no trajectory")
                 continue
+            if trajectory != candidates[0]:
+                log(f"{seq}: WARN {candidates[0].name} missing; submitting {trajectory.name}")
 
             run([python, estimate_converter, "--in-tum", trajectory,
                  "--out-estimate", estimate], check=True)

@@ -97,7 +97,10 @@ driver default.**
 
 On sequence_1_19, rectification at 1e-6 scores 51.10 against 50.04 for the
 raw IMU in `lamaria_multicam.md`. That raw run used an older build, so the
-+1.06 is indicative only. Values below 1e-7 were not tried.
++1.06 is indicative only. sequence_1_19 was recorded on a different device
+(serial `1WM09370081264`, gyro bias [0.0018, 0.0045, 0.00004] rad/s) from the
+other sequences here. The driver reads each sequence's own `.vrs` header, so
+this is handled per sequence. Values below 1e-7 were not tried.
 
 ## IMU time offset
 

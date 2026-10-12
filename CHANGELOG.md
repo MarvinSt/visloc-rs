@@ -6,6 +6,17 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **`gsplat_photos` SIFT finds matches on high-resolution photos.** It now
+  uses COLMAP's VLFeat detector (subpixel localization) and descriptor, and
+  feeds SIFT grey values in [0, 1] as `GrayImage` documents (it passed
+  0–255, which made the contrast threshold 255× too permissive). The default
+  detector reports integer pixel positions. On one ETH3D courtyard pair with
+  1,749 points in common it found 37 matches; the new path finds 721. ETH3D
+  courtyard (1,600 px) registers 38/38 photos instead of 15, and pipes 11/14
+  instead of 2. The VLFeat path runs on the CPU (matching stays on the GPU);
+  `--sift-opt vlfeat_compatible_detector=0 --sift-opt
+  vlfeat_compatible_descriptor=0 --sift-opt vlfeat_bilinear_orientations=0`
+  restores GPU extraction.
 - **`gsplat_photos` no longer drops photos a pixel off the common size.**
   Photos whose scaled size is within 1% of the most common one are resized
   to it instead of being dropped. ETH3D courtyard's undistorted images come
@@ -141,6 +152,17 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **VLFeat-compatible SIFT is 2.2x faster on the CPU, bit-identically.** The
+  separable blur now runs a kernel tap at a time over whole rows (contiguous
+  and vectorizable, same per-sample summation order), and the extremum scan
+  stops as soon as a sample fails the threshold or both neighbour tests.
+  One 1,600 x 1,066 photo: 5.72 s -> 2.64 s, with the same keypoints and
+  descriptors bit for bit (`crates/vision/examples/sift_vlfeat_bench.rs`
+  prints a checksum).
+- **`gsplat_photos` CPU matching computes one descriptor product per pair**
+  instead of two (`match_descriptors_cross_checked` instead of
+  `CrossCheckMatcher`): 3.6x faster on 8,000-keypoint photos, identical
+  matches.
 - **`gsplat_photos` frees SfM inputs it no longer needs.** Byte-identical
   models. Grey images for SIFT are made 256 at a time instead of all at
   once (4 bytes a pixel: 16.5 GB for SmallCity's 5,822 photos). With

@@ -8,7 +8,7 @@
 //!    renders one camera), and write it to `out_dir/images`.
 //! 2. Focal length from the EXIF 35 mm equivalent when present, else
 //!    COLMAP's prior of 1.2 x the long side; principal point at the centre.
-//! 3. SIFT (RootSIFT, the settings that beat COLMAP on EuRoC), GPU matching,
+//! 3. SIFT (COLMAP's VLFeat detector and descriptor, RootSIFT), GPU matching,
 //!    two-view verification: exhaustive pairs for up to `exhaustive_max`
 //!    images, a sliding window over the sorted names beyond.
 //! 4. The COLMAP incremental-mapper port, then one global bundle adjustment
@@ -438,7 +438,13 @@ pub fn build_photo_dataset(
         .collect();
     let _ = std::fs::write(out_dir.join("image_names.txt"), listing);
 
-    // SIFT: the EuRoC-vs-COLMAP settings.
+    // SIFT: COLMAP's VLFeat detector (subpixel localization) and descriptor.
+    // The default detector reports integer pixel positions: on ETH3D
+    // courtyard it found 37 matches where this finds 721 for one pair, and
+    // registered 15 of 38 photos instead of 38. It runs on the CPU (the GPU
+    // extractor implements the default detector only); `--sift-opt
+    // vlfeat_compatible_detector=0 --sift-opt vlfeat_compatible_descriptor=0`
+    // restores GPU extraction.
     let mut sift_cfg = SiftConfig {
         max_keypoints: cfg.sift_max_keypoints,
         normalization: visloc_vision::features::sift::SiftNormalization::L1Root,
@@ -448,17 +454,21 @@ pub fn build_photo_dataset(
         "descriptor_magnification=3",
         "max_orientations=2",
         "prefer_larger_scale=1",
+        "vlfeat_compatible_detector=1",
+        "vlfeat_compatible_descriptor=1",
+        "vlfeat_bilinear_orientations=1",
     ]
     .into_iter()
     .chain(cfg.sift_overrides.iter().map(String::as_str))
     {
         apply_sift_override(&mut sift_cfg, o).map_err(EurocError::Sift)?;
     }
-    // f32 grey images are SIFT's input, made a chunk at a time: all of them
-    // at once (4 bytes a pixel) are 16.5 GB for SmallCity's 5,822 photos.
+    // f32 grey images in [0, 1] are SIFT's input (its contrast threshold
+    // assumes that range), made a chunk at a time: all of them at once
+    // (4 bytes a pixel) are 16.5 GB for SmallCity's 5,822 photos.
     let gray_of = |img: &image::RgbImage| -> Vec<f32> {
         img.pixels()
-            .map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
+            .map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0)
             .collect()
     };
     let to_features = |kps: Vec<visloc_vision::features::sift::SiftKeypoint>, desc| FeatureSet {

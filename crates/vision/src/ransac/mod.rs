@@ -217,13 +217,29 @@ where
                 .iter()
                 .map(|index| correspondences[*index].clone())
                 .collect::<Vec<_>>();
-            if let Some(mut refined_pose) = self.pose_estimator.estimate_pose(&refined, camera) {
-                let pre_refinement_score = score_pose(
-                    camera,
-                    &refined_pose,
-                    correspondences,
-                    self.reprojection_threshold,
-                );
+            // Start from the better of the search's winner and a refit of
+            // the pose estimator on all its inliers. The refit alone is not
+            // enough: a minimal solver re-run on the inliers solves from three
+            // of them and can land far from the winner (on Courthouse it
+            // turned 700 correspondences with hundreds of inliers into 3-6),
+            // which then failed registration.
+            let mut start: Option<(Pose, ReprojectionScore)> =
+                search.best_pose.as_ref().map(|pose| {
+                    let score =
+                        score_pose(camera, pose, correspondences, self.reprojection_threshold);
+                    (pose.clone(), score)
+                });
+            if let Some(refit) = self.pose_estimator.estimate_pose(&refined, camera) {
+                let score =
+                    score_pose(camera, &refit, correspondences, self.reprojection_threshold);
+                if start
+                    .as_ref()
+                    .is_none_or(|(_, best)| is_refinement_better(&score, best))
+                {
+                    start = Some((refit, score));
+                }
+            }
+            if let Some((mut refined_pose, pre_refinement_score)) = start {
                 let mut refinement_applied = false;
                 if let Some(pose_refiner) = &self.pose_refiner {
                     if let Some(nonlinear_pose) =
@@ -598,6 +614,75 @@ mod tests {
         assert!(!is_refinement_better(&fewer_inliers, &baseline));
         assert!(is_refinement_better(&more_inliers, &baseline));
         assert!(is_refinement_better(&same_or_better, &baseline));
+    }
+
+    /// A pose estimator that solves its minimal samples exactly but returns
+    /// a far-off pose when refit on more points, like a minimal solver run
+    /// on three of many noisy inliers.
+    #[derive(Debug, Clone)]
+    struct BadRefitPnP {
+        truth: Pose,
+    }
+
+    impl PoseEstimator for BadRefitPnP {
+        fn estimate_pose(
+            &self,
+            correspondences: &[Correspondence2D3D],
+            _camera: &Camera,
+        ) -> Option<Pose> {
+            if correspondences.len() == self.minimum_correspondences() {
+                Some(self.truth.clone())
+            } else {
+                Some(Pose::from_world_to_camera(
+                    UnitQuaternion::from_euler_angles(0.0, 0.3, 0.0),
+                    Vector3::new(2.0, 0.0, 0.0),
+                ))
+            }
+        }
+
+        fn minimum_correspondences(&self) -> usize {
+            4
+        }
+    }
+
+    #[test]
+    fn a_bad_refit_does_not_replace_the_search_winner() {
+        let camera = Camera::pinhole(1, 640, 480, 500.0, 500.0, 320.0, 240.0);
+        let truth = Pose::from_world_to_camera(UnitQuaternion::identity(), Vector3::zeros());
+        let correspondences = (0..40)
+            .map(|i| {
+                let point3d = Point3::new(
+                    (i % 8) as f64 * 0.3 - 1.0,
+                    (i / 8) as f64 * 0.3 - 0.6,
+                    4.0 + (i % 5) as f64,
+                );
+                Correspondence2D3D {
+                    point2d: camera
+                        .project(&truth.transform_world_point(&point3d))
+                        .unwrap(),
+                    point3d,
+                    confidence: None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let report = PnPRansac {
+            pose_estimator: BadRefitPnP {
+                truth: truth.clone(),
+            },
+            pose_refiner: None::<crate::pnp::GaussNewtonPoseRefiner>,
+            iterations: 8,
+            confidence: None,
+            reprojection_threshold: 2.0,
+            seed: 3,
+            early_stop_min_iterations: 0,
+            early_stop_inlier_ratio: None,
+        }
+        .estimate(&correspondences, &camera)
+        .unwrap();
+
+        assert_eq!(report.inliers.len(), correspondences.len());
+        assert_eq!(report.pose, truth);
     }
 
     #[test]

@@ -88,6 +88,14 @@ fn mapper_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("BASALT_ONLINE_MAPPER_TRACE").is_some())
 }
 
+/// `BASALT_ONLINE_MAPPER_LOOP_LOG`: one `[loop]` line on stderr per loop
+/// candidate that reaches the pose gates in `match_new_keyframe` (accepted or
+/// rejected), with its geometry against the current map. Zero-cost when unset.
+fn loop_log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BASALT_ONLINE_MAPPER_LOOP_LOG").is_some())
+}
+
 macro_rules! mapper_trace {
     ($($arg:tt)*) => {
         if mapper_trace_enabled() {
@@ -202,6 +210,16 @@ pub struct OnlineMapperConfig {
     /// *match itself*, which always feeds the global problem. A single
     /// ungated false loop was measured to destroy the V2_03 estimate.
     pub loop_match_max_rotation_error_deg: f64,
+    /// Position gate for loop matches, in metres: a loop is rejected when the
+    /// two keyframes' current map positions are farther apart than
+    /// `loop_match_max_distance_m + loop_match_distance_per_travelled_m *
+    /// (path length between them)`. A true revisit can only be as far apart
+    /// as the drift accumulated in between; repeated structure elsewhere on
+    /// the route usually is not. `INFINITY` (the default) disables the gate.
+    pub loop_match_max_distance_m: f64,
+    /// Drift allowance of the position gate per metre travelled between the
+    /// two keyframes (e.g. `0.02` = 2 %).
+    pub loop_match_distance_per_travelled_m: f64,
     /// Candidates considered per new keyframe query in
     /// `match_new_keyframe`, i.e. the `num_results` truncation passed to
     /// `query_bow_candidates` -- independent of (and by default smaller
@@ -303,6 +321,8 @@ impl Default for OnlineMapperConfig {
             loop_gap_keyframes: 30,
             loop_matching: true,
             loop_match_max_rotation_error_deg: 30.0,
+            loop_match_max_distance_m: f64::INFINITY,
+            loop_match_distance_per_travelled_m: 0.0,
             match_top_k: 5,
             headless: NfrMapperHeadlessConfig::default(),
             projection_rematch: false,
@@ -1100,16 +1120,48 @@ impl OnlineNfrMapper {
             if is_loop && !self.config.loop_matching {
                 continue;
             }
-            if is_loop
-                && self.config.loop_match_max_rotation_error_deg < 180.0
-                && self
-                    .loop_match_rotation_error_deg(left_id, right_id, &t_i_j)
-                    .is_some_and(|angle| angle > self.config.loop_match_max_rotation_error_deg)
-            {
-                mapper_trace!(
-                    "match_new_keyframe: reject loop {left_id:?}/{right_id:?} rotation-gate"
-                );
-                continue;
+            if is_loop {
+                let rotation_error = self.loop_match_rotation_error_deg(left_id, right_id, &t_i_j);
+                let geometry = self.loop_match_geometry(left_id, right_id);
+                let verdict = if self.config.loop_match_max_rotation_error_deg < 180.0
+                    && rotation_error
+                        .is_some_and(|angle| angle > self.config.loop_match_max_rotation_error_deg)
+                {
+                    "reject-rotation"
+                } else if geometry.is_some_and(|(distance, travelled, _)| {
+                    distance
+                        > self.config.loop_match_max_distance_m
+                            + self.config.loop_match_distance_per_travelled_m * travelled
+                }) {
+                    "reject-distance"
+                } else {
+                    "accept"
+                };
+                if loop_log_enabled() {
+                    let (distance, travelled, seconds) =
+                        geometry.unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+                    let timestamp = |id: TimeCamId| {
+                        self.mapper
+                            .frame_timestamps
+                            .get(&id.frame_id)
+                            .copied()
+                            .unwrap_or(-1)
+                    };
+                    eprintln!(
+                        "[loop] {verdict} left={} right={} left_ts={} right_ts={} gap={gap} inliers={} raw={} rot_err_deg={:.2} dist_m={distance:.2} travelled_m={travelled:.1} dt_s={seconds:.1}",
+                        left_id.frame_id,
+                        right_id.frame_id,
+                        timestamp(left_id),
+                        timestamp(right_id),
+                        inliers.len(),
+                        raw_matches.len(),
+                        rotation_error.unwrap_or(f64::NAN),
+                    );
+                }
+                if verdict != "accept" {
+                    mapper_trace!("match_new_keyframe: {verdict} loop {left_id:?}/{right_id:?}");
+                    continue;
+                }
             }
             self.mapper.feature_match_data.insert(
                 (left_id, right_id),
@@ -1169,6 +1221,44 @@ impl OnlineNfrMapper {
         let vio_relative = left_pose.inverse().compose(right_pose);
         let delta = vio_relative.rotation.inverse() * t_i_j.rotation;
         Some(delta.angle().to_degrees())
+    }
+
+    /// Current-map geometry of a loop pair: (distance between the two
+    /// keyframes' positions, path length along the keyframes in between,
+    /// seconds between them). `None` when either pose is unknown.
+    fn loop_match_geometry(
+        &self,
+        left_id: TimeCamId,
+        right_id: TimeCamId,
+    ) -> Option<(f64, f64, f64)> {
+        let left = self.mapper.frame_poses.get(&left_id.frame_id)?.translation;
+        let right = self.mapper.frame_poses.get(&right_id.frame_id)?.translation;
+        let (lo, hi) = if left_id.frame_id <= right_id.frame_id {
+            (left_id.frame_id, right_id.frame_id)
+        } else {
+            (right_id.frame_id, left_id.frame_id)
+        };
+        let mut travelled = 0.0;
+        let mut previous = None;
+        for pose in self
+            .mapper
+            .frame_poses
+            .range(lo..=hi)
+            .map(|(_, pose)| pose.translation)
+        {
+            if let Some(prev) = previous {
+                travelled += (pose - prev).norm();
+            }
+            previous = Some(pose);
+        }
+        let seconds = match (
+            self.mapper.frame_timestamps.get(&lo),
+            self.mapper.frame_timestamps.get(&hi),
+        ) {
+            (Some(a), Some(b)) => (b - a) as f64 * 1e-9,
+            _ => f64::NAN,
+        };
+        Some(((left - right).norm(), travelled, seconds))
     }
 
     /// Build a metric loop-closure `RelativePoseFactor` for an accepted loop

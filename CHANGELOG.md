@@ -152,6 +152,17 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **The COLMAP-port BA's PCG is preconditioned with runs of 32 frames.**
+  Block-Jacobi dropped every coupling between cameras. Cameras next to
+  each other in capture (frame-id) order share most points, so the
+  preconditioner is now a dense inverse over each run of 32 consecutive
+  free frames. It falls back to block-Jacobi when a run is not positive
+  definite. On a SmallCity mapper replay (same machine and inputs), PCG
+  took 30,634 iterations instead of 50,393, the solves 405 s instead of
+  612 s, and the mapper 904 s instead of 1,088 s, with a comparable result
+  (centre error median 0.87 m against 0.96 m). `VISLOC_PORT_PCG_CLUSTER=k`
+  changes the run length; `1` restores block-Jacobi. Systems under 1,000
+  free frames do not use PCG and are unchanged.
 - **VLFeat-compatible SIFT is 2.2x faster on the CPU, bit-identically.** The
   separable blur now runs a kernel tap at a time over whole rows (contiguous
   and vectorizable, same per-sample summation order), and the extremum scan

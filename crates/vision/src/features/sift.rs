@@ -607,40 +607,50 @@ fn gaussian_kernel_vlfeat(sigma: f64) -> Vec<f64> {
 
 fn blur_vlfeat(input: &Layer, sigma: f64) -> Layer {
     let kernel = gaussian_kernel_vlfeat(sigma);
-    let radius = kernel.len() as i64 / 2;
-    let mut horizontal = vec![0.0f64; input.data.len()];
-    for y in 0..input.height as i64 {
-        for x in 0..input.width as i64 {
-            horizontal[y as usize * input.width + x as usize] = kernel
-                .iter()
-                .enumerate()
-                .map(|(index, &weight)| weight * input.get(x + index as i64 - radius, y))
-                .sum();
+    let radius = kernel.len() / 2;
+    let (width, height) = (input.width, input.height);
+    // Each output sample is `sum_i kernel[i] * sample(p + i - radius)` with
+    // edge clamping, accumulated in kernel order from -0.0 (what `f64::sum`
+    // does), so the result is bit-identical to the plain per-pixel loop.
+    // Horizontal pass: the interior a kernel tap at a time over the whole
+    // row (vectorizable, same per-sample order), the clamped ends per sample.
+    let interior = radius..width.saturating_sub(radius).max(radius);
+    let mut horizontal = vec![-0.0f64; input.data.len()];
+    for (row, out) in input
+        .data
+        .chunks_exact(width)
+        .zip(horizontal.chunks_exact_mut(width))
+    {
+        for (index, weight) in kernel.iter().enumerate().filter(|_| !interior.is_empty()) {
+            let src = &row[interior.start + index - radius..];
+            for (value, sample) in out[interior.clone()].iter_mut().zip(src) {
+                *value += weight * sample;
+            }
+        }
+        for x in (0..interior.start.min(width)).chain(interior.end..width) {
+            let mut acc = -0.0f64;
+            for (index, weight) in kernel.iter().enumerate() {
+                let xi = (x + index).saturating_sub(radius).min(width - 1);
+                acc += weight * row[xi];
+            }
+            out[x] = acc;
         }
     }
-    let horizontal = Layer {
-        width: input.width,
-        height: input.height,
-        data: horizontal,
-    };
-    let horizontal_get = |x: i64, y: i64| -> f64 {
-        let xi = x.clamp(0, horizontal.width as i64 - 1) as usize;
-        let yi = y.clamp(0, horizontal.height as i64 - 1) as usize;
-        horizontal.data[yi * horizontal.width + xi]
-    };
-    let mut output = vec![0.0f64; input.data.len()];
-    for y in 0..input.height as i64 {
-        for x in 0..input.width as i64 {
-            output[y as usize * input.width + x as usize] = kernel
-                .iter()
-                .enumerate()
-                .map(|(index, &weight)| weight * horizontal_get(x, y + index as i64 - radius))
-                .sum();
+    // Vertical pass, a row at a time: the same per-sample order, but each
+    // kernel tap reads one contiguous source row.
+    let mut output = vec![-0.0f64; input.data.len()];
+    for (y, out) in output.chunks_exact_mut(width).enumerate() {
+        for (index, weight) in kernel.iter().enumerate() {
+            let yi = (y + index).saturating_sub(radius).min(height - 1);
+            let src = &horizontal[yi * width..(yi + 1) * width];
+            for (value, sample) in out.iter_mut().zip(src) {
+                *value += weight * sample;
+            }
         }
     }
     Layer {
-        width: input.width,
-        height: input.height,
+        width,
+        height,
         data: output,
     }
 }
@@ -1230,6 +1240,11 @@ fn refine_vlfeat_extremum(
     // below remains the strict `abs(value) > tp` test.
     let mut is_max = value >= 0.8 * threshold;
     let mut is_min = value <= -0.8 * threshold;
+    // Most samples fail the threshold; the neighbour scan below can only
+    // clear the flags, so skip it.
+    if !(is_max || is_min) {
+        return None;
+    }
     for ds in -1i64..=1 {
         for dy in -1i64..=1 {
             for dx in -1i64..=1 {
@@ -1248,11 +1263,11 @@ fn refine_vlfeat_extremum(
                 if neighbour <= value {
                     is_min = false;
                 }
+                if !(is_max || is_min) {
+                    return None;
+                }
             }
         }
-    }
-    if !(is_max || is_min) {
-        return None;
     }
 
     let mut ix = x;

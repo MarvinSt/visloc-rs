@@ -24,7 +24,7 @@ use visloc_slam::{IncrementalSfmConfig, PairwiseMatches};
 use visloc_vision::distortion::RadialTangential;
 use visloc_vision::features::sift::{extract_sift, GrayImage, SiftConfig};
 use visloc_vision::features::FeatureSet;
-use visloc_vision::matching::{BruteForceMatcher, CrossCheckMatcher, DescriptorMatch, Matcher};
+use visloc_vision::matching::{BruteForceMatcher, DescriptorMatch};
 use visloc_vision::two_view::{
     ConfigurationType, TwoViewCorrespondence, TwoViewGeometryOptions, TwoViewGeometryVerifier,
 };
@@ -634,9 +634,11 @@ pub fn undistort_gray(
     out
 }
 
+/// Ratio-tested mutual nearest neighbours: one descriptor matrix product
+/// serves both directions (`CrossCheckMatcher` computes it twice).
 pub(crate) fn cpu_matches(fi: &FeatureSet, fj: &FeatureSet) -> Vec<DescriptorMatch> {
-    CrossCheckMatcher::new(BruteForceMatcher { ratio: Some(0.8) })
-        .match_descriptors(&fi.descriptors, &fj.descriptors)
+    BruteForceMatcher { ratio: Some(0.8) }
+        .match_descriptors_cross_checked(&fi.descriptors, &fj.descriptors)
 }
 
 pub(crate) fn verify_pair(

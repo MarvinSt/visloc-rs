@@ -152,6 +152,17 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **VLFeat-compatible SIFT is 2.2x faster on the CPU, bit-identically.** The
+  separable blur now runs a kernel tap at a time over whole rows (contiguous
+  and vectorizable, same per-sample summation order), and the extremum scan
+  stops as soon as a sample fails the threshold or both neighbour tests.
+  One 1,600 x 1,066 photo: 5.72 s -> 2.64 s, with the same keypoints and
+  descriptors bit for bit (`crates/vision/examples/sift_vlfeat_bench.rs`
+  prints a checksum).
+- **`gsplat_photos` CPU matching computes one descriptor product per pair**
+  instead of two (`match_descriptors_cross_checked` instead of
+  `CrossCheckMatcher`): 3.6x faster on 8,000-keypoint photos, identical
+  matches.
 - **`gsplat_photos` frees SfM inputs it no longer needs.** Byte-identical
   models. Grey images for SIFT are made 256 at a time instead of all at
   once (4 bytes a pixel: 16.5 GB for SmallCity's 5,822 photos). With

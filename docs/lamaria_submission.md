@@ -36,23 +36,31 @@ skipped, so an interrupted run can be restarted unchanged.
 
 ```bash
 RUSTFLAGS="-C target-feature=+avx2,+fma" \
-  cargo build --release --example basalt_euroc_vio_demo --features basalt-lm-workspace-reuse
+  cargo build --release --example basalt_euroc_online_slam_demo --features basalt-lm-workspace-reuse
 
 python scripts/run_lamaria_test_submission.py \
   --tracks 1 \
-  --vio-exe target/release/examples/basalt_euroc_vio_demo \
+  --slam-exe target/release/examples/basalt_euroc_online_slam_demo \
   --config configs/basalt/variants/lamaria/euroc_config_big_window_multicam.json \
-  --gyro-bias-std 1e-6 \
+  --gyro-bias-std 1e-7 \
   --work-dir /path/to/lamaria_submission/work \
   --slam-dir /path/to/lamaria_submission/slam \
   --threads 12
 ```
 
 `--config` defaults to the multi-camera big-window LaMAria variant
-(`euroc_config_big_window_multicam.json`) and `--gyro-bias-std` to 1e-6, the
-best measured setup ([`lamaria_multicam.md`](lamaria_multicam.md)); it is about
+(`euroc_config_big_window_multicam.json`) and `--gyro-bias-std` to 1e-7, the
+best measured setup ([`lamaria_multicam.md`](lamaria_multicam.md) for the
+config, [`lamaria_imu_rectification.md`](lamaria_imu_rectification.md#re-tuning-gyro_bias_std)
+for the value, which assumes the rectified IMU); it is about
 1.45× slower than `euroc_config_big_window.json`.  `aria2c` is used with 16 connections when available
 (the server throttles a single connection), otherwise `urllib` is the fallback.
+
+`--slam-exe` runs the VIO plus the online mapper and submits its full-frame
+`trajectory_online.tum`. That is +5.44 Score on average over the VIO alone
+across one training sequence per track, for roughly 1.15–1.4× the run time
+([`lamaria_online_mapper.md`](lamaria_online_mapper.md)). Passing `--vio-exe` (`basalt_euroc_vio_demo`) instead runs the VIO
+only.
 
 IMU rectification is on by default
 ([`lamaria_imu_rectification.md`](lamaria_imu_rectification.md); +4.35 Score on

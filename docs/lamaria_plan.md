@@ -152,7 +152,21 @@ before/after on training sequences.
    categories (Medium 37.72 → 39.47, Long 24.14 → 28.89, Low light
    20.42 → 26.42, Moving 27.64 → 32.56; mean +4.35) with the multicam
    defaults unchanged
-   ([`lamaria_imu_rectification.md`](lamaria_imu_rectification.md)).
+   ([`lamaria_imu_rectification.md`](lamaria_imu_rectification.md)). The
+   factory IMU time offset (±4.1 ms) gave no consistent gain on sequence_2_11
+   and is not applied. The VIO is deterministic (a rerun is bit-identical).
+   With the rectified IMU, `gyro_bias_std` 1e-7 beats 1e-6 on average over
+   one sequence per track (+2.53; Long +6.87, Low light +6.00, Short +1.15,
+   Medium −1.11, Moving −0.29) and is now the driver default.
+9. **Online mapper on the rectified IMU.** Status: **measured on one training
+   sequence per track (2026-10-12); available in the submission driver via
+   `--slam-exe`.** With the rectified IMU and 1e-7, the online mapper adds
+   +5.44 Score on average over the VIO (Short +1.66, Medium +13.05, Long
+   +4.82, Low light +3.77, Moving +3.93; mean 38.21 → 43.66) and lowers ATE on
+   every sequence with pseudo-GT, for roughly 1.15–1.4× the run time
+   ([`lamaria_online_mapper.md`](lamaria_online_mapper.md)). At 1e-8 its
+   effect is erratic (one wrong loop costs up to 10 points), and joint VI-BA
+   does not beat the default mapper.
 
 ## 5. Test-set operational pipeline
 
@@ -186,6 +200,8 @@ before/after on training sequences.
   divergent Aria rig (lever 4).
 - [`lamaria_imu_rectification.md`](lamaria_imu_rectification.md) — Aria
   factory IMU rectification and per-category results (lever 8).
+- [`lamaria_online_mapper.md`](lamaria_online_mapper.md) — online mapper on
+  the rectified IMU, per-track results and cost (lever 9).
 - [`vi_slam_benchmarks.md`](vi_slam_benchmarks.md) — EuRoC VI-SLAM results.
 - [`vi_slam_global_consistency_plan.md`](vi_slam_global_consistency_plan.md) —
   global-consistency evidence and staged plan.

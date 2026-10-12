@@ -102,6 +102,22 @@ raw IMU in `lamaria_multicam.md`. That raw run used an older build, so the
 other sequences here. The driver reads each sequence's own `.vrs` header, so
 this is handled per sequence. Values below 1e-7 were not tried.
 
+1e-8 was measured afterwards, VIO only, with the same protocol:
+
+| Sequence | Score 1e-7 → 1e-8 | ATE 1e-7 → 1e-8 |
+|---|---|---|
+| sequence_1_19 | 52.26 → 51.30 | 2.17 → 2.15 m |
+| sequence_2_11 | 38.36 → 38.23 | 3.21 → 3.22 m |
+| sequence_3_17 | 35.76 → **38.20** | 4.63 → **4.18 m** |
+| sequence_4_10 | 32.42 → **35.98** | 3.58 → 3.74 m |
+| sequence_5_11 | **32.27** → 25.62 | n/a |
+| **Mean** | **38.21** → 37.87 (−0.35) | |
+
+1e-8 helps Long and Low light but costs 6.7 points on Moving platform. With
+the online mapper it is also erratic
+([`lamaria_online_mapper.md`](lamaria_online_mapper.md)), so **1e-7 stays the
+default**.
+
 ## IMU time offset
 
 The factory record also gives per-sensor time offsets for `imu-right`
@@ -169,4 +185,6 @@ therefore available for a submission without touching ground truth.
    time-offset table). The evidence that rectification and 1e-7 are real is
    their direction across tracks together with their trajectory
    improvement.
-2. **Below 1e-7.** The sweep stops at 1e-7; smaller values were not tried.
+2. **Per-track values.** 1e-8 wins on Long and Low light and loses on
+   Moving platform. Choosing per track from one sequence each would be
+   overfitting, so a single value is used.

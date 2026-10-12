@@ -1218,9 +1218,47 @@ impl OnlineNfrMapper {
     ) -> Option<f64> {
         let left_pose = self.mapper.frame_poses.get(&left_id.frame_id)?;
         let right_pose = self.mapper.frame_poses.get(&right_id.frame_id)?;
-        let vio_relative = left_pose.inverse().compose(right_pose);
-        let delta = vio_relative.rotation.inverse() * t_i_j.rotation;
+        let camera_relative =
+            self.camera_relative_pose(left_id, left_pose, right_id, right_pose)?;
+        let delta = camera_relative.rotation.inverse() * t_i_j.rotation;
         Some(delta.angle().to_degrees())
+    }
+
+    /// `T_cl_cr` from the map's IMU poses (`frame_poses` are `T_w_i`): the
+    /// frame in which the two-view RANSAC result `t_i_j` lives. Comparing
+    /// `t_i_j` with the IMU-frame relative pose instead mixes frames, which
+    /// on a camera mounted at a large angle to the IMU (Aria) turns the
+    /// viewpoint change itself into "rotation error".
+    fn camera_relative_pose(
+        &self,
+        left_id: TimeCamId,
+        left_pose: &SE3,
+        right_id: TimeCamId,
+        right_pose: &SE3,
+    ) -> Option<SE3> {
+        let calibration = self.mapper.calibration.as_ref()?;
+        Some(camera_relative_from_imu(
+            left_pose,
+            calibration.camera_to_imu(left_id.cam_id)?,
+            right_pose,
+            calibration.camera_to_imu(right_id.cam_id)?,
+        ))
+    }
+
+    /// `T_ir_il` (IMU frames) from a camera-frame relative pose `T_cl_cr`:
+    /// `T_il_ir = T_i_cl * T_cl_cr * T_i_cr^-1`.
+    fn imu_right_left_from_cameras(
+        &self,
+        left_id: TimeCamId,
+        right_id: TimeCamId,
+        t_cl_cr: &SE3,
+    ) -> Option<SE3> {
+        let calibration = self.mapper.calibration.as_ref()?;
+        Some(imu_right_left_from_camera_relative(
+            calibration.camera_to_imu(left_id.cam_id)?,
+            t_cl_cr,
+            calibration.camera_to_imu(right_id.cam_id)?,
+        ))
     }
 
     /// Current-map geometry of a loop pair: (distance between the two
@@ -1295,7 +1333,8 @@ impl OnlineNfrMapper {
         // repeated structure disagrees grossly; a genuine loop, whose
         // translation may have drifted, agrees on rotation.
         {
-            let vio_relative = left_pose.inverse().compose(&right_pose);
+            let vio_relative =
+                self.camera_relative_pose(left_id, &left_pose, right_id, &right_pose)?;
             let measured = data.t_i_j.clone();
             let delta = vio_relative.rotation.inverse() * measured.rotation;
             let angle_deg = delta.angle().to_degrees();
@@ -1388,8 +1427,11 @@ impl OnlineNfrMapper {
                 residuals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let median = residuals[residuals.len() / 2];
                 if median <= self.config.loop_closure_max_metric_residual_deg {
-                    let t_left_right = SE3::new(rotation, translation);
-                    let t_right_left = t_left_right.inverse();
+                    // `rotation`/`translation` relate the two *cameras*; the
+                    // factor constrains the IMU poses.
+                    let t_cl_cr = SE3::new(rotation, translation);
+                    let t_right_left =
+                        self.imu_right_left_from_cameras(left_id, right_id, &t_cl_cr)?;
                     let q = t_right_left.rotation.quaternion();
                     return Some(self.build_loop_factor(
                         right_id.frame_id,
@@ -1423,8 +1465,11 @@ impl OnlineNfrMapper {
             return None;
         }
         let relative = right_pose.inverse().compose(&left_pose);
-        // `data.t_i_j` is `T_left_right`; the factor wants `T_right_left`.
-        let rotation = data.t_i_j.inverse().rotation;
+        // `data.t_i_j` is the cameras' `T_cl_cr`; the factor wants the IMU
+        // poses' `T_ir_il`.
+        let rotation = self
+            .imu_right_left_from_cameras(left_id, right_id, &data.t_i_j)?
+            .rotation;
         let q = rotation.quaternion();
         Some(self.build_loop_factor(
             right_id.frame_id,
@@ -2300,6 +2345,21 @@ fn stereo_frame_id(timestamp_ns: i64, images: &[OfImageData], camera_id: u16) ->
 
 /// Verbatim copy of `session.rs`'s private helper of the same name (that
 /// file is not modified -- see the module documentation).
+/// `T_cl_cr` of two cameras from their IMU poses `T_w_il`, `T_w_ir` and
+/// extrinsics `T_i_cl`, `T_i_cr`.
+fn camera_relative_from_imu(t_w_il: &SE3, t_i_cl: &SE3, t_w_ir: &SE3, t_i_cr: &SE3) -> SE3 {
+    t_w_il
+        .compose(t_i_cl)
+        .inverse()
+        .compose(&t_w_ir.compose(t_i_cr))
+}
+
+/// `T_ir_il` of the IMU poses from a camera-frame `T_cl_cr`:
+/// `T_il_ir = T_i_cl * T_cl_cr * T_i_cr^-1`.
+fn imu_right_left_from_camera_relative(t_i_cl: &SE3, t_cl_cr: &SE3, t_i_cr: &SE3) -> SE3 {
+    t_i_cl.compose(t_cl_cr).compose(&t_i_cr.inverse()).inverse()
+}
+
 fn temporal_result_se3(result: &crate::mapper::features::TemporalRansacResult) -> SE3 {
     let rotation = Matrix3::from_row_slice(&[
         result.refined_model_rotation[0][0],
@@ -2371,6 +2431,44 @@ mod tests {
     use serde_json::Value;
 
     const TEST_SEED: u32 = 12345;
+
+    fn se3(axis: [f64; 3], angle_deg: f64, t: [f64; 3]) -> SE3 {
+        SE3::new(
+            UnitQuaternion::from_axis_angle(
+                &nalgebra::Unit::new_normalize(Vector3::from(axis)),
+                angle_deg.to_radians(),
+            ),
+            Vector3::from(t),
+        )
+    }
+
+    #[test]
+    fn loop_frame_conversions_are_consistent_with_tilted_cameras() {
+        // Aria-like: two cameras tilted far from the IMU axes.
+        let t_i_cl = se3([0.3, 1.0, 0.2], 75.0, [0.05, 0.01, -0.02]);
+        let t_i_cr = se3([-0.4, 0.8, 0.5], -70.0, [-0.05, 0.02, 0.01]);
+        // A 40 deg yaw turn plus 3 m of motion between the keyframes.
+        let t_w_il = se3([0.0, 0.0, 1.0], 10.0, [1.0, 2.0, 0.5]);
+        let t_w_ir = se3([0.1, 0.0, 1.0], 50.0, [3.5, 3.0, 0.4]);
+
+        let t_cl_cr = camera_relative_from_imu(&t_w_il, &t_i_cl, &t_w_ir, &t_i_cr);
+        // A correct loop measurement agrees exactly with the map in camera frames.
+        let delta = t_cl_cr.rotation.inverse() * t_cl_cr.rotation;
+        assert!(delta.angle().to_degrees() < 1e-9);
+        // The IMU-frame relative rotation is not the camera-frame one: the
+        // frame mix-up this guards against reports a large error here.
+        let imu_relative = t_w_il.inverse().compose(&t_w_ir);
+        let mixed = (imu_relative.rotation.inverse() * t_cl_cr.rotation)
+            .angle()
+            .to_degrees();
+        assert!(mixed > 10.0, "mixed-frame error {mixed}");
+
+        // Converting the camera measurement back gives the IMU poses' T_ir_il.
+        let t_ir_il = imu_right_left_from_camera_relative(&t_i_cl, &t_cl_cr, &t_i_cr);
+        let expected = t_w_ir.inverse().compose(&t_w_il);
+        assert!((t_ir_il.translation - expected.translation).norm() < 1e-9);
+        assert!((t_ir_il.rotation.inverse() * expected.rotation).angle() < 1e-9);
+    }
 
     // The exact real MH_01 M8a/M8b marginalization-event fixture the pinned
     // `pipelines/basalt/tests/m8f_nfr_session.rs` gate uses, reused here

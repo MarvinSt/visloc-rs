@@ -11,23 +11,16 @@
 //! (`.cc:192-282`, see `bundle_adjustment.rs` for the iteration-count-only
 //! subset threaded through), `Run` (`.cc:381-448`), `InitializeReconstruction`
 //! (`.cc:450-528`), `CheckRunGlobalRefinement` (`.cc:530-542`),
-//! `ReconstructSubModel` (`.cc:544-711`, structure-less registration
-//! omitted — see deviation below), `Reconstruct` (`.cc:713-820`).
+//! `ReconstructSubModel` (`.cc:544-711`), `Reconstruct` (`.cc:713-820`).
 //!
 //! ## Deviations
 //!
-//! - **`structure_less_registration_fallback` (COLMAP default `true`,
-//!   `incremental_pipeline.h:83`) is not ported.** `RegisterNextStructureLessImage`
-//!   (`incremental_mapper.cc:671-949`, epipolar/Sampson-based 2D-2D
-//!   resectioning with its own minimal solver) is a materially large
-//!   additional estimator that the C2 task brief did not list among
-//!   `mapper.rs`'s required routines (`RegisterNextImage`,
-//!   `RegisterNextGeneralFrame`, `FindNextImages`, BA, filtering,
-//!   retriangulation). Its omission means this port will fail to register
-//!   any frame that COLMAP only recovers via structure-less fallback (no
-//!   2D-3D correspondences, only 2D-2D) — flagged as a real, expected
-//!   source of registered-frame shortfall alongside the GP3P gap (see
-//!   `mapper.rs`'s module doc), not silently absorbed.
+//! - **`structure_less_registration_fallback` (COLMAP 4 default `true`)
+//!   is off by default** (`MapperOptions::structure_less_registration_fallback`):
+//!   the port's frozen controls predate it. When on, a round in which no
+//!   candidate registers from 2D-3D correspondences retries the candidates
+//!   from 2D-2D ones (`IncrementalMapper::register_next_structure_less_image`,
+//!   which lists its own deviations).
 //! - **`AlignReconstructionToPriorsOrRigScale`/`Normalize()`** (`.cc:96-160`)
 //!   are both omitted — see `mapper.rs`'s `iterative_global_refinement` doc
 //!   comment: with `ba_refine_sensor_from_rig=0` this control's rescale
@@ -262,28 +255,50 @@ fn reconstruct_sub_model(
         reg_next_success = false;
         let mut registered_image_id: Option<ImageT> = None;
 
-        let t_find = std::time::Instant::now();
-        let next_images = mapper.find_next_images(mapper_options, recon);
-        let find_ms = t_find.elapsed().as_millis();
+        // Structure-based registration first; when every candidate fails,
+        // the structure-less fallback (COLMAP 4) if enabled.
+        let structure_less_flags: &[bool] = if mapper_options.structure_less_registration_fallback {
+            &[false, true]
+        } else {
+            &[false]
+        };
         let t_reg = std::time::Instant::now();
         let mut attempts = 0usize;
-        for &candidate in &next_images {
-            attempts += 1;
-            if mapper.register_next_image(
-                mapper_options,
-                recon,
-                db.correspondence_graph(),
-                candidate,
-            ) {
-                reg_next_success = true;
-                registered_image_id = Some(candidate);
+        let mut find_ms = 0;
+        let mut num_candidates = 0;
+        for &structure_less in structure_less_flags {
+            let t_find = std::time::Instant::now();
+            let next_images = mapper.find_next_images(mapper_options, recon, structure_less);
+            find_ms += t_find.elapsed().as_millis();
+            num_candidates += next_images.len();
+            for &candidate in &next_images {
+                attempts += 1;
+                let registered = if structure_less {
+                    mapper.register_next_structure_less_image(
+                        mapper_options,
+                        recon,
+                        db.correspondence_graph(),
+                        candidate,
+                    )
+                } else {
+                    mapper.register_next_image(
+                        mapper_options,
+                        recon,
+                        db.correspondence_graph(),
+                        candidate,
+                    )
+                };
+                if registered {
+                    reg_next_success = true;
+                    registered_image_id = Some(candidate);
+                    break;
+                }
+            }
+            if reg_next_success {
                 break;
             }
         }
-        eprintln!(
-            "TIMING find_next_images elapsed_ms={find_ms} candidates={}",
-            next_images.len()
-        );
+        eprintln!("TIMING find_next_images elapsed_ms={find_ms} candidates={num_candidates}");
         eprintln!(
             "TIMING register_next_image elapsed_ms={} attempts={attempts} success={reg_next_success}",
             t_reg.elapsed().as_millis()

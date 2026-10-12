@@ -388,6 +388,7 @@ pub fn find_next_images(
     obs: &super::observation_manager::ObservationManager,
     filtered_frames: &std::collections::BTreeSet<super::types::FrameT>,
     num_reg_trials: &BTreeMap<ImageT, usize>,
+    structure_less: bool,
 ) -> Vec<ImageT> {
     let mut primary: Vec<(ImageT, u64)> = Vec::new();
     let mut secondary: Vec<(ImageT, u64)> = Vec::new();
@@ -403,7 +404,13 @@ pub fn find_next_images(
         if trials >= max_reg_trials {
             continue;
         }
-        let rank = obs.point3d_visibility_score(image_id);
+        // Structure-less registration ranks by 2D-2D correspondences to
+        // registered images (`.cc:276-281`).
+        let rank = if structure_less {
+            obs.num_visible_correspondences(image_id) as u64
+        } else {
+            obs.point3d_visibility_score(image_id)
+        };
         if filtered_frames.contains(&image.frame_id) || trials != 0 {
             secondary.push((image_id, rank));
         } else {

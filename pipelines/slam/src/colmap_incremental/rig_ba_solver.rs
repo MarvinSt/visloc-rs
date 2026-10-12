@@ -1973,6 +1973,42 @@ fn optimize_rig_obs(
     Ok(result)
 }
 
+/// One `BA_MEMORY` line: the main working sets of a solve, in MB, so a
+/// large run's memory can be attributed without a heap profiler. Sizes
+/// count elements, not allocator slack. `elimination` is the reduced
+/// system's off-diagonal blocks (f64) built on every trial, `pcg_f32` their
+/// f32 copy on the PCG path.
+fn log_memory(problem: &Problem, rig_obs: &[RigObs], points_lin: &[PointLin]) {
+    const MB: f64 = 1024.0 * 1024.0;
+    let pair_idx: usize = problem.point_pair_edge_idx.iter().map(Vec::len).sum();
+    let free_frames: usize = problem.point_free_frames.iter().map(Vec::len).sum();
+    let lin_frames: usize = points_lin.iter().map(|pl| pl.frames.len()).sum();
+    let lin_hcp: usize = points_lin.iter().map(|pl| pl.hcp.len()).sum();
+    let contributions = problem
+        .contributions
+        .as_ref()
+        .map_or(0, |c| c.slot.len() * std::mem::size_of::<[u32; 2]>());
+    let edges = problem.edges.len();
+    eprintln!(
+        "BA_MEMORY n_free_frames={} obs={} points={} edges={} rig_obs_mb={:.0} problem_obs_mb={:.0} point_free_frames_mb={:.0} point_pair_edge_idx_mb={:.0} (pairs={pair_idx}) contributions_mb={:.0} points_lin_mb={:.0} elimination_mb={:.0} pcg_f32_mb={:.0}",
+        problem.n_free_frames,
+        problem.obs.len(),
+        problem.points.len(),
+        edges,
+        std::mem::size_of_val(rig_obs) as f64 / MB,
+        std::mem::size_of_val(problem.obs.as_slice()) as f64 / MB,
+        (free_frames * 4) as f64 / MB,
+        (pair_idx * 4) as f64 / MB,
+        contributions as f64 / MB,
+        (std::mem::size_of_val(points_lin)
+            + lin_frames * 4
+            + lin_hcp * std::mem::size_of::<SMatrix<f64, 6, 3>>()) as f64
+            / MB,
+        (edges * std::mem::size_of::<Matrix6<f64>>()) as f64 / MB,
+        (edges * std::mem::size_of::<nalgebra::Matrix6<f32>>()) as f64 / MB,
+    );
+}
+
 /// [`optimize_with_tolerance`] on frames and points given as arrays
 /// ([`RigBaInput`]) and observations `rig_obs`; the optimized poses and
 /// points replace `input.poses` and `input.points`.
@@ -1997,6 +2033,11 @@ pub(crate) fn optimize_rig_input(
         (0.5 * full, pl, fd, fb)
     };
     let initial_cost = 2.0 * half_cost;
+    if problem.n_free_frames >= iterative_min_free_frames()
+        || std::env::var_os("VISLOC_BA_MEMORY").is_some()
+    {
+        log_memory(&problem, rig_obs, &points_lin);
+    }
 
     let mut radius = INITIAL_RADIUS;
     let mut decrease_factor = 2.0;

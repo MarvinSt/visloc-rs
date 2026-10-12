@@ -108,6 +108,23 @@ fn parse_args() -> Args {
     }
 }
 
+/// `; rss=… MB peak=… MB` from `/proc/self/status` (Linux), else empty: the
+/// database cache's share of a run's memory, next to the mapper's peak.
+fn memory_note() -> String {
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return String::new();
+    };
+    let field = |name: &str| {
+        status
+            .lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<f64>().ok())
+            .map_or(String::from("?"), |kb| format!("{:.0}", kb / 1024.0))
+    };
+    format!("; rss={} MB peak={} MB", field("VmRSS:"), field("VmHWM:"))
+}
+
 fn main() {
     let args = parse_args();
     let start = Instant::now();
@@ -125,11 +142,12 @@ fn main() {
     )
     .unwrap_or_else(|e| panic!("failed to load database cache: {e}"));
     eprintln!(
-        "loaded: {} rigs, {} cameras, {} frames, {} images",
+        "loaded: {} rigs, {} cameras, {} frames, {} images{}",
         db.num_rigs(),
         db.num_cameras(),
         db.num_frames(),
-        db.num_images()
+        db.num_images(),
+        memory_note()
     );
 
     let mut options = pipeline::PipelineOptions::default();
@@ -170,6 +188,7 @@ fn main() {
     fs::create_dir_all(&args.out_colmap).expect("failed to create --out-colmap directory");
 
     let result = pipeline::run(&options, &db);
+    eprintln!("mapper done{}", memory_note());
     let models = result.models;
 
     let elapsed = start.elapsed();

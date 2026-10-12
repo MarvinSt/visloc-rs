@@ -471,9 +471,14 @@ pub fn build_photo_dataset(
             .map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0)
             .collect()
     };
+    let byte_scale = sift_cfg.vlfeat_compatible_descriptor;
     let to_features = |kps: Vec<visloc_vision::features::sift::SiftKeypoint>, desc| FeatureSet {
         keypoints: kps.iter().map(|k| Point2::new(k.x, k.y)).collect(),
-        descriptors: desc,
+        descriptors: if byte_scale {
+            unit_scale_descriptors(desc)
+        } else {
+            desc
+        },
     };
     let t0 = std::time::Instant::now();
     #[cfg(feature = "gpu")]
@@ -904,9 +909,35 @@ pub fn build_photo_dataset(
     ))
 }
 
+/// VLFeat-compatible SIFT descriptors come back already quantised like
+/// COLMAP's bytes (`round(512 x)`, norm about 512). Matching expects the
+/// unit-norm scale: the GPU u8 bank quantises with `round(512 x)` again,
+/// which saturated every non-zero value at 255 and left near-binary
+/// descriptors (SmallCity lost 70% of its 3D points). Dividing by 512 is
+/// exact in f32, so the bank recovers the same bytes, and the CPU matcher's
+/// comparisons are unchanged.
+fn unit_scale_descriptors(mut desc: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    for d in &mut desc {
+        for v in d.iter_mut() {
+            *v /= 512.0;
+        }
+    }
+    desc
+}
+
 #[cfg(test)]
 mod tests {
     use super::exif_focal_35mm;
+    use super::unit_scale_descriptors;
+
+    #[test]
+    fn vlfeat_bytes_round_trip_through_the_u8_scale() {
+        let bytes: Vec<f32> = (0..128).map(|i| ((i * 37) % 256) as f32).collect();
+        let unit = unit_scale_descriptors(vec![bytes.clone()]);
+        for (b, u) in bytes.iter().zip(&unit[0]) {
+            assert_eq!((u * 512.0).round().clamp(0.0, 255.0), *b);
+        }
+    }
 
     /// A minimal little-endian EXIF APP1: IFD0 -> ExifIFD -> 0xA405 = 26.
     #[test]

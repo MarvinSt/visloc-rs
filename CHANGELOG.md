@@ -6,6 +6,16 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **`gsplat_photos` GPU matching saturated VLFeat-compatible descriptors.**
+  Those descriptors come back already in COLMAP's byte scale (norm about
+  512), and the default u8 GPU bank quantises with `round(512 x)` again,
+  so every non-zero value clipped to 255 and the descriptors were nearly
+  binary. On SmallCity (GPU matching) this cut the verified pairs by 12%
+  and the 3D points by 70% (292k instead of 958k), and pass 4 drifted
+  (own-fit median 0.62 m instead of 0.13 m). They are now divided by 512
+  before matching, which is exact: the bank recovers the same bytes and
+  CPU matching is bit-identical. CPU-matched runs (`--cpu`, the ETH3D
+  numbers above) were not affected.
 - **`gsplat_photos` SIFT finds matches on high-resolution photos.** It now
   uses COLMAP's VLFeat detector (subpixel localization) and descriptor, and
   feeds SIFT grey values in [0, 1] as `GrayImage` documents (it passed
@@ -152,6 +162,17 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **The COLMAP-port BA's PCG is preconditioned with runs of 32 frames.**
+  Block-Jacobi dropped every coupling between cameras. Cameras next to
+  each other in capture (frame-id) order share most points, so the
+  preconditioner is now a dense inverse over each run of 32 consecutive
+  free frames. It falls back to block-Jacobi when a run is not positive
+  definite. On a SmallCity mapper replay (same machine and inputs), PCG
+  took 30,634 iterations instead of 50,393, the solves 405 s instead of
+  612 s, and the mapper 904 s instead of 1,088 s, with a comparable result
+  (centre error median 0.87 m against 0.96 m). `VISLOC_PORT_PCG_CLUSTER=k`
+  changes the run length; `1` restores block-Jacobi. Systems under 1,000
+  free frames do not use PCG and are unchanged.
 - **VLFeat-compatible SIFT is 2.2x faster on the CPU, bit-identically.** The
   separable blur now runs a kernel tap at a time over whole rows (contiguous
   and vectorizable, same per-sample summation order), and the extremum scan

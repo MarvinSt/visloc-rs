@@ -136,7 +136,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use nalgebra::{DMatrix, Matrix3, Matrix6, Point2, Point3, SMatrix, Vector2, Vector3, Vector6};
+use nalgebra::{
+    DMatrix, DVector, Matrix3, Matrix6, Point2, Point3, SMatrix, Vector2, Vector3, Vector6,
+};
 use rayon::prelude::*;
 
 use visloc_core::geometry::SE3;
@@ -495,6 +497,72 @@ fn pcg_f32_blocks() -> bool {
     static F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F32.get_or_init(|| std::env::var("VISLOC_PORT_PCG_F64_BLOCKS").map_or(true, |v| v != "1"))
 }
+/// Free frames per cluster of the edge-list PCG's preconditioner
+/// ([`cluster_preconditioner`]); `VISLOC_PORT_PCG_CLUSTER=k` overrides it,
+/// `1` restores block-Jacobi. Frames are in frame-id (capture) order, and
+/// neighbours in capture order share most points, so a dense inverse over
+/// each run of consecutive frames captures the strongest couplings that
+/// block-Jacobi drops. On a Courthouse replay forced onto PCG, the same
+/// systems took 62 iterations a solve instead of 114 (k=16: 70, k=64: 60).
+/// Each frame's run inverse adds `6 x 6k` values to a product that reads
+/// `edges / frames` 6x6 blocks per frame (~390 on SmallCity), so the
+/// per-iteration cost barely moves.
+const PCG_CLUSTER_FRAMES: usize = 32;
+fn pcg_cluster_size() -> Option<usize> {
+    static K: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        Some(
+            std::env::var("VISLOC_PORT_PCG_CLUSTER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(PCG_CLUSTER_FRAMES),
+        )
+        .filter(|&k| k > 1)
+    })
+}
+
+/// Inverses of the reduced camera matrix restricted to runs of `k`
+/// consecutive free frames (diagonal blocks plus the edges inside a run),
+/// as `(first frame, inverse)`. `None` when a run is not positive definite;
+/// the caller then falls back to block-Jacobi.
+fn cluster_preconditioner(
+    diag: &[Matrix6<f64>],
+    edges: &[(u32, u32)],
+    offdiag: &[Matrix6<f64>],
+    k: usize,
+) -> Option<Vec<(usize, DMatrix<f64>)>> {
+    let n = diag.len();
+    let starts: Vec<usize> = (0..n).step_by(k).collect();
+    let mut mats: Vec<DMatrix<f64>> = starts
+        .iter()
+        .map(|&s| {
+            let m = k.min(n - s);
+            let mut mat = DMatrix::<f64>::zeros(m * 6, m * 6);
+            for i in 0..m {
+                mat.view_mut((i * 6, i * 6), (6, 6)).copy_from(&diag[s + i]);
+            }
+            mat
+        })
+        .collect();
+    for (&(a, b), blk) in edges.iter().zip(offdiag) {
+        let (a, b) = (a as usize, b as usize);
+        if a / k != b / k {
+            continue;
+        }
+        let (c, ia, ib) = (a / k, a % k, b % k);
+        // `blk` is the (row b, column a) block.
+        mats[c].view_mut((ib * 6, ia * 6), (6, 6)).copy_from(blk);
+        mats[c]
+            .view_mut((ia * 6, ib * 6), (6, 6))
+            .copy_from(&blk.transpose());
+    }
+    starts
+        .into_par_iter()
+        .zip(mats)
+        .map(|(s, mat)| mat.cholesky().map(|c| (s, c.inverse())))
+        .collect()
+}
+
 /// Iteration cap of [`pcg_blocks6`] (Ceres' `max_linear_solver_iterations`).
 const PCG_MAX_ITERATIONS: usize = 500;
 
@@ -562,7 +630,7 @@ fn pcg_csr6(
             })
             .collect()
     };
-    pcg_core(&diag, matvec, rhs, tol).map(|(x, _)| x)
+    pcg_core(&diag, matvec, rhs, tol, None).map(|(x, _)| x)
 }
 
 /// [`pcg_blocks6`] with the matrix given by its diagonal blocks and a
@@ -572,12 +640,31 @@ fn pcg_core(
     matvec: impl Fn(&[Vector6<f64>]) -> Vec<Vector6<f64>>,
     rhs: &DMatrix<f64>,
     tol: f64,
+    clusters: Option<&[(usize, DMatrix<f64>)]>,
 ) -> Option<(DMatrix<f64>, usize)> {
     let n = diag.len();
     let precond: Vec<Matrix6<f64>> = diag
         .par_iter()
         .map(|d| d.cholesky().map(|c| c.inverse()))
         .collect::<Option<Vec<_>>>()?;
+    // z = M⁻¹ r: block-Jacobi, or per-cluster dense inverses when given.
+    let apply = |r: &[Vector6<f64>]| -> Vec<Vector6<f64>> {
+        let Some(clusters) = clusters else {
+            return r.iter().zip(&precond).map(|(r, m)| m * r).collect();
+        };
+        let parts: Vec<Vec<Vector6<f64>>> = clusters
+            .par_iter()
+            .map(|(start, inv)| {
+                let m = inv.nrows() / 6;
+                let rc = DVector::<f64>::from_fn(m * 6, |k, _| r[start + k / 6][k % 6]);
+                let zc = inv * rc;
+                (0..m)
+                    .map(|i| Vector6::from_fn(|k, _| zc[i * 6 + k]))
+                    .collect()
+            })
+            .collect();
+        parts.into_iter().flatten().collect()
+    };
     let dot = |a: &[Vector6<f64>], b: &[Vector6<f64>]| -> f64 {
         let partial: Vec<f64> = a.par_iter().zip(b).map(|(x, y)| x.dot(y)).collect();
         partial.iter().sum()
@@ -591,7 +678,7 @@ fn pcg_core(
         return Some((DMatrix::zeros(n * 6, 1), 0));
     }
     let mut r = b;
-    let mut z: Vec<Vector6<f64>> = r.iter().zip(&precond).map(|(r, m)| m * r).collect();
+    let mut z: Vec<Vector6<f64>> = apply(&r);
     let mut p = z.clone();
     let mut rz = dot(&r, &z);
     let mut iterations = 0;
@@ -610,7 +697,7 @@ fn pcg_core(
         if dot(&r, &r).sqrt() <= tol * b_norm {
             break;
         }
-        z = r.iter().zip(&precond).map(|(r, m)| m * r).collect();
+        z = apply(&r);
         let rz_next = dot(&r, &z);
         let beta = rz_next / rz;
         rz = rz_next;
@@ -1602,7 +1689,15 @@ fn solve_step(
         }
         timings.assemble += t.elapsed();
         let t = Instant::now();
-        let (solved, iterations) = pcg_core(&frame_diag, matvec, &rhs, pcg_relative_tolerance())?;
+        let clusters = pcg_cluster_size()
+            .and_then(|k| cluster_preconditioner(&frame_diag, edges, &flat_offdiag, k));
+        let (solved, iterations) = pcg_core(
+            &frame_diag,
+            matvec,
+            &rhs,
+            pcg_relative_tolerance(),
+            clusters.as_deref(),
+        )?;
         timings.pcg_iterations += iterations;
         let mut dx_frames = vec![Vector6::<f64>::zeros(); n_free];
         for a in 0..n_free {
@@ -2936,6 +3031,53 @@ mod iterative_bench {
             );
         }
         columns
+    }
+
+    /// The run-of-frames preconditioner converges to the same solution as a
+    /// dense Cholesky solve, in fewer iterations than block-Jacobi.
+    #[test]
+    fn cluster_preconditioned_pcg_matches_cholesky() {
+        let n = 120;
+        let columns = dense_covisibility_system(n);
+        let mut diag = Vec::with_capacity(n);
+        let mut edges = Vec::new();
+        let mut offdiag = Vec::new();
+        let mut dense = DMatrix::<f64>::zeros(n * 6, n * 6);
+        for (j, col) in columns.iter().enumerate() {
+            for (&i, blk) in col {
+                dense.view_mut((i * 6, j * 6), (6, 6)).copy_from(blk);
+                if i == j {
+                    diag.push(*blk);
+                } else {
+                    dense
+                        .view_mut((j * 6, i * 6), (6, 6))
+                        .copy_from(&blk.transpose());
+                    // Edge-list convention: `(a, b)` holds the (row b, column a) block.
+                    edges.push((j as u32, i as u32));
+                    offdiag.push(*blk);
+                }
+            }
+        }
+        let rhs = DMatrix::<f64>::from_fn(n * 6, 1, |i, _| ((i * 13) % 17) as f64 - 8.0);
+        let exact = dense.clone().cholesky().expect("SPD").solve(&rhs);
+        let matvec = |x: &[Vector6<f64>]| -> Vec<Vector6<f64>> {
+            let xs = DVector::<f64>::from_fn(n * 6, |k, _| x[k / 6][k % 6]);
+            let y = &dense * xs;
+            (0..n)
+                .map(|i| Vector6::from_fn(|k, _| y[i * 6 + k]))
+                .collect()
+        };
+        let (jacobi, it_jacobi) = pcg_core(&diag, matvec, &rhs, 1e-10, None).expect("pcg");
+        let clusters = cluster_preconditioner(&diag, &edges, &offdiag, 16).expect("SPD runs");
+        let (clustered, it_clustered) =
+            pcg_core(&diag, matvec, &rhs, 1e-10, Some(&clusters)).expect("pcg");
+        let scale = exact.norm();
+        assert!((&jacobi - &exact).norm() < 1e-6 * scale);
+        assert!((&clustered - &exact).norm() < 1e-6 * scale);
+        assert!(
+            it_clustered < it_jacobi,
+            "clustered {it_clustered} vs block-Jacobi {it_jacobi} iterations"
+        );
     }
 
     /// `cargo test --release -p visloc-slam --lib iterative_bench -- --ignored --nocapture`

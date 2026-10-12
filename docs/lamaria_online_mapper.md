@@ -45,10 +45,14 @@ drift: −2.1° at the end of the sequence becomes +0.4° (1e-8 run, see below).
 |---|---|---|
 | sequence_1_19 | 51.30 → 41.25 (**−10.06**) | 2.15 → 3.00 m |
 | sequence_2_11 | 38.23 → **54.04** (+15.81) | 3.22 → **2.20 m** |
+| sequence_3_17 | 38.20 → **43.64** (+5.44) | 4.18 → **2.99 m** |
 | sequence_4_10 | 35.98 → 31.54 (**−4.43**) | 3.74 → 4.29 m |
 | sequence_5_11 | 25.62 → **35.89** (+10.28) | n/a |
+| **Mean** | 37.87 → 41.27 (+3.41) | |
 
-At 1e-8 the mapper's effect is erratic. On sequence_1_19 the 60-second
+At 1e-8 the mapper's mean (41.27) stays below the 1e-7 mapper's mean
+(43.66), even though 1e-8 + mapper is the best result on Medium and Long.
+Its effect is also erratic. On sequence_1_19 the 60-second
 segment fits stay accurate while the whole trajectory bends, which is the
 signature of an accepted wrong loop or merge. At 1e-7 the effect is
 positive on every track, so **1e-7 stays the default**. 1e-8 also loses

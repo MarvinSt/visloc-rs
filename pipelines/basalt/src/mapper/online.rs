@@ -1238,8 +1238,8 @@ impl OnlineNfrMapper {
         } else {
             (right_id.frame_id, left_id.frame_id)
         };
-        let mut travelled = 0.0;
-        let mut previous = None;
+        let mut travelled = 0.0_f64;
+        let mut previous: Option<Vector3<f64>> = None;
         for pose in self
             .mapper
             .frame_poses

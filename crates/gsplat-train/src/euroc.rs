@@ -317,10 +317,14 @@ pub(crate) fn run_colmap_port(
     let mut options = PipelineOptions::default();
     // The port's default (8) is a rig-benchmark control override; use
     // COLMAP's own `Mapper.abs_pose_min_num_inliers` for single cameras.
-    options.mapper.abs_pose_min_num_inliers = 30;
-    for o in mapper_overrides {
+    let mut applied = vec!["abs_pose_min_num_inliers=30".to_string()];
+    applied.extend(mapper_overrides.iter().cloned());
+    for o in &applied {
         apply_mapper_override(&mut options.mapper, o).map_err(err)?;
     }
+    // `colmap_incremental_mapper` replays this directory with these.
+    std::fs::write(dir.join("mapper_options.txt"), applied.join("\n") + "\n")
+        .map_err(|e| err(e.to_string()))?;
     let run = pipeline::run(&options, &db);
     let _ = std::fs::write(dir.join("mapper.log"), run.log.join("\n"));
     let mut order: Vec<usize> = (0..run.models.len()).collect();
@@ -572,31 +576,8 @@ pub fn apply_mapper_override(
     cfg: &mut visloc_slam::colmap_incremental::MapperOptions,
     kv: &str,
 ) -> Result<(), String> {
-    let (key, value) = kv
-        .split_once('=')
-        .ok_or_else(|| format!("--mapper-opt {kv}: expected key=value"))?;
-    let num = || -> Result<f64, String> {
-        value
-            .parse::<f64>()
-            .map_err(|e| format!("--mapper-opt {key}: {e}"))
-    };
-    match key {
-        "init_min_num_inliers" => cfg.init_min_num_inliers = num()? as usize,
-        "init_max_error" => cfg.init_max_error = num()?,
-        "init_max_forward_motion" => cfg.init_max_forward_motion = num()?,
-        "init_min_tri_angle_deg" => cfg.init_min_tri_angle_deg = num()?,
-        "init_max_reg_trials" => cfg.init_max_reg_trials = num()? as usize,
-        "abs_pose_max_error" => cfg.abs_pose_max_error = num()?,
-        "abs_pose_min_num_inliers" => cfg.abs_pose_min_num_inliers = num()? as usize,
-        "abs_pose_min_inlier_ratio" => cfg.abs_pose_min_inlier_ratio = num()?,
-        "ba_local_num_images" => cfg.ba_local_num_images = num()? as usize,
-        "ba_local_min_tri_angle_deg" => cfg.ba_local_min_tri_angle_deg = num()?,
-        "filter_max_reproj_error" => cfg.filter_max_reproj_error = num()?,
-        "filter_min_tri_angle_deg" => cfg.filter_min_tri_angle_deg = num()?,
-        "max_reg_trials" => cfg.max_reg_trials = num()? as usize,
-        _ => return Err(format!("--mapper-opt: unknown key {key}")),
-    }
-    Ok(())
+    cfg.apply_override(kv)
+        .map_err(|e| format!("--mapper-opt {e}"))
 }
 
 /// Bilinear undistortion of a grey image to a pinhole camera with the same

@@ -140,6 +140,37 @@ impl Default for Options {
 }
 
 impl Options {
+    /// Apply one `key=value` override (the numeric thresholds only), e.g.
+    /// `abs_pose_min_num_inliers=30`. Errors name the offending key.
+    pub fn apply_override(&mut self, kv: &str) -> Result<(), String> {
+        let (key, value) = kv
+            .split_once('=')
+            .ok_or_else(|| format!("{kv}: expected key=value"))?;
+        let num = || -> Result<f64, String> {
+            value
+                .trim()
+                .parse::<f64>()
+                .map_err(|e| format!("{key}: {e}"))
+        };
+        match key.trim() {
+            "init_min_num_inliers" => self.init_min_num_inliers = num()? as usize,
+            "init_max_error" => self.init_max_error = num()?,
+            "init_max_forward_motion" => self.init_max_forward_motion = num()?,
+            "init_min_tri_angle_deg" => self.init_min_tri_angle_deg = num()?,
+            "init_max_reg_trials" => self.init_max_reg_trials = num()? as usize,
+            "abs_pose_max_error" => self.abs_pose_max_error = num()?,
+            "abs_pose_min_num_inliers" => self.abs_pose_min_num_inliers = num()? as usize,
+            "abs_pose_min_inlier_ratio" => self.abs_pose_min_inlier_ratio = num()?,
+            "ba_local_num_images" => self.ba_local_num_images = num()? as usize,
+            "ba_local_min_tri_angle_deg" => self.ba_local_min_tri_angle_deg = num()?,
+            "filter_max_reproj_error" => self.filter_max_reproj_error = num()?,
+            "filter_min_tri_angle_deg" => self.filter_min_tri_angle_deg = num()?,
+            "max_reg_trials" => self.max_reg_trials = num()? as usize,
+            _ => return Err(format!("unknown key {key}")),
+        }
+        Ok(())
+    }
+
     const fn init_gate(&self) -> InitGateOptions {
         InitGateOptions {
             init_min_num_inliers: self.init_min_num_inliers,
@@ -1252,5 +1283,26 @@ impl IncrementalMapper {
             }
         }
         ranked
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Options;
+
+    #[test]
+    fn options_apply_overrides_by_key() {
+        let mut options = Options::default();
+        options
+            .apply_override("abs_pose_min_num_inliers=30")
+            .unwrap();
+        options
+            .apply_override("filter_max_reproj_error = 2.5")
+            .unwrap();
+        assert_eq!(options.abs_pose_min_num_inliers, 30);
+        assert_eq!(options.filter_max_reproj_error, 2.5);
+        assert!(options.apply_override("no_such_key=1").is_err());
+        assert!(options.apply_override("max_reg_trials").is_err());
+        assert!(options.apply_override("max_reg_trials=x").is_err());
     }
 }

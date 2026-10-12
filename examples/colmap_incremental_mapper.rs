@@ -152,9 +152,29 @@ fn main() {
 
     let mut options = pipeline::PipelineOptions::default();
     options.mapper.random_seed = args.random_seed;
-    // `gsplat_photos` (single camera) uses COLMAP's own
-    // `Mapper.abs_pose_min_num_inliers = 30`; replay its exports with
-    // VISLOC_ABS_POSE_MIN_INLIERS=30.
+    // Exports from `gsplat_photos`/`gsplat_euroc` record the mapper options
+    // they ran with (e.g. COLMAP's single-camera
+    // `abs_pose_min_num_inliers=30`) next to the manifest; replay with them.
+    let recorded = args
+        .manifest
+        .parent()
+        .map(|dir| dir.join("mapper_options.txt"))
+        .filter(|path| path.exists());
+    if let Some(path) = recorded {
+        let text = fs::read_to_string(&path).expect("failed to read mapper_options.txt");
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            options
+                .mapper
+                .apply_override(line)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
+        eprintln!(
+            "mapper options from {}: {}",
+            path.display(),
+            text.trim().replace('\n', ", ")
+        );
+    }
+    // VISLOC_ABS_POSE_MIN_INLIERS overrides both.
     if let Some(n) = std::env::var("VISLOC_ABS_POSE_MIN_INLIERS")
         .ok()
         .and_then(|v| v.parse().ok())

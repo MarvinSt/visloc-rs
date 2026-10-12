@@ -6,6 +6,19 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **`colmap_incremental_mapper` replays a `gsplat_photos`/`gsplat_euroc`
+  export with the options it ran with.** Those pipelines use COLMAP's
+  single-camera `abs_pose_min_num_inliers=30`, but a replay of their
+  `port/` directory used the port's rig-control default of 8 unless
+  `VISLOC_ABS_POSE_MIN_INLIERS=30` was set. That registered images the
+  pipeline rejects; ETH3D meadow, for one, replayed at 15/15 images with a
+  26.6 cm centre RMSE instead of 14/15 at 5.9 cm. The export now writes
+  `port/mapper_options.txt` (the options applied, including `--mapper-opt`
+  overrides), and the replay applies it, so a replay reproduces the
+  pipeline's model byte for byte. Earlier replay-based comparisons in this
+  log ran with 8 on both sides. `MapperOptions::apply_override` now holds
+  the `key=value` parser that `--mapper-opt` uses.
+
 - **PnP RANSAC no longer throws away its best pose.** After the search,
   `PnPRansac` refit the pose estimator on all the inliers and refined
   from that refit alone. With P3P the refit solves from three of the

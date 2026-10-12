@@ -6,6 +6,17 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **PnP RANSAC no longer throws away its best pose.** After the search,
+  `PnPRansac` refit the pose estimator on all the inliers and refined
+  from that refit alone. With P3P the refit solves from three of the
+  inliers and can land far from the search's winner, and the refinement
+  then started from the bad pose: on the Courthouse replay 50 image
+  registrations failed this way (around 700 correspondences, 3-6 inliers
+  left), leaving 544 of 553 images registered. It now starts from the
+  better of the winner and the refit. Courthouse registers all 553 with
+  no failed attempt; the ETH3D courtyard, pipes, kicker and terrains
+  replays are unchanged (same images, centre RMSE within 0.07 cm).
+
 - **`gsplat_photos` GPU matching saturated VLFeat-compatible descriptors.**
   Those descriptors come back already in COLMAP's byte scale (norm about
   512), and the default u8 GPU bank quantises with `round(512 x)` again,

@@ -4,7 +4,7 @@
 //! cargo run --release -p visloc-gsplat-train --features gpu,euroc --example gsplat_photos -- \
 //!     --images <folder> --out <work dir> [--steps 30000] [--max-size 1600] [--focal PX] \
 //!     [--no-mesh] [--normal-weight 0.005] [--appearance] [--exhaustive-max 300] [--window 20]
-//!     [--retrieval 30] [--max-keypoints 4000] [--sift-opt key=value ...] [--match-f32] [--mask-black 12]
+//!     [--retrieval 30] [--max-keypoints 8192] [--sift-opt key=value ...] [--match-f32] [--mask-black 12]
 //! ```
 //!
 //! SfM from `visloc_gsplat_train::photos` (EXIF focal, GPU SIFT/matching,

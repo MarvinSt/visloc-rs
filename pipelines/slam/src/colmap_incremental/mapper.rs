@@ -1160,13 +1160,24 @@ impl IncrementalMapper {
             }
             config_image_ids = config.images().iter().copied().collect();
 
-            // Deviation: COLMAP additionally fixes rig/camera parameter
-            // blocks not fully represented in the local window
-            // (`incremental_mapper.cc:1036-1065`) — moot here since
-            // `sensor_from_rig` and camera intrinsics are never Ceres
-            // parameter blocks in this port at all (control:
-            // `ba_refine_sensor_from_rig=0`, no intrinsics refinement; see
-            // `bundle_adjustment.rs` module doc). Nothing to fix.
+            // COLMAP fixes the camera (and rig) parameter blocks not fully
+            // represented in the local window (`incremental_mapper.cc:
+            // 1036-1065`): a camera is refined only while every registered
+            // image of it is in the window. `sensor_from_rig` is never a
+            // parameter block in this port (`ba_refine_sensor_from_rig=0`).
+            if ba_options.refine_focal_length || ba_options.refine_principal_point {
+                let mut in_window: BTreeMap<CameraT, usize> = BTreeMap::new();
+                for &iid in &config_image_ids {
+                    *in_window.entry(recon.image(iid).camera_id).or_default() += 1;
+                }
+                let registered = &self.num_reg_images_per_camera;
+                if in_window
+                    .iter()
+                    .any(|(id, &n)| n < registered.get(id).copied().unwrap_or(0))
+                {
+                    config.set_constant_intrinsics();
+                }
+            }
 
             let mut variable_ids: Vec<Point3DT> = Vec::new();
             for &pid in point3d_ids {

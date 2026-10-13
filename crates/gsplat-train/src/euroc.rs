@@ -97,7 +97,7 @@ pub struct EurocSfmConfig {
     /// registered metres off. `0` keeps every frame.
     pub min_keyframe_motion_px: f64,
     /// `key=value` overrides of the COLMAP-port mapper's
-    /// `colmap_incremental::MapperOptions` (see [`apply_mapper_override`]),
+    /// `colmap_incremental::PipelineOptions` (see [`apply_mapper_override`]),
     /// applied only when `colmap_port_mapper` is set.
     pub mapper_overrides: Vec<String>,
 }
@@ -324,7 +324,7 @@ pub(crate) fn run_colmap_port(
     ];
     applied.extend(mapper_overrides.iter().cloned());
     for o in &applied {
-        apply_mapper_override(&mut options.mapper, o).map_err(err)?;
+        apply_mapper_override(&mut options, o).map_err(err)?;
     }
     // `colmap_incremental_mapper` replays this directory with these.
     std::fs::write(dir.join("mapper_options.txt"), applied.join("\n") + "\n")
@@ -354,6 +354,21 @@ pub(crate) fn run_colmap_port(
         models.push(read_port_model(&model_dir, features).map_err(err)?);
     }
     Ok(models)
+}
+
+/// `[fx, fy, cx, cy]` of the largest model `run_colmap_port` wrote under
+/// `out_dir` (`port/model0/cameras.txt`, one PINHOLE camera).
+pub(crate) fn read_port_camera(out_dir: &Path) -> Option<[f64; 4]> {
+    let text = std::fs::read_to_string(out_dir.join("port/model0/cameras.txt")).ok()?;
+    let row = text
+        .lines()
+        .find(|l| !l.starts_with('#') && !l.trim().is_empty())?;
+    let t: Vec<&str> = row.split_whitespace().collect();
+    if t.get(1) != Some(&"PINHOLE") || t.len() < 8 {
+        return None;
+    }
+    let v: Vec<f64> = t[4..8].iter().filter_map(|x| x.parse().ok()).collect();
+    v.try_into().ok()
 }
 
 /// Read a COLMAP text model written by the port back as poses + tracks.
@@ -571,13 +586,14 @@ pub fn apply_sfm_override(cfg: &mut IncrementalSfmConfig, kv: &str) -> Result<()
     Ok(())
 }
 
-/// Apply one `key=value` override to the COLMAP-port mapper's
-/// `colmap_incremental::MapperOptions`. Diagnostic knob for sweeping the
+/// Apply one `key=value` override to the COLMAP-port pipeline's options
+/// (`colmap_incremental::PipelineOptions::apply_override`: the mapper's
+/// thresholds and the BA's `ba_refine_*`). Diagnostic knob for sweeping the
 /// mapper's registration/triangulation/filtering thresholds against
 /// `--mapper colmap-port`; see `docs/euroc_gpu_sfm_vs_colmap.md`'s
 /// "mapper-side robustness" experiments.
 pub fn apply_mapper_override(
-    cfg: &mut visloc_slam::colmap_incremental::MapperOptions,
+    cfg: &mut visloc_slam::colmap_incremental::PipelineOptions,
     kv: &str,
 ) -> Result<(), String> {
     cfg.apply_override(kv)

@@ -155,6 +155,7 @@ pub struct BundleAdjustmentConfig {
     constant_point3d_ids: BTreeSet<Point3DT>,
     variable_point3d_ids: BTreeSet<Point3DT>,
     gauge: Gauge,
+    constant_intrinsics: bool,
 }
 
 impl BundleAdjustmentConfig {
@@ -197,6 +198,13 @@ impl BundleAdjustmentConfig {
 
     pub const fn fix_gauge(&mut self, gauge: Gauge) {
         self.gauge = gauge;
+    }
+
+    /// COLMAP's `SetConstantCamIntrinsics` for the solve's (single) camera:
+    /// local BA holds a camera constant unless every registered image of it
+    /// is in the window (`incremental_mapper.cc:1036-1065`).
+    pub const fn set_constant_intrinsics(&mut self) {
+        self.constant_intrinsics = true;
     }
 }
 
@@ -301,6 +309,15 @@ pub struct BundleAdjustmentOptions {
     /// legacy absolute `‖g‖_∞ <= 1e-4` criterion; COLMAP uses `1.0` for
     /// global BA and `10.0` for local BA (`incremental_pipeline.cc:244,201`).
     pub gradient_tolerance_rel: Option<f64>,
+    /// COLMAP's `BundleAdjustmentOptions::refine_focal_length` /
+    /// `refine_principal_point` (`bundle_adjustment.h`; the pipeline's
+    /// `ba_refine_*`). Applied to the solve's camera when every observation
+    /// shares one PINHOLE/SIMPLE_PINHOLE camera and the config does not
+    /// hold it constant (see [`BundleAdjustmentConfig::set_constant_intrinsics`]);
+    /// the native backend only, below its iterative-solve size. Off by
+    /// default (the port's controls hold intrinsics fixed).
+    pub refine_focal_length: bool,
+    pub refine_principal_point: bool,
 }
 
 impl BundleAdjustmentOptions {
@@ -327,6 +344,8 @@ impl BundleAdjustmentOptions {
             // the local-BA counterpart of the global-BA convergence fix
             // (docs/colmap_rig_mapper_port_plan.md §9.1).
             gradient_tolerance_rel: Some(10.0),
+            refine_focal_length: false,
+            refine_principal_point: false,
         }
     }
     /// `kDefaultCeresGlobalMaxNumIterations` (`incremental_pipeline.cc:48`).
@@ -353,6 +372,8 @@ impl BundleAdjustmentOptions {
             // ~1-2 iterations (see docs/colmap_rig_mapper_port_plan.md §8.4).
             refine_points3d: true,
             gradient_tolerance_rel: Some(1.0),
+            refine_focal_length: false,
+            refine_principal_point: false,
         }
     }
 }
@@ -756,6 +777,37 @@ fn solve_native(
             sensor_from_rig: sensor_from_rig_for_image(recon, image_id),
         }));
     }
+    // The camera block: one PINHOLE/SIMPLE_PINHOLE camera behind every
+    // observation, not held constant, with a refine option on.
+    let mut shared_intrinsics = None;
+    if (options.refine_focal_length || options.refine_principal_point)
+        && !config.constant_intrinsics
+    {
+        let mut camera_ids = observed
+            .iter()
+            .enumerate()
+            .filter(|&(_, &seen)| seen)
+            .map(|(image_id, _)| recon.image(image_id as ImageT).camera_id);
+        let first = camera_ids.next();
+        if let Some(camera_id) = first.filter(|&id| camera_ids.all(|other| other == id)) {
+            let camera = recon.camera(camera_id);
+            if matches!(
+                camera.model,
+                visloc_core::types::CameraModel::Pinhole
+                    | visloc_core::types::CameraModel::SimplePinhole
+            ) {
+                let (fx, fy, cx, cy) = camera.intrinsics().expect("pinhole intrinsics");
+                shared_intrinsics = Some((
+                    camera_id,
+                    super::rig_ba_solver::SharedIntrinsics {
+                        params: [fx, fy, cx, cy],
+                        refine_focal_length: options.refine_focal_length,
+                        refine_principal_point: options.refine_principal_point,
+                    },
+                ));
+            }
+        }
+    }
     let point_xyz: Vec<Point3<f64>> = plans.iter().map(|plan| plan.xyz).collect();
     drop(plans);
     let obs: Vec<Obs> = keys
@@ -797,10 +849,20 @@ fn solve_native(
         options.max_num_iterations,
         options.loss_function,
         options.gradient_tolerance_rel,
+        shared_intrinsics.as_mut().map(|(_, k)| k),
     );
     let Ok(result) = solved else {
         return false;
     };
+    if let Some((camera_id, k)) = shared_intrinsics {
+        let camera = recon.camera_mut(camera_id);
+        let [fx, fy, cx, cy] = k.params;
+        camera.params = match camera.model {
+            visloc_core::types::CameraModel::SimplePinhole => vec![fx, cx, cy],
+            _ => vec![fx, fy, cx, cy],
+        };
+        eprintln!("BA_INTRINSICS camera={camera_id} fx={fx:.3} fy={fy:.3} cx={cx:.3} cy={cy:.3}");
+    }
     eprintln!(
         "BA_SOLVE backend={:?} frames={} obs={n_obs} landmarks={n_lm} fixed_landmarks={n_fixed_lm} iterations={} elapsed_ms={}",
         options.backend,

@@ -46,6 +46,7 @@ gpu-matcher = ["dep:visloc-dpvo-cuda-runtime"]
 
 [dependencies]
 nalgebra = { workspace = true }
+wide = { workspace = true }
 rand = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

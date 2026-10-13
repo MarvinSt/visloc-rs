@@ -189,6 +189,11 @@ impl Reconstruction {
             .get(&camera_id)
             .unwrap_or_else(|| panic!("camera {camera_id} does not exist"))
     }
+    pub fn camera_mut(&mut self, camera_id: CameraT) -> &mut Camera {
+        self.cameras
+            .get_mut(&camera_id)
+            .unwrap_or_else(|| panic!("camera {camera_id} does not exist"))
+    }
     pub fn frame(&self, frame_id: FrameT) -> &Frame {
         self.frames
             .get(&frame_id)

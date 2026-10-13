@@ -164,7 +164,6 @@ fn main() {
         let text = fs::read_to_string(&path).expect("failed to read mapper_options.txt");
         for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
             options
-                .mapper
                 .apply_override(line)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         }

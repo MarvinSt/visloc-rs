@@ -255,6 +255,34 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **Less per-image overhead in the COLMAP-port mapper on large models.**
+  The SmallCity replay also spent 435 s in local refinement outside the
+  solver core: point filtering 107 s, choosing the local window 63 s,
+  and linearizations in every solve. The filter and window changes are
+  bit-identical. The linearization rounds differently: its sums are
+  grouped by point shard, and the pose Jacobian is formed as
+  `[J_point | -J_point [p]x]`. It stays deterministic at any thread count
+  (new test).
+  - **Linearization** runs in a fixed number of point shards. Each shard
+    adds its per-frame blocks into its own accumulators, and the shards
+    are summed in order. The old code wrote 336 bytes per observation to
+    a buffer and folded it serially, which was a third of the time. A
+    point's linearization also no longer copies its frame list. On the
+    `large_global_ba_phases` bench (3M observations) one linearization
+    went from 350 ms to 190 ms.
+  - **Point filters** compute each observing image's pose and
+    projection centre once per pass, in one table shared by both
+    filters. They used to compose every observation's pose through its
+    frame and rig. The triangulation-angle filter also no longer
+    collects and sorts every observation's image id.
+  - **`find_local_bundle`** counts shared points through a table indexed
+    by image id instead of a `BTreeMap` and a `HashMap`, and takes the
+    75th-percentile angle with a selection instead of a sort.
+
+  On the 13 ETH3D scenes every centre error is unchanged to the reported
+  digit; mapper time is 41.1 s → 39.6 s (facade, the largest, 17.2 s →
+  15.6 s).
+
 - **Faster COLMAP-port bundle adjustment.** Profiling a SmallCity replay
   (5,816 images, 18.5 min mapper) put 400 s in global-BA solves and
   76 s in local-BA solves, nearly all of them a single LM step. Three

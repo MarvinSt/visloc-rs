@@ -299,6 +299,17 @@ All notable changes to `visloc-rs` will be documented here.
       (p90 2.19 m → 0.75 m). The previous binary reproduced 0.640 m
       exactly, so the mapper is deterministic and the change comes from
       the code. A single run cannot say whether the gain is systematic.
+    - **Follow-up: the gain was not systematic.** The same replay
+      with this release (#280) gives 0.611 m (p90 2.10 m) in 21:00. Each
+      of the four passes alone fits the reference to about 0.1 m, but
+      their fitted scales differ by up to 7% (3.92 to 4.19). So the
+      centre error is the drift between passes, not BA precision, and
+      it moves with the reconstruction path.
+    - **PCG tolerance 0.1 tried and rejected** (`VISLOC_PORT_PCG_TOL`,
+      same pod). The looser solves made the large BAs take 143 LM steps
+      instead of 77, and their PCG iterations went from 10,249 to
+      22,972. Wall time rose from 21:00 to 24:03. The median error was
+      0.522 m, inside the run-to-run spread. The default stays 1e-2.
 
 - **COLMAP-port mapper: fewer allocations and cheaper scoring.** All
   three changes are bit-identical; ETH3D outputs match the previous

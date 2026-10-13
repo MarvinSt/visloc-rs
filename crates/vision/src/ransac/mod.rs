@@ -338,7 +338,8 @@ where
         // short-circuits RANSAC on hard scenes while a misaligned prior
         // gracefully degrades to the standard random search.
         if let Some(prior) = pose_prior {
-            let score = score_pose(camera, prior, correspondences, self.reprojection_threshold);
+            let score =
+                score_hypothesis(camera, prior, correspondences, self.reprojection_threshold);
             if !score.inliers.is_empty() {
                 best_pose = Some(prior.clone());
                 best_inliers = score.inliers;
@@ -379,11 +380,11 @@ where
                 })
                 .collect();
             let (estimator, threshold) = (&self.pose_estimator, self.reprojection_threshold);
-            let hypotheses: Vec<Option<(Pose, ReprojectionScore)>> = samples
+            let hypotheses: Vec<Option<(Pose, HypothesisScore)>> = samples
                 .par_iter()
                 .map(|sample| {
                     let pose = estimator.estimate_pose(sample, camera)?;
-                    let score = score_pose(camera, &pose, correspondences, threshold);
+                    let score = score_hypothesis(camera, &pose, correspondences, threshold);
                     Some((pose, score))
                 })
                 .collect();
@@ -429,7 +430,8 @@ where
                 continue;
             };
 
-            let score = score_pose(camera, &pose, correspondences, self.reprojection_threshold);
+            let score =
+                score_hypothesis(camera, &pose, correspondences, self.reprojection_threshold);
             if score.inliers.len() > best_inliers.len()
                 || (score.inliers.len() == best_inliers.len() && score.mean_error < best_error)
             {
@@ -512,6 +514,44 @@ fn is_refinement_better(candidate: &ReprojectionScore, baseline: &ReprojectionSc
 struct RansacSearchResult {
     best_pose: Option<Pose>,
     best_inliers: Vec<usize>,
+}
+
+/// What the hypothesis search compares: the inliers and their mean error
+/// ([`score_pose`] without the median and maximum, whose sort of every
+/// inlier error per hypothesis was a large part of a registration).
+struct HypothesisScore {
+    inliers: Vec<usize>,
+    mean_error: f64,
+}
+
+fn score_hypothesis(
+    camera: &Camera,
+    pose: &Pose,
+    correspondences: &[Correspondence2D3D],
+    threshold: f64,
+) -> HypothesisScore {
+    let mut inliers = Vec::new();
+    let mut error_sum = 0.0;
+    for (index, correspondence) in correspondences.iter().enumerate() {
+        let Some(projected) = reproject(camera, pose, &correspondence.point3d) else {
+            continue;
+        };
+        let error = (projected - correspondence.point2d).norm();
+        if error <= threshold {
+            inliers.push(index);
+            error_sum += error;
+        }
+    }
+    // The same sum, in the same order, as `reprojection_stats`' mean.
+    let mean_error = if inliers.is_empty() {
+        f64::INFINITY
+    } else {
+        error_sum / inliers.len() as f64
+    };
+    HypothesisScore {
+        inliers,
+        mean_error,
+    }
 }
 
 fn score_pose(

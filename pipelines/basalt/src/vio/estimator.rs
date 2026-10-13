@@ -95,10 +95,10 @@ pub struct EstimatorConfig {
     /// Opt-in (not upstream; `config.vio_earth_rotation_latitude_deg`).
     /// Vertical component of Earth's rotation in rad/s, `w_e sin(latitude)`.
     /// A gyroscope also measures Earth's rotation, which a world fixed to the
-    /// ground does not have.  Yaw is unobservable to the VIO, so the vertical
-    /// part integrates into a heading drift of 0.18 deg/min at 47 deg
-    /// latitude; a gyro bias with a tight random walk cannot absorb it,
-    /// because its projection on the body axes changes as the body turns.
+    /// ground does not have.  Uncorrected, the vertical part is a heading
+    /// rate of 0.18 deg/min at 47 deg latitude.  Its body-frame projection
+    /// depends only on roll and pitch, so the gyro bias estimate absorbs
+    /// most of it while the tilt is steady; this removes the remainder.
     /// Non-zero subtracts `R_wb^T [0, 0, value]` from every gyro sample,
     /// with `R_wb` the newest window state.  The horizontal part is left
     /// alone: it would need the north direction, and gravity keeps the tilt

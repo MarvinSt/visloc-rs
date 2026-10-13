@@ -170,6 +170,16 @@ before/after on training sequences.
    rotation check (IMU vs camera frame) was fixed; with a 5° gate the mapper
    mean rises to 44.95 (+1.29; Medium +4.94, Long +1.03, Short +0.47, no
    track worse).
+10. **Remaining error: slow heading and scale drift.** Status: **diagnosed
+   (2026-10-13), no fix yet.** Fitting each sequence's CP residuals with a
+   yaw drift and a scale drift linear in time brings the median CP error
+   below 1 m on Short, Long and Moving (sequence_5_11: 2.88 → 0.70 m, mostly
+   a −7.6 % scale drift). The VIO's heading drifts at −0.06 to −0.28°/min
+   on all four sequences with pseudo-GT. Compensating Earth's rotation does
+   not remove the drift (sequence_5_11 VIO 32.27 → 33.00), and a VIO
+   outlier filter does not repair the funicular ride on sequence_5_11, which
+   is worth at most +5.2. Both are opt-in, default off
+   ([`lamaria_drift_analysis.md`](lamaria_drift_analysis.md)).
 
 ## 5. Test-set operational pipeline
 
@@ -205,6 +215,8 @@ before/after on training sequences.
   factory IMU rectification and per-category results (lever 8).
 - [`lamaria_online_mapper.md`](lamaria_online_mapper.md) — online mapper on
   the rectified IMU, per-track results and cost (lever 9).
+- [`lamaria_drift_analysis.md`](lamaria_drift_analysis.md) — CP error
+  analysis: funicular ride, heading and scale drift (lever 10).
 - [`vi_slam_benchmarks.md`](vi_slam_benchmarks.md) — EuRoC VI-SLAM results.
 - [`vi_slam_global_consistency_plan.md`](vi_slam_global_consistency_plan.md) —
   global-consistency evidence and staged plan.

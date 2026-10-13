@@ -83,19 +83,33 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **The COLMAP-port BA refines rig calibrations
+  (`ba_refine_sensor_from_rig`).** The non-reference sensors'
+  `sensor_from_rig` poses of the observed rigs become 6-DoF nodes of the
+  reduced system (stepped as `sensor_from_rig ∘ exp(ξ)`), coupled directly
+  to the frames observing through them and, through the points, to
+  everything else, on both solve paths. Local BA refines a rig's sensors
+  only while every registered frame of it is in the window
+  (`incremental_mapper.cc:1036-1065`). Off by default
+  (`--mapper-opt ba_refine_sensor_from_rig=1`). A synthetic 3-sensor rig
+  is recovered from a perturbed calibration on both paths. SmallCity's
+  six cameras are not rigid enough for it: its reference poses put
+  cameras 3 and 5 about 1° (median, up to 15° in turns) off any fixed
+  calibration, ~8 px at its focal length, so a rig model would fight the
+  data there.
+
 - **The COLMAP-port mapper self-calibrates the focal length and principal
   point in its bundle adjustments, and `gsplat_photos` turns it on.**
   COLMAP's `ba_refine_focal_length` / `ba_refine_principal_point`
   (`--mapper-opt ba_refine_focal_length=1` etc., recorded in
-  `mapper_options.txt`) add the camera as a block of the native BA's
-  reduced system, solved by bordering the factored pose system. One focal
-  step moves `fx` and `fy` together (square pixels). Local BA refines a
-  camera only while every registered image of it is in the window, as
-  COLMAP does. Solves large enough for the iterative path (1000+ free
-  frames, e.g. SmallCity's global BAs) carry the camera as one more node
-  of the PCG system, padded to 6x6, with the border's rank-3 coupling in
-  the product; forcing every ETH3D solve onto that path reproduces the
-  direct solves' errors to 0.002 cm. Off by default in the mapper; `gsplat_photos` enables it unless
+  `mapper_options.txt`) add the camera to the native BA as one more
+  6-dim node of the reduced system (`[focal, cx, cy]` plus three fixed
+  slots), so the direct and the iterative (PCG, 1000+ free frames) solves
+  take it like a frame; forcing every ETH3D solve onto the iterative path
+  reproduces the direct solves' errors to 0.002 cm. One focal step moves
+  `fx` and `fy` together (square pixels). Local BA refines a camera only
+  while every registered image of it is in the window, as COLMAP does.
+  Off by default in the mapper; `gsplat_photos` enables it unless
   `--no-refine-intrinsics`. On the 13 ETH3D DSLR scenes the centred
   principal point prior is ~4 px off, and fixed intrinsics had inflated
   the camera-centre errors 2-5x. Replaying the 8192-detection exports

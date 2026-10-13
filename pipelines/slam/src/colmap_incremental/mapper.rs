@@ -1163,8 +1163,8 @@ impl IncrementalMapper {
             // COLMAP fixes the camera (and rig) parameter blocks not fully
             // represented in the local window (`incremental_mapper.cc:
             // 1036-1065`): a camera is refined only while every registered
-            // image of it is in the window. `sensor_from_rig` is never a
-            // parameter block in this port (`ba_refine_sensor_from_rig=0`).
+            // image of it is in the window, a rig's `sensor_from_rig` poses
+            // only while every registered frame of it is.
             if ba_options.refine_focal_length || ba_options.refine_principal_point {
                 let mut in_window: BTreeMap<CameraT, usize> = BTreeMap::new();
                 for &iid in &config_image_ids {
@@ -1176,6 +1176,23 @@ impl IncrementalMapper {
                     .any(|(id, &n)| n < registered.get(id).copied().unwrap_or(0))
                 {
                     config.set_constant_intrinsics();
+                }
+            }
+            if ba_options.refine_sensor_from_rig {
+                let frame_ids: BTreeSet<FrameT> = config_image_ids
+                    .iter()
+                    .map(|&iid| recon.image(iid).frame_id)
+                    .collect();
+                let mut in_window: BTreeMap<RigT, usize> = BTreeMap::new();
+                for &fid in &frame_ids {
+                    *in_window.entry(recon.frame(fid).rig_id()).or_default() += 1;
+                }
+                let mut registered: BTreeMap<RigT, usize> = BTreeMap::new();
+                for &fid in recon.reg_frame_ids() {
+                    *registered.entry(recon.frame(fid).rig_id()).or_default() += 1;
+                }
+                if in_window.iter().any(|(id, &n)| n < registered[id]) {
+                    config.set_constant_sensors_from_rig();
                 }
             }
 

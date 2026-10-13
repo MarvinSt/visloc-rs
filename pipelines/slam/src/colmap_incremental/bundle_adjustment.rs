@@ -33,16 +33,15 @@
 //!    a 2-camera rig), so [`BundleAdjustmentConfig`] tracks `image_ids`
 //!    (residual inclusion, exactly matching COLMAP) plus `constant_frame_ids`
 //!    (pose gauge, one level coarser than COLMAP's per-sensor
-//!    `SetConstantSensorFromRigPose` — irrelevant here since
-//!    `ba_refine_sensor_from_rig=0` means `sensor_from_rig` is *never* a
-//!    Ceres parameter block in this port at all, matching COLMAP's own
-//!    control-configuration behavior exactly, see the reprojection_error.h
-//!    citation above).
-//! 2. **No intrinsics refinement code path at all** — the control config
-//!    (`ba_refine_focal_length/principal_point/extra_params = 0`, plan
-//!    §0.1/§1.2) never varies camera intrinsics, and
-//!    `BaRigObservation`/`rig_residual_jacobians` in `bundle.rs` never
-//!    exposes them as parameters, so there is nothing to wire up.
+//!    `SetConstantSensorFromRigPose`: the config holds every sensor of the
+//!    solve constant or none, [`BundleAdjustmentConfig::set_constant_sensors_from_rig`]).
+//! 2. **Intrinsics and rig refinement on the native backend only, and
+//!    coarser.** `refine_focal_length` / `refine_principal_point` apply only
+//!    when one PINHOLE/SIMPLE_PINHOLE camera is behind every observation
+//!    (one focal step on `fx` and `fy`), `refine_sensor_from_rig` to every
+//!    calibrated non-reference sensor of the observed rigs; the control
+//!    config (`ba_refine_* = 0`, plan §0.1/§1.2) leaves all of them off.
+//!    `refine_extra_params` has no counterpart (pinhole models only).
 //! 3. **Point variable/constant policy now faithfully ports
 //!    `ParameterizePoints` (`bundle_adjustment_ceres.cc:538-555`) plus
 //!    `AddPointToProblem` (`bundle_adjustment_ceres.cc:819-879`).** COLMAP's
@@ -126,7 +125,7 @@ use visloc_core::geometry::{Pose, SE3};
 
 use super::reconstruction::Reconstruction;
 use super::rig_ba_solver::{Obs, PointMajorObs, RigBaInput, RigObs};
-use super::types::{CameraT, FrameT, ImageT, Point2DT, Point3DT, SensorT};
+use super::types::{CameraT, FrameT, ImageT, Point2DT, Point3DT, RigT, SensorT};
 
 /// Port of `BundleAdjustmentGauge` (`bundle_adjustment.h:47-48`). See module
 /// doc deviation 4.
@@ -156,6 +155,7 @@ pub struct BundleAdjustmentConfig {
     variable_point3d_ids: BTreeSet<Point3DT>,
     gauge: Gauge,
     constant_intrinsics: bool,
+    constant_sensors_from_rig: bool,
 }
 
 impl BundleAdjustmentConfig {
@@ -205,6 +205,13 @@ impl BundleAdjustmentConfig {
     /// is in the window (`incremental_mapper.cc:1036-1065`).
     pub const fn set_constant_intrinsics(&mut self) {
         self.constant_intrinsics = true;
+    }
+
+    /// COLMAP's `SetConstantSensorFromRigPose` for every sensor of the solve:
+    /// local BA holds a rig's sensors constant unless every registered frame
+    /// of it is in the window (`incremental_mapper.cc:1036-1065`).
+    pub const fn set_constant_sensors_from_rig(&mut self) {
+        self.constant_sensors_from_rig = true;
     }
 }
 
@@ -318,6 +325,12 @@ pub struct BundleAdjustmentOptions {
     /// default (the port's controls hold intrinsics fixed).
     pub refine_focal_length: bool,
     pub refine_principal_point: bool,
+    /// COLMAP's `refine_sensor_from_rig` (`ba_refine_sensor_from_rig`): the
+    /// non-reference sensors' `sensor_from_rig` poses of the observed rigs
+    /// become parameter blocks unless the config holds them constant
+    /// ([`BundleAdjustmentConfig::set_constant_sensors_from_rig`]); native
+    /// backend only. Off by default.
+    pub refine_sensor_from_rig: bool,
 }
 
 impl BundleAdjustmentOptions {
@@ -346,6 +359,7 @@ impl BundleAdjustmentOptions {
             gradient_tolerance_rel: Some(10.0),
             refine_focal_length: false,
             refine_principal_point: false,
+            refine_sensor_from_rig: false,
         }
     }
     /// `kDefaultCeresGlobalMaxNumIterations` (`incremental_pipeline.cc:48`).
@@ -374,6 +388,7 @@ impl BundleAdjustmentOptions {
             gradient_tolerance_rel: Some(1.0),
             refine_focal_length: false,
             refine_principal_point: false,
+            refine_sensor_from_rig: false,
         }
     }
 }
@@ -747,7 +762,13 @@ fn solve_native(
         frame_idx: u32,
         intrinsics: (f64, f64, f64, f64),
         sensor_from_rig: SE3,
+        /// Index into `extras.sensors` when its `sensor_from_rig` is refined.
+        sensor: Option<u32>,
     }
+    // The refined sensors: each observed rig's calibrated non-reference
+    // sensors, in (rig, sensor) order.
+    let refine_sensors = options.refine_sensor_from_rig && !config.constant_sensors_from_rig;
+    let mut refined_sensors: Vec<(RigT, SensorT)> = Vec::new();
     let mut observed = vec![false; max_obs_image_id as usize + 1];
     for &image_id in &config.image_ids {
         observed[image_id as usize] = true;
@@ -769,12 +790,26 @@ fn solve_native(
         let Some(intrinsics) = recon.camera(image.camera_id).intrinsics() else {
             return false;
         };
+        let rig_id = recon.frame(image.frame_id).rig_id();
+        let sensor_id = SensorT::camera(image.camera_id);
+        let sensor =
+            (refine_sensors && recon.rig(rig_id).has_sensor_from_rig(sensor_id)).then(|| {
+                let key = (rig_id, sensor_id);
+                match refined_sensors.iter().position(|&k| k == key) {
+                    Some(i) => i as u32,
+                    None => {
+                        refined_sensors.push(key);
+                        (refined_sensors.len() - 1) as u32
+                    }
+                }
+            });
         image_info.push(Some(ImageInfo {
             frame_idx: all_frame_ids
                 .binary_search(&image.frame_id)
                 .expect("observed frame") as u32,
             intrinsics,
             sensor_from_rig: sensor_from_rig_for_image(recon, image_id),
+            sensor,
         }));
     }
     // The camera block: one PINHOLE/SIMPLE_PINHOLE camera behind every
@@ -808,6 +843,13 @@ fn solve_native(
             }
         }
     }
+    let mut extras = super::rig_ba_solver::ExtraBlocks {
+        camera: shared_intrinsics.map(|(_, k)| k),
+        sensors: refined_sensors
+            .iter()
+            .map(|&(rig_id, sensor_id)| recon.rig(rig_id).sensor_from_rig(sensor_id))
+            .collect(),
+    };
     let point_xyz: Vec<Point3<f64>> = plans.iter().map(|plan| plan.xyz).collect();
     drop(plans);
     let obs: Vec<Obs> = keys
@@ -816,12 +858,16 @@ fn solve_native(
             let info = image_info[image_id as usize]
                 .as_ref()
                 .expect("observed image");
-            Obs::new(
+            let obs = Obs::new(
                 info.frame_idx,
                 recon.image(image_id).points2d[point2d_idx].xy,
                 info.intrinsics,
                 info.sensor_from_rig.clone(),
-            )
+            );
+            match info.sensor {
+                Some(sensor) => obs.with_sensor(sensor),
+                None => obs,
+            }
         })
         .collect();
     drop(keys);
@@ -849,12 +895,17 @@ fn solve_native(
         options.max_num_iterations,
         options.loss_function,
         options.gradient_tolerance_rel,
-        shared_intrinsics.as_mut().map(|(_, k)| k),
+        &mut extras,
     );
     let Ok(result) = solved else {
         return false;
     };
-    if let Some((camera_id, k)) = shared_intrinsics {
+    for (&(rig_id, sensor_id), pose) in refined_sensors.iter().zip(&extras.sensors) {
+        recon
+            .rig_mut(rig_id)
+            .add_sensor(sensor_id, Some(pose.clone()));
+    }
+    if let (Some((camera_id, _)), Some(k)) = (shared_intrinsics, extras.camera) {
         let camera = recon.camera_mut(camera_id);
         let [fx, fy, cx, cy] = k.params;
         camera.params = match camera.model {

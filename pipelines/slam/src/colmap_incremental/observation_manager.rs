@@ -222,6 +222,59 @@ pub fn image_projection_center(recon: &Reconstruction, image_id: ImageT) -> Poin
     Point3::from(cam_from_world.inverse().translation)
 }
 
+/// An image's pose as the point filters read it, per observation.
+pub(crate) struct ImagePose {
+    pub cam_from_world: SE3,
+    /// [`image_projection_center`].
+    pub centre: Point3<f64>,
+}
+
+/// [`ImagePose`] of every image observing one of `point3d_ids`, by id. The
+/// filters looked each observation's pose up through its frame and rig and
+/// composed it, and the triangulation-angle filter gathered and sorted every
+/// observation's image id to find the images; on a large model that was most
+/// of a local filter's time. Images are collected through a table indexed
+/// by id instead, and each pose is computed once.
+pub(crate) fn track_image_poses(
+    recon: &Reconstruction,
+    point3d_ids: &[Point3DT],
+) -> IdMap<ImagePose> {
+    use rayon::prelude::*;
+    let mut seen: Vec<bool> = Vec::new();
+    let mut image_ids: Vec<ImageT> = Vec::new();
+    for &id in point3d_ids {
+        if !recon.exists_point3d(id) {
+            continue;
+        }
+        for el in &recon.point3d(id).track {
+            let index = el.image_id as usize;
+            if index >= seen.len() {
+                seen.resize(index + 1, false);
+            }
+            if !seen[index] {
+                seen[index] = true;
+                image_ids.push(el.image_id);
+            }
+        }
+    }
+    image_ids
+        .par_iter()
+        .map(|&id| {
+            let cam_from_world = image_cam_from_world(recon, id);
+            let centre = Point3::from(cam_from_world.inverse().translation);
+            (
+                id,
+                ImagePose {
+                    cam_from_world,
+                    centre,
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// `Camera::HasBogusParams` equivalent. The control configuration
 /// (`ba_refine_focal_length=0`, `ba_refine_principal_point=0`,
 /// `ba_refine_extra_params=0`, plan §0.1/milestone bullet "no intrinsic
@@ -602,17 +655,21 @@ impl ObservationManager {
         min_tri_angle_deg: f64,
         point3d_ids: &[Point3DT],
     ) -> usize {
-        let mut n = self.filter_points3d_with_large_reprojection_error(
+        // Filtering moves no image, so one pose table serves both filters.
+        let poses = track_image_poses(recon, point3d_ids);
+        let mut n = self.filter_large_reprojection_error(
             recon,
             graph,
             max_reproj_error,
             point3d_ids,
+            &poses,
         );
-        n += self.filter_points3d_with_small_triangulation_angle(
+        n += self.filter_small_triangulation_angle(
             recon,
             graph,
             min_tri_angle_deg,
             point3d_ids,
+            &poses,
         );
         n
     }
@@ -716,22 +773,21 @@ impl ObservationManager {
         min_tri_angle_deg: f64,
         point3d_ids: &[Point3DT],
     ) -> usize {
+        let poses = track_image_poses(recon, point3d_ids);
+        self.filter_small_triangulation_angle(recon, graph, min_tri_angle_deg, point3d_ids, &poses)
+    }
+
+    fn filter_small_triangulation_angle(
+        &mut self,
+        recon: &mut Reconstruction,
+        graph: &CorrespondenceGraph,
+        min_tri_angle_deg: f64,
+        point3d_ids: &[Point3DT],
+        poses: &IdMap<ImagePose>,
+    ) -> usize {
         use rayon::prelude::*;
         let min_tri_angle_rad = min_tri_angle_deg.to_radians();
-        let mut image_ids: Vec<ImageT> = point3d_ids
-            .iter()
-            .filter(|&&id| recon.exists_point3d(id))
-            .flat_map(|&id| recon.point3d(id).track.iter().map(|el| el.image_id))
-            .collect();
-        image_ids.sort_unstable();
-        image_ids.dedup();
         let recon_ref: &Reconstruction = recon;
-        let proj_centers: IdMap<Point3<f64>> = image_ids
-            .par_iter()
-            .map(|&id| (id, image_projection_center(recon_ref, id)))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .collect();
         let drop: Vec<Option<usize>> = point3d_ids
             .par_iter()
             .map(|&point3d_id| {
@@ -741,9 +797,9 @@ impl ObservationManager {
                 let point = recon_ref.point3d(point3d_id);
                 let track = &point.track;
                 for i1 in 0..track.len() {
-                    let pc1 = proj_centers[&track[i1].image_id];
+                    let pc1 = poses[&track[i1].image_id].centre;
                     for track_el2 in track.iter().take(i1) {
-                        let pc2 = proj_centers[&track_el2.image_id];
+                        let pc2 = poses[&track_el2.image_id].centre;
                         if calculate_triangulation_angle(pc1, pc2, point.xyz) >= min_tri_angle_rad {
                             return None;
                         }
@@ -775,6 +831,18 @@ impl ObservationManager {
         max_error: f64,
         point3d_ids: &[Point3DT],
     ) -> usize {
+        let poses = track_image_poses(recon, point3d_ids);
+        self.filter_large_reprojection_error(recon, graph, max_error, point3d_ids, &poses)
+    }
+
+    fn filter_large_reprojection_error(
+        &mut self,
+        recon: &mut Reconstruction,
+        graph: &CorrespondenceGraph,
+        max_error: f64,
+        point3d_ids: &[Point3DT],
+        poses: &IdMap<ImagePose>,
+    ) -> usize {
         use rayon::prelude::*;
         enum Decision {
             Skip,
@@ -800,10 +868,9 @@ impl ObservationManager {
                     let image = recon_ref.image(el.image_id);
                     let camera = recon_ref.camera(image.camera_id);
                     let xy = image.points2d[el.point2d_idx].xy;
-                    let cam_from_world = image_cam_from_world(recon_ref, el.image_id);
-                    let err =
-                        calculate_squared_reprojection_error(xy, xyz, &cam_from_world, camera)
-                            .sqrt();
+                    let cam_from_world = &poses[&el.image_id].cam_from_world;
+                    let err = calculate_squared_reprojection_error(xy, xyz, cam_from_world, camera)
+                        .sqrt();
                     if err > max_error {
                         to_delete.push(*el);
                     } else {

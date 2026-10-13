@@ -443,29 +443,40 @@ pub fn find_local_bundle(
     recon: &Reconstruction,
 ) -> Vec<ImageT> {
     let image = recon.image(image_id);
-    let mut shared: BTreeMap<ImageT, usize> = BTreeMap::new();
     // The image's 3D points, in its point2D order, and for every other
-    // image the positions (in that order) of the points it also observes.
+    // image its shared-point count and the positions (in that order) of the
+    // points it also observes. Images are found through a table indexed by
+    // id (ids are small and dense): a point's track is walked for every one
+    // of the image's points, which on a city-scale model is tens of
+    // thousands of lookups per call.
     let mut xyzs = Vec::new();
-    let mut points_of: std::collections::HashMap<ImageT, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut slot_of: Vec<u32> = Vec::new();
+    let mut overlapping: Vec<(ImageT, usize, Vec<usize>)> = Vec::new();
     for p in &image.points2d {
         if let Some(pid) = p.point3d_id {
             let point3d = recon.point3d(pid);
             let k = xyzs.len();
             xyzs.push(point3d.xyz);
             for el in &point3d.track {
-                if el.image_id != image_id {
-                    *shared.entry(el.image_id).or_insert(0) += 1;
-                    let list = points_of.entry(el.image_id).or_default();
-                    if list.last() != Some(&k) {
-                        list.push(k);
-                    }
+                if el.image_id == image_id {
+                    continue;
+                }
+                let index = el.image_id as usize;
+                if index >= slot_of.len() {
+                    slot_of.resize(index + 1, u32::MAX);
+                }
+                if slot_of[index] == u32::MAX {
+                    slot_of[index] = overlapping.len() as u32;
+                    overlapping.push((el.image_id, 0, Vec::new()));
+                }
+                let (_, count, points) = &mut overlapping[slot_of[index] as usize];
+                *count += 1;
+                if points.last() != Some(&k) {
+                    points.push(k);
                 }
             }
         }
     }
-    let mut overlapping: Vec<(ImageT, usize)> = shared.into_iter().collect();
     overlapping.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
     let num_eff = ba_local_num_images.saturating_sub(1).min(overlapping.len());
@@ -478,33 +489,35 @@ pub fn find_local_bundle(
     let min_angle_rad = ba_local_min_tri_angle_deg.to_radians();
 
     let mut chosen: Vec<ImageT> = Vec::new();
-    let mut used: std::collections::BTreeSet<ImageT> = std::collections::BTreeSet::new();
-    for &(other_id, _count) in &overlapping {
+    let mut used = vec![false; overlapping.len()];
+    for (i, (other_id, _, points)) in overlapping.iter().enumerate() {
         if chosen.len() >= num_eff {
             break;
         }
-        let other_center = cam_center(other_id);
-        let mut angles: Vec<f64> = points_of[&other_id]
+        if points.is_empty() {
+            continue;
+        }
+        let other_center = cam_center(*other_id);
+        let mut angles: Vec<f64> = points
             .iter()
             .map(|&k| calculate_triangulation_angle(this_center, other_center, xyzs[k]))
             .collect();
-        if angles.is_empty() {
-            continue;
-        }
-        angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p75 = angles[(angles.len() * 3 / 4).min(angles.len() - 1)];
+        // The 75th percentile is the element a full sort would put there.
+        let at = (angles.len() * 3 / 4).min(angles.len() - 1);
+        let (_, &mut p75, _) = angles.select_nth_unstable_by(at, |a, b| a.partial_cmp(b).unwrap());
         if p75 >= min_angle_rad {
-            chosen.push(other_id);
-            used.insert(other_id);
+            chosen.push(*other_id);
+            used[i] = true;
         }
     }
     if chosen.len() < num_eff {
-        for &(other_id, _) in &overlapping {
+        for (i, (other_id, _, _)) in overlapping.iter().enumerate() {
             if chosen.len() >= num_eff {
                 break;
             }
-            if used.insert(other_id) {
-                chosen.push(other_id);
+            if !used[i] {
+                used[i] = true;
+                chosen.push(*other_id);
             }
         }
     }

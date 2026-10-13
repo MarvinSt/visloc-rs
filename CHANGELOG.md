@@ -83,6 +83,25 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **`visloc_web`: run the photo pipeline from a web browser.**
+  `cargo run --release --example visloc_web` serves a page on
+  127.0.0.1:8080. From it you can:
+  - pick a photo folder in a folder browser;
+  - choose SfM only, splats, or splats and a mesh, plus the main
+    `gsplat_photos` options;
+  - start a run, follow a progress bar parsed from the run's output, and
+    see the log without the mapper's per-step diagnostics;
+  - cancel a run;
+  - turn the reconstruction in an in-page 3D viewer (sparse points in
+    their colours, cameras as frustums);
+  - download `scene.ply`, `mesh.ply`, the COLMAP text model and the full
+    log;
+  - open an existing output folder just to view it.
+
+  Each run is a `gsplat_photos` child process, one at a time. The server
+  uses only the standard library, so no new dependencies. Downloads are
+  limited to the run's output folder.
+
 - **The COLMAP-port BA refines rig calibrations
   (`ba_refine_sensor_from_rig`).** The non-reference sensors'
   `sensor_from_rig` poses of the observed rigs become 6-DoF nodes of the

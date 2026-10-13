@@ -226,6 +226,21 @@ cargo run --release -p visloc-gsplat-train --features gpu,euroc --example gsplat
   --images /path/to/my_photos --out /path/to/runs/my-scene
 ```
 
+The same pipeline can also be run from a web browser. A small local server
+(`visloc_web`, standard library only) lets you pick the photo folder, start a
+run, and follow its progress and log. When the run ends you can turn the
+recovered cameras and points in 3D and download `scene.ply`, `mesh.ply` and
+the COLMAP model. It can also open an existing output folder just to view it.
+
+```bash
+cargo build --release -p visloc-gsplat-train --features gpu,euroc --example gsplat_photos
+cargo run --release --example visloc_web -- --port 8080   # then open http://127.0.0.1:8080
+```
+
+The server listens on 127.0.0.1 only. Pass `--host` to serve on another
+address, but anyone who can reach the server can start runs and download run
+outputs.
+
 <p align="center">
   <img src="docs/assets/photos_to_mesh.gif" alt="south-building: each raw input photo next to the trained Gaussian splat and the extracted mesh rendered from the same recovered pose" width="900">
 </p>

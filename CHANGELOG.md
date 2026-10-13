@@ -83,6 +83,38 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **The COLMAP-port mapper self-calibrates the focal length and principal
+  point in its bundle adjustments, and `gsplat_photos` turns it on.**
+  COLMAP's `ba_refine_focal_length` / `ba_refine_principal_point`
+  (`--mapper-opt ba_refine_focal_length=1` etc., recorded in
+  `mapper_options.txt`) add the camera as a block of the native BA's
+  reduced system, solved by bordering the factored pose system. One focal
+  step moves `fx` and `fy` together (square pixels). Local BA refines a
+  camera only while every registered image of it is in the window, as
+  COLMAP does; solves large enough for the iterative (PCG) path keep it
+  fixed. Off by default in the mapper; `gsplat_photos` enables it unless
+  `--no-refine-intrinsics`. On the 13 ETH3D DSLR scenes the centred
+  principal point prior is ~4 px off, and fixed intrinsics had inflated
+  the camera-centre errors 2-5x. Replaying the 8192-detection exports
+  with the refinement on (centre RMSE, cm; COLMAP 4.2 from the same prior
+  with focal and principal point refined):
+
+  | scene | fixed | refined in the mapper | COLMAP refined |
+  |---|---|---|---|
+  | facade | 6.688 | **1.673** | |
+  | courtyard | 4.431 | **1.420** | 1.680 |
+  | electro | 3.506 | **0.523** | |
+  | delivery_area | 2.354 | 0.502 | 0.464 |
+  | kicker | 2.075 | 0.744 | 0.538 |
+  | terrace | 2.049 | **0.380** | 0.550 |
+  | office | 0.997 | **0.565** | 0.800 (20/26) |
+  | relief | 0.855 | 0.429 | 0.281 |
+  | relief_2 | 0.730 | 0.228 | 0.201 |
+  | playground | 0.628 | **0.386** | 123.7 |
+  | terrains | 0.526 | **0.244** | 0.314 |
+  | pipes | 0.699 | **0.326** | 0.392 |
+  | meadow | 5.839 | 5.732 | 5.312 |
+
 - **COLMAP 4's structure-less registration fallback in the COLMAP-port
   mapper.** When no candidate image registers from 2D-3D correspondences,
   the mapper now retries the candidates from 2D-2D correspondences to the

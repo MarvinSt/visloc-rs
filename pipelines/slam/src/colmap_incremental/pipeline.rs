@@ -101,6 +101,35 @@ impl Default for PipelineOptions {
     }
 }
 
+impl PipelineOptions {
+    /// Apply one `key=value` override: COLMAP's `ba_refine_focal_length` /
+    /// `ba_refine_principal_point` (`0`/`1`, on both the local and the
+    /// global BA options), else [`MapperOptions::apply_override`].
+    pub fn apply_override(&mut self, kv: &str) -> Result<(), String> {
+        let flag = |value: &str, key: &str| {
+            value
+                .parse::<f64>()
+                .map(|v| v != 0.0)
+                .map_err(|e| format!("{key}: {e}"))
+        };
+        match kv.split_once('=') {
+            Some((key @ "ba_refine_focal_length", value)) => {
+                let on = flag(value, key)?;
+                self.local_ba.refine_focal_length = on;
+                self.global_ba.refine_focal_length = on;
+                Ok(())
+            }
+            Some((key @ "ba_refine_principal_point", value)) => {
+                let on = flag(value, key)?;
+                self.local_ba.refine_principal_point = on;
+                self.global_ba.refine_principal_point = on;
+                Ok(())
+            }
+            _ => self.mapper.apply_override(kv),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Success,

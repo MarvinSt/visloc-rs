@@ -27,7 +27,9 @@ use visloc_vision::features::FeatureSet;
 use visloc_vision::matching::DescriptorMatch;
 
 use crate::dataset::{Dataset, View};
-use crate::euroc::{apply_sift_override, cpu_matches, run_colmap_port, verify_pair, EurocError};
+use crate::euroc::{
+    apply_sift_override, cpu_matches, read_port_camera, run_colmap_port, verify_pair, EurocError,
+};
 use crate::init::ColoredPoint;
 
 /// Settings for [`build_photo_dataset`].
@@ -739,8 +741,21 @@ pub fn build_photo_dataset(
         }
     }
 
-    // Mapper, then a global BA that also refines the intrinsics.
+    // Mapper, then a global BA that also refines the intrinsics. The mapper
+    // self-calibrates the focal length and principal point in its own
+    // bundle adjustments (COLMAP's `ba_refine_focal_length` /
+    // `ba_refine_principal_point`): on the 13 ETH3D DSLR scenes the
+    // principal point of the centred prior is ~4 px off, which fixed
+    // intrinsics turned into 2-5x larger camera-centre errors.
     let t0 = std::time::Instant::now();
+    let port_overrides: Vec<String> = if cfg.refine_intrinsics {
+        vec![
+            "ba_refine_focal_length=1".into(),
+            "ba_refine_principal_point=1".into(),
+        ]
+    } else {
+        Vec::new()
+    };
     let models = run_colmap_port(
         out_dir,
         &camera,
@@ -748,16 +763,25 @@ pub fn build_photo_dataset(
         height,
         &features,
         &pairwise,
-        &[],
+        &port_overrides,
         log,
     )?;
     let (mut poses, mut tracks, mut reproj) = models.into_iter().next().expect("non-empty");
     let mut cam = camera.clone();
+    if cfg.refine_intrinsics {
+        if let Some(params) = read_port_camera(out_dir) {
+            cam.params[..4].copy_from_slice(&params);
+            log(&format!(
+                "mapper intrinsics: fx {:.1} fy {:.1} cx {:.1} cy {:.1} px",
+                params[0], params[1], params[2], params[3]
+            ));
+        }
+    }
     let mapped = poses.iter().filter(|p| p.is_some()).count();
     if cfg.refine_intrinsics && mapped > cfg.refine_intrinsics_max_images {
         log(&format!(
             "skipping intrinsics refinement: {mapped} images > --refine-intrinsics-max {}; \
-             keeping the prior focal",
+             keeping the mapper's intrinsics",
             cfg.refine_intrinsics_max_images
         ));
     } else if cfg.refine_intrinsics {
@@ -771,7 +795,7 @@ pub fn build_photo_dataset(
         // covisibility pattern instead of a dense (6 * images)^2 system.
         sfm_cfg.ba_config.linear_solver = visloc_slam::LinearSolver::Sparse;
         let r = visloc_slam::incremental_sfm_with_initial_poses(
-            &camera,
+            &cam,
             &features,
             &pairwise,
             &sfm_cfg,

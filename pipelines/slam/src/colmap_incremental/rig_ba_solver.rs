@@ -202,6 +202,43 @@ pub(crate) struct PointMajorObs {
     pub point_obs_range: Vec<(u32, u32)>,
 }
 
+/// Pinhole intrinsics shared by every observation of a solve and refined
+/// with the poses and points: COLMAP's `ba_refine_focal_length` and
+/// `ba_refine_principal_point` (`bundle_adjustment_ceres.cc`, the camera
+/// block with a `SubsetManifold` over the fixed parameters). Deviation: one
+/// focal step moves `fx` and `fy` together (square pixels, as COLMAP's
+/// `SIMPLE_PINHOLE`), where COLMAP's `PINHOLE` refines them independently.
+/// The camera is one more block of the reduced system, solved by bordering
+/// the pose system (see [`solve_step`]); the observations' own intrinsics
+/// are ignored while it is set.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SharedIntrinsics {
+    /// `[fx, fy, cx, cy]`.
+    pub params: [f64; 4],
+    pub refine_focal_length: bool,
+    pub refine_principal_point: bool,
+}
+
+impl SharedIntrinsics {
+    /// Which of the camera block's `[focal, cx, cy]` steps are free.
+    const fn free(&self) -> [bool; 3] {
+        [
+            self.refine_focal_length,
+            self.refine_principal_point,
+            self.refine_principal_point,
+        ]
+    }
+
+    fn stepped(&self, dk: &Vector3<f64>) -> Self {
+        let mut next = *self;
+        next.params[0] += dk[0];
+        next.params[1] += dk[0];
+        next.params[2] += dk[1];
+        next.params[3] += dk[2];
+        next
+    }
+}
+
 struct Problem {
     /// `Some(slot)` for free frames (`slot` indexes the reduced camera
     /// system, `0..n_free_frames`), `None` for fixed frames.
@@ -250,6 +287,8 @@ struct Problem {
     /// than 8 shards each zeroing and filling an `edges_len` buffer; on the
     /// few-hundred-frame Courthouse problems the shards stay faster.
     contributions: Option<ContributionIndex>,
+    /// The shared camera block, when the intrinsics are refined.
+    intrinsics: Option<SharedIntrinsics>,
 }
 
 /// Which points observe each free frame of the reduced camera system, in
@@ -977,6 +1016,7 @@ fn assemble_problem(
         point_pair_edge_idx,
         shard_boundaries,
         contributions,
+        intrinsics: None,
     })
 }
 
@@ -1162,6 +1202,30 @@ struct PointLin {
     /// `−Jᵀr` for the point block, only meaningful if `free`.
     bp: Vector3<f64>,
     free: bool,
+    /// The point's camera-block terms, when the intrinsics are refined.
+    camera: Option<PointCamera>,
+}
+
+/// One point's share of the camera block (`Jcam`: the `2×3` Jacobian of an
+/// observation w.r.t. `[focal, cx, cy]`, zero in fixed columns).
+struct PointCamera {
+    /// `Jposeᵀ Jcam` per free frame, in `PointLin::frames` order.
+    hck: Vec<SMatrix<f64, 6, 3>>,
+    /// `Jcamᵀ Jpoint`, only meaningful if the point is free.
+    hkp: Matrix3<f64>,
+    /// `Jcamᵀ Jcam` over the point's observations.
+    hkk: Matrix3<f64>,
+    /// `−Jcamᵀ r` over the point's observations.
+    bk: Vector3<f64>,
+}
+
+/// The camera block's raw (undamped, pre-elimination) terms, summed over
+/// every point in point order.
+struct CameraLin {
+    /// `Σ Jposeᵀ Jcam` per free frame slot.
+    hck: Vec<SMatrix<f64, 6, 3>>,
+    hkk: Matrix3<f64>,
+    bk: Vector3<f64>,
 }
 
 /// Stage A: evaluate residual + Jacobians for every observation of one point
@@ -1178,6 +1242,7 @@ struct PointLin {
 /// linear scan that grows the list — see [`build_reduced_system_pattern`]'s
 /// doc for why the frame *set* itself is precomputed once per `optimize()`
 /// call rather than rediscovered here.
+#[allow(clippy::too_many_arguments)]
 fn linearize_point(
     obs_slice: &[Obs],
     point_free: bool,
@@ -1185,6 +1250,7 @@ fn linearize_point(
     poses: &[SE3],
     target_frames: &[u32],
     loss: LossFunction,
+    camera: Option<&SharedIntrinsics>,
     frame_blocks: &mut [f64],
 ) -> (f64, PointLin) {
     frame_blocks.fill(0.0);
@@ -1192,21 +1258,39 @@ fn linearize_point(
     let mut hpp = Matrix3::zeros();
     let mut bp = Vector3::zeros();
     let mut hcp: Vec<SMatrix<f64, 6, 3>> = vec![SMatrix::<f64, 6, 3>::zeros(); target_frames.len()];
+    let mut point_camera = camera.map(|_| PointCamera {
+        hck: vec![SMatrix::<f64, 6, 3>::zeros(); target_frames.len()],
+        hkp: Matrix3::zeros(),
+        hkk: Matrix3::zeros(),
+        bk: Vector3::zeros(),
+    });
 
     for o in obs_slice {
         let pose = &poses[o.frame_idx as usize];
-        let Some((mut r, mut j_pose, mut j_point)) = residual_and_jacobians(
-            o.fx,
-            o.fy,
-            o.cx,
-            o.cy,
-            &o.sensor_from_rig,
-            pose,
-            point_xyz,
-            o.xy,
-        ) else {
+        let (fx, fy, cx, cy) = match camera {
+            Some(c) => (c.params[0], c.params[1], c.params[2], c.params[3]),
+            None => (o.fx, o.fy, o.cx, o.cy),
+        };
+        let Some((mut r, mut j_pose, mut j_point)) =
+            residual_and_jacobians(fx, fy, cx, cy, &o.sensor_from_rig, pose, point_xyz, o.xy)
+        else {
             continue;
         };
+        // d(u, v)/d(focal, cx, cy) = [[x/z, 1, 0], [y/z, 0, 1]] from the
+        // raw residual (u = r.x + x_obs = fx * x/z + cx).
+        let mut j_cam = camera.map(|c| {
+            let free = c.free();
+            let pick = |i: usize, v: f64| if free[i] { v } else { 0.0 };
+            let (xn, yn) = ((r.x + o.xy.x - cx) / fx, (r.y + o.xy.y - cy) / fy);
+            SMatrix::<f64, 2, 3>::new(
+                pick(0, xn),
+                pick(1, 1.0),
+                0.0,
+                pick(0, yn),
+                0.0,
+                pick(2, 1.0),
+            )
+        });
         // Robust-loss correction (`residual_block.cc:161-197`'s exact order:
         // evaluate rho at the *raw* squared norm, correct both Jacobian
         // blocks from the raw residual, *then* correct the residual itself)
@@ -1224,6 +1308,9 @@ fn linearize_point(
             let corrector = Corrector::new(s, rho);
             corrector.correct_jacobian(&r, &mut j_pose);
             corrector.correct_jacobian(&r, &mut j_point);
+            if let Some(j_cam) = j_cam.as_mut() {
+                corrector.correct_jacobian(&r, j_cam);
+            }
             corrector.correct_residual(&mut r);
             rho[0]
         };
@@ -1231,6 +1318,13 @@ fn linearize_point(
         if point_free {
             hpp += j_point.transpose() * j_point;
             bp += -(j_point.transpose() * r);
+        }
+        if let (Some(j_cam), Some(pc)) = (&j_cam, point_camera.as_mut()) {
+            pc.hkk += j_cam.transpose() * j_cam;
+            pc.bk += -(j_cam.transpose() * r);
+            if point_free {
+                pc.hkp += j_cam.transpose() * j_point;
+            }
         }
         if let Ok(slot) = target_frames.binary_search(&o.frame_idx) {
             let block = &mut frame_blocks[slot * FRAME_BLOCK..(slot + 1) * FRAME_BLOCK];
@@ -1246,6 +1340,9 @@ fn linearize_point(
             if point_free {
                 hcp[slot] += j_pose.transpose() * j_point;
             }
+            if let (Some(j_cam), Some(pc)) = (&j_cam, point_camera.as_mut()) {
+                pc.hck[slot] += j_pose.transpose() * j_cam;
+            }
         }
     }
 
@@ -1257,6 +1354,7 @@ fn linearize_point(
             hpp,
             bp,
             free: point_free,
+            camera: point_camera,
         },
     )
 }
@@ -1274,7 +1372,13 @@ fn linearize_point(
 fn linearize(
     problem: &Problem,
     loss: LossFunction,
-) -> (f64, Vec<PointLin>, Vec<Matrix6<f64>>, Vec<Vector6<f64>>) {
+) -> (
+    f64,
+    Vec<PointLin>,
+    Vec<Matrix6<f64>>,
+    Vec<Vector6<f64>>,
+    Option<CameraLin>,
+) {
     // Points are linearized in parallel a chunk at a time; each point's
     // per-frame `JᵀJ` / `−Jᵀr` (column-major, [`FRAME_BLOCK`] values) lands
     // in a chunk buffer and is folded into the frame accumulators serially,
@@ -1290,6 +1394,11 @@ fn linearize(
     let mut points_lin = Vec::with_capacity(n_points);
     let mut frame_diag_raw = vec![Matrix6::<f64>::zeros(); problem.n_free_frames];
     let mut frame_bc_raw = vec![Vector6::<f64>::zeros(); problem.n_free_frames];
+    let mut camera_lin = problem.intrinsics.map(|_| CameraLin {
+        hck: vec![SMatrix::<f64, 6, 3>::zeros(); problem.n_free_frames],
+        hkk: Matrix3::zeros(),
+        bk: Vector3::zeros(),
+    });
     let mut blocks: Vec<f64> = Vec::new();
     let mut chunk_start = 0;
     while chunk_start < n_points {
@@ -1324,6 +1433,7 @@ fn linearize(
                     &problem.poses,
                     &problem.point_free_frames[p],
                     loss,
+                    problem.intrinsics.as_ref(),
                     frame_blocks,
                 )
             })
@@ -1336,6 +1446,13 @@ fn linearize(
                 let block = &blocks[(offset + k) * FRAME_BLOCK..(offset + k + 1) * FRAME_BLOCK];
                 frame_diag_raw[slot] += Matrix6::from_column_slice(&block[..36]);
                 frame_bc_raw[slot] += Vector6::from_column_slice(&block[36..]);
+                if let (Some(cl), Some(pc)) = (camera_lin.as_mut(), pl.camera.as_ref()) {
+                    cl.hck[slot] += pc.hck[k];
+                }
+            }
+            if let (Some(cl), Some(pc)) = (camera_lin.as_mut(), pl.camera.as_ref()) {
+                cl.hkk += pc.hkk;
+                cl.bk += pc.bk;
             }
             offset += pl.frames.len();
             costs.push(cost);
@@ -1345,7 +1462,13 @@ fn linearize(
     // A serial sum in point order, as before.
     let full_cost: f64 = costs.iter().copied().sum();
 
-    (full_cost, points_lin, frame_diag_raw, frame_bc_raw)
+    (
+        full_cost,
+        points_lin,
+        frame_diag_raw,
+        frame_bc_raw,
+        camera_lin,
+    )
 }
 
 #[inline]
@@ -1607,6 +1730,48 @@ fn eliminate_by_output(
     (flat_offdiag, diag_delta, bc_delta)
 }
 
+/// The camera block's Schur-complement terms at `mu`: for every free point,
+/// `hck_a -= hcp_a Hpp⁻¹ hkpᵀ` (per free frame `a`), `hkk -= hkp Hpp⁻¹ hkpᵀ`
+/// and `bk -= hkp Hpp⁻¹ bp`, with the same damped `Hpp⁻¹` as
+/// [`eliminate_and_accumulate`]. Points are folded in point order.
+#[allow(clippy::type_complexity)]
+fn eliminate_camera(
+    problem: &Problem,
+    points_lin: &[PointLin],
+    mu: f64,
+) -> (Vec<SMatrix<f64, 6, 3>>, Matrix3<f64>, Vector3<f64>) {
+    let per_point: Vec<Option<(Matrix3<f64>, Vector3<f64>, Vec<SMatrix<f64, 6, 3>>)>> = points_lin
+        .par_iter()
+        .map(|pl| {
+            let pc = pl.camera.as_ref()?;
+            if !pl.free {
+                return None;
+            }
+            let inv = damped_hpp_inverse(&pl.hpp, mu)?;
+            let kp_inv = pc.hkp * inv;
+            Some((
+                kp_inv * pc.hkp.transpose(),
+                kp_inv * pl.bp,
+                pl.hcp.iter().map(|h| h * kp_inv.transpose()).collect(),
+            ))
+        })
+        .collect();
+    let mut hck = vec![SMatrix::<f64, 6, 3>::zeros(); problem.n_free_frames];
+    let (mut hkk, mut bk) = (Matrix3::zeros(), Vector3::zeros());
+    for (pl, terms) in points_lin.iter().zip(per_point) {
+        let Some((kk, b, frames)) = terms else {
+            continue;
+        };
+        hkk -= kk;
+        bk -= b;
+        for (&fidx, term) in pl.frames.iter().zip(frames) {
+            let slot = problem.free_frame_slot[fidx as usize].expect("free") as usize;
+            hck[slot] -= term;
+        }
+    }
+    (hck, hkk, bk)
+}
+
 /// Shard count for [`eliminate_and_accumulate`]: capped so the transient
 /// per-shard `edges_len`-sized buffers (`3 shards worth` — see its `local_*`
 /// locals — of `Matrix6` = 288 bytes each) never exceed roughly 256MB in
@@ -1680,11 +1845,12 @@ fn solve_step(
     edges: &[(u32, u32)],
     frame_diag_raw: &[Matrix6<f64>],
     frame_bc_raw: &[Vector6<f64>],
+    camera_lin: Option<&CameraLin>,
     mu: f64,
     cache: &mut Option<BlockSymbolic>,
     order: Option<&[u32]>,
     timings: &mut PhaseTimings,
-) -> Option<(Vec<Vector6<f64>>, Vec<Vector3<f64>>, f64)> {
+) -> Option<SolvedStep> {
     let n_free = problem.n_free_frames;
     let t = Instant::now();
     let (flat_offdiag, diag_delta, bc_delta) =
@@ -1771,12 +1937,16 @@ fn solve_step(
             }
         }
         timings.linsolve += t.elapsed();
+        // The camera block is never refined on this path (see
+        // `optimize_point_major`).
+        debug_assert!(camera_lin.is_none());
         return Some(back_substitute(
             problem,
             points_lin,
             frame_diag_raw,
             frame_bc_raw,
             dx_frames,
+            None,
             mu,
             timings,
         ));
@@ -1800,16 +1970,47 @@ fn solve_step(
             columns[pb].insert(pa, val.transpose());
         }
     }
-    let mut rhs = DMatrix::<f64>::zeros(n_free * 6, 1);
+    // With the camera block, the system is bordered:
+    //   [A  B] [dx]   [b ]
+    //   [Bᵀ C] [dk] = [bk]
+    // A (the pose system above) is factored once against [b | B], giving
+    // y = A⁻¹b and Z = A⁻¹B; then (C − BᵀZ) dk = bk − Bᵀy and dx = y − Z dk.
+    let camera_terms = camera_lin.map(|cl| {
+        let (hck_delta, hkk_delta, bk_delta) = eliminate_camera(problem, points_lin, mu);
+        let border: Vec<SMatrix<f64, 6, 3>> = cl
+            .hck
+            .iter()
+            .zip(&hck_delta)
+            .map(|(raw, d)| raw + d)
+            .collect();
+        let mut c = cl.hkk + hkk_delta;
+        let d = clamp_diag3(&cl.hkk);
+        for i in 0..3 {
+            c[(i, i)] += mu * d[i];
+        }
+        (border, c, cl.bk + bk_delta)
+    });
+    let n_rhs = if camera_terms.is_some() { 4 } else { 1 };
+    let mut rhs = DMatrix::<f64>::zeros(n_free * 6, n_rhs);
     for a in 0..n_free {
         for i in 0..6 {
             rhs[(pos(a) * 6 + i, 0)] = frame_bc[a][i];
+        }
+    }
+    if let Some((border, _, _)) = &camera_terms {
+        for (a, block) in border.iter().enumerate() {
+            for col in 0..3 {
+                for i in 0..6 {
+                    rhs[(pos(a) * 6 + i, 1 + col)] = block[(i, col)];
+                }
+            }
         }
     }
     timings.assemble += t.elapsed();
 
     let t = Instant::now();
     let solved = if n_free >= iterative_min_free_frames() {
+        debug_assert!(camera_terms.is_none());
         pcg_blocks6(&columns, &rhs, pcg_relative_tolerance())?
     } else {
         solve_spd_blocks6_cached(cache, columns, &rhs).ok()?
@@ -1820,6 +2021,35 @@ fn solve_step(
             dx_frames[a][i] = solved[(pos(a) * 6 + i, 0)];
         }
     }
+    let mut dk = None;
+    if let (Some((border, c, bk)), Some(cl)) = (&camera_terms, camera_lin) {
+        let z_of =
+            |a: usize| SMatrix::<f64, 6, 3>::from_fn(|i, col| solved[(pos(a) * 6 + i, 1 + col)]);
+        let mut schur = *c;
+        let mut g = *bk;
+        for (a, block) in border.iter().enumerate() {
+            schur -= block.transpose() * z_of(a);
+            g -= block.transpose() * dx_frames[a];
+        }
+        // Fixed camera parameters keep a zero step.
+        let free = problem.intrinsics.expect("camera block").free();
+        for i in (0..3).filter(|&i| !free[i]) {
+            for j in 0..3 {
+                schur[(i, j)] = 0.0;
+                schur[(j, i)] = 0.0;
+            }
+            schur[(i, i)] = 1.0;
+            g[i] = 0.0;
+        }
+        let step = schur.try_inverse()? * g;
+        if !step.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        for (a, dx) in dx_frames.iter_mut().enumerate() {
+            *dx -= z_of(a) * step;
+        }
+        dk = Some((cl, step));
+    }
     timings.linsolve += t.elapsed();
     Some(back_substitute(
         problem,
@@ -1827,22 +2057,35 @@ fn solve_step(
         frame_diag_raw,
         frame_bc_raw,
         dx_frames,
+        dk,
         mu,
         timings,
     ))
 }
 
+/// One LM trial step: frame steps (free-slot order), point steps (point
+/// order), the model's predicted decrease and, with the camera block, its
+/// `[focal, cx, cy]` step.
+struct SolvedStep {
+    dx_frames: Vec<Vector6<f64>>,
+    dx_points: Vec<Vector3<f64>>,
+    predicted: f64,
+    dk: Option<Vector3<f64>>,
+}
+
 /// Free-point steps from the camera steps, and the LM model's predicted
 /// cost decrease, for [`solve_step`].
+#[allow(clippy::too_many_arguments)]
 fn back_substitute(
     problem: &Problem,
     points_lin: &[PointLin],
     frame_diag_raw: &[Matrix6<f64>],
     frame_bc_raw: &[Vector6<f64>],
     dx_frames: Vec<Vector6<f64>>,
+    camera: Option<(&CameraLin, Vector3<f64>)>,
     mu: f64,
     timings: &mut PhaseTimings,
-) -> (Vec<Vector6<f64>>, Vec<Vector3<f64>>, f64) {
+) -> SolvedStep {
     let n_free = problem.n_free_frames;
     let t = Instant::now();
     let dx_points: Vec<Vector3<f64>> = points_lin
@@ -1858,6 +2101,9 @@ fn back_substitute(
             for (k, &fidx) in pl.frames.iter().enumerate() {
                 let slot = problem.free_frame_slot[fidx as usize].expect("free") as usize;
                 rhs -= pl.hcp[k].transpose() * dx_frames[slot];
+            }
+            if let (Some((_, dk)), Some(pc)) = (&camera, &pl.camera) {
+                rhs -= pc.hkp.transpose() * dk;
             }
             hpp_inv * rhs
         })
@@ -1879,11 +2125,21 @@ fn back_substitute(
         let damped_dx = Vector3::from_iterator((0..3).map(|i| mu * d[i] * dx[i]));
         predicted += dx.dot(&(pl.bp + damped_dx));
     }
+    if let Some((cl, dk)) = &camera {
+        let d = clamp_diag3(&cl.hkk);
+        let damped_dk = Vector3::from_iterator((0..3).map(|i| mu * d[i] * dk[i]));
+        predicted += dk.dot(&(cl.bk + damped_dk));
+    }
     predicted *= 0.5;
     timings.backsub += t.elapsed();
     timings.trials += 1;
 
-    (dx_frames, dx_points, predicted)
+    SolvedStep {
+        dx_frames,
+        dx_points,
+        predicted,
+        dk: camera.map(|(_, dk)| dk),
+    }
 }
 
 /// Residual-only (no Jacobian) total cost at a candidate `(poses, points)` —
@@ -1894,6 +2150,7 @@ fn evaluate_cost(
     problem: &Problem,
     poses: &[SE3],
     points: &[Point3<f64>],
+    camera: Option<&SharedIntrinsics>,
     loss: LossFunction,
 ) -> f64 {
     let per_point: Vec<f64> = problem
@@ -1911,8 +2168,12 @@ fn evaluate_cost(
                     continue;
                 }
                 let z_inv = point_sensor.z.recip();
-                let dx = o.fx * point_sensor.x * z_inv + o.cx - o.xy.x;
-                let dy = o.fy * point_sensor.y * z_inv + o.cy - o.xy.y;
+                let (fx, fy, cx, cy) = match camera {
+                    Some(c) => (c.params[0], c.params[1], c.params[2], c.params[3]),
+                    None => (o.fx, o.fy, o.cx, o.cy),
+                };
+                let dx = fx * point_sensor.x * z_inv + cx - o.xy.x;
+                let dy = fy * point_sensor.y * z_inv + cy - o.xy.y;
                 let s = dx * dx + dy * dy;
                 // Residual-only re-check (no Jacobian) — `rho[0]` alone
                 // reproduces the robustified cost, matching `linearize_point`'s
@@ -1960,8 +2221,12 @@ fn apply_step(
     (poses, points)
 }
 
-fn gradient_inf_norm(points_lin: &[PointLin], frame_bc_raw: &[Vector6<f64>]) -> f64 {
-    let mut m: f64 = 0.0;
+fn gradient_inf_norm(
+    points_lin: &[PointLin],
+    frame_bc_raw: &[Vector6<f64>],
+    camera_lin: Option<&CameraLin>,
+) -> f64 {
+    let mut m: f64 = camera_lin.map_or(0.0, |cl| cl.bk.amax());
     for v in frame_bc_raw {
         for i in 0..6 {
             m = m.max(v[i].abs());
@@ -2085,10 +2350,10 @@ pub(crate) fn optimize_rig_input(
     gradient_tolerance_rel: Option<f64>,
 ) -> Result<BaResult, BaError> {
     let t_build = Instant::now();
-    let problem = build_problem(input, rig_obs)?;
+    let mut problem = build_problem(input, rig_obs)?;
     optimize_problem(
         input,
-        problem,
+        &mut problem,
         t_build,
         std::mem::size_of_val(rig_obs),
         max_num_iterations,
@@ -2100,31 +2365,52 @@ pub(crate) fn optimize_rig_input(
 /// [`optimize_rig_input`] with the observations already grouped by point
 /// ([`PointMajorObs`]), so the caller's own per-point pass replaces the
 /// image-ordered [`RigObs`] list and its regrouping.
+///
+/// `intrinsics`, when given, is the one camera of every observation, refined
+/// in place (see [`SharedIntrinsics`]). Solves on the iterative (PCG) path,
+/// from [`ITERATIVE_MIN_FREE_FRAMES`] free frames, keep it fixed: the
+/// bordered solve needs the factored pose system.
 pub(crate) fn optimize_point_major(
     input: &mut RigBaInput,
     point_major: PointMajorObs,
     max_num_iterations: usize,
     loss: LossFunction,
     gradient_tolerance_rel: Option<f64>,
+    intrinsics: Option<&mut SharedIntrinsics>,
 ) -> Result<BaResult, BaError> {
     let t_build = Instant::now();
-    let problem = assemble_problem(input, point_major, 0.0)?;
-    optimize_problem(
+    let mut problem = assemble_problem(input, point_major, 0.0)?;
+    let intrinsics = intrinsics.filter(|_| {
+        let direct = problem.n_free_frames < iterative_min_free_frames();
+        if !direct {
+            eprintln!(
+                "BA_INTRINSICS fixed: {} free frames take the iterative solve",
+                problem.n_free_frames
+            );
+        }
+        direct
+    });
+    problem.intrinsics = intrinsics.as_deref().copied();
+    let result = optimize_problem(
         input,
-        problem,
+        &mut problem,
         t_build,
         0,
         max_num_iterations,
         loss,
         gradient_tolerance_rel,
-    )
+    );
+    if let (Some(out), Some(refined)) = (intrinsics, problem.intrinsics) {
+        *out = refined;
+    }
+    result
 }
 
 /// The LM loop of [`optimize_rig_input`] on a built `problem`;
 /// `rig_obs_bytes` only feeds the `BA_MEMORY` line.
 fn optimize_problem(
     input: &mut RigBaInput,
-    mut problem: Problem,
+    problem: &mut Problem,
     t_build: Instant,
     rig_obs_bytes: usize,
     max_num_iterations: usize,
@@ -2135,18 +2421,18 @@ fn optimize_problem(
     let mut timings = PhaseTimings::default();
     let mut apply_ms = 0.0;
 
-    let (mut half_cost, mut points_lin, mut frame_diag_raw, mut frame_bc_raw) = {
+    let (mut half_cost, mut points_lin, mut frame_diag_raw, mut frame_bc_raw, mut camera_lin) = {
         let t = Instant::now();
-        let (full, pl, fd, fb) = linearize(&problem, loss);
+        let (full, pl, fd, fb, cl) = linearize(problem, loss);
         timings.linearize += t.elapsed();
         timings.linearize_calls += 1;
-        (0.5 * full, pl, fd, fb)
+        (0.5 * full, pl, fd, fb, cl)
     };
     let initial_cost = 2.0 * half_cost;
     if problem.n_free_frames >= iterative_min_free_frames()
         || std::env::var_os("VISLOC_BA_MEMORY").is_some()
     {
-        log_memory(&problem, rig_obs_bytes, &points_lin);
+        log_memory(problem, rig_obs_bytes, &points_lin);
     }
 
     let mut radius = INITIAL_RADIUS;
@@ -2181,7 +2467,7 @@ fn optimize_problem(
     let mut consecutive_invalid_steps = 0usize;
 
     for it in 0..max_num_iterations {
-        let grad_norm = gradient_inf_norm(&points_lin, &frame_bc_raw);
+        let grad_norm = gradient_inf_norm(&points_lin, &frame_bc_raw, camera_lin.as_ref());
         match gradient_tolerance_rel {
             // Legacy absolute criterion (unchanged).
             None => {
@@ -2208,17 +2494,24 @@ fn optimize_problem(
             },
         }
         let mu = 1.0 / radius;
-        let Some((dx_frames, dx_points, predicted)) = solve_step(
-            &problem,
+        let Some(SolvedStep {
+            dx_frames,
+            dx_points,
+            predicted,
+            dk,
+        }) = solve_step(
+            problem,
             &points_lin,
             &problem.edges,
             &frame_diag_raw,
             &frame_bc_raw,
+            camera_lin.as_ref(),
             mu,
             &mut cache,
             order.as_deref(),
             &mut timings,
-        ) else {
+        )
+        else {
             // An invalid step (Ceres `StepIsInvalid`): rejected like a step
             // that did not lower the cost.
             consecutive_invalid_steps += 1;
@@ -2244,10 +2537,20 @@ fn optimize_problem(
         };
         consecutive_invalid_steps = 0;
         let t_apply = Instant::now();
-        let (trial_poses, trial_points) = apply_step(&problem, &dx_frames, &dx_points);
+        let (trial_poses, trial_points) = apply_step(problem, &dx_frames, &dx_points);
+        let trial_camera = problem
+            .intrinsics
+            .map(|c| c.stepped(&dk.unwrap_or_else(Vector3::zeros)));
         apply_ms += t_apply.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();
-        let trial_half_cost = 0.5 * evaluate_cost(&problem, &trial_poses, &trial_points, loss);
+        let trial_half_cost = 0.5
+            * evaluate_cost(
+                problem,
+                &trial_poses,
+                &trial_points,
+                trial_camera.as_ref(),
+                loss,
+            );
         timings.evaluate_cost += t.elapsed();
         let actual = half_cost - trial_half_cost;
         let rho = if predicted > 0.0 && predicted.is_finite() {
@@ -2285,16 +2588,18 @@ fn optimize_problem(
             let small_decrease = actual < function_tolerance() * half_cost;
             problem.poses = trial_poses;
             problem.points = trial_points;
+            problem.intrinsics = trial_camera;
             radius /= (1.0 / 3.0_f64).max(1.0 - (2.0 * rho - 1.0).powi(3));
             decrease_factor = 2.0;
             let t = Instant::now();
-            let (full, pl, fd, fb) = linearize(&problem, loss);
+            let (full, pl, fd, fb, cl) = linearize(problem, loss);
             timings.linearize += t.elapsed();
             timings.linearize_calls += 1;
             half_cost = 0.5 * full;
             points_lin = pl;
             frame_diag_raw = fd;
             frame_bc_raw = fb;
+            camera_lin = cl;
             if small_decrease {
                 converged = true;
                 break;
@@ -3138,6 +3443,139 @@ mod tests {
             "expected Trivial (no outlier down-weighting) to be pulled off further than \
              SoftL1: soft={soft_err} trivial={trivial_err}"
         );
+    }
+
+    /// A 12-frame scene seen through `truth`, with frames 0 and 1 fixed (the
+    /// gauge, scale included): observations, the true poses and points, and
+    /// a perturbed start.
+    fn intrinsics_scene(truth: [f64; 4]) -> (RigBaInput, PointMajorObs, Vec<Point3<f64>>) {
+        let [fx, fy, cx, cy] = truth;
+        let poses: Vec<SE3> = (0..12)
+            .map(|i| {
+                let t = i as f64 / 11.0 - 0.5;
+                SE3::new(
+                    UnitQuaternion::from_euler_angles(0.08 * t, -0.25 * t, 0.05 * t),
+                    Vector3::new(-1.5 * t, 0.2 * t * t, 0.4 * t),
+                )
+            })
+            .collect();
+        let points: Vec<Point3<f64>> = (0..300)
+            .map(|p| {
+                let (a, b, c) = (p % 10, (p / 10) % 10, p / 100);
+                Point3::new(
+                    a as f64 * 0.4 - 1.8,
+                    b as f64 * 0.3 - 1.4,
+                    4.0 + c as f64 * 1.5 + 0.1 * a as f64,
+                )
+            })
+            .collect();
+        let mut obs = Vec::new();
+        let mut ranges = Vec::new();
+        for point in &points {
+            let start = obs.len() as u32;
+            for (f, pose) in poses.iter().enumerate() {
+                let x = pose.transform_point(point);
+                let xy = Point2::new(fx * x.x / x.z + cx, fy * x.y / x.z + cy);
+                // Wrong intrinsics on the observations: the camera block
+                // must not read them.
+                obs.push(Obs::new(
+                    f as u32,
+                    xy,
+                    (1.0, 1.0, 0.0, 0.0),
+                    SE3::identity(),
+                ));
+            }
+            ranges.push((start, obs.len() as u32));
+        }
+        let start_poses = poses
+            .iter()
+            .enumerate()
+            .map(|(i, pose)| {
+                if i < 2 {
+                    pose.clone()
+                } else {
+                    let d = Vector6::new(0.01, -0.01, 0.02, 0.002, -0.001, 0.0015);
+                    pose.compose(&SE3::exp(&(d * (i as f64 / 12.0))))
+                }
+            })
+            .collect();
+        let input = RigBaInput {
+            frame_ids: (0..12).collect(),
+            frame_fixed: (0..12).map(|i| i < 2).collect(),
+            poses: start_poses,
+            point_ids: (0..points.len() as u64).collect(),
+            point_fixed: vec![false; points.len()],
+            points: points
+                .iter()
+                .map(|p| p + Vector3::new(0.02, -0.01, 0.03))
+                .collect(),
+        };
+        (
+            input,
+            PointMajorObs {
+                obs,
+                point_obs_range: ranges,
+            },
+            points,
+        )
+    }
+
+    #[test]
+    fn camera_block_recovers_focal_and_principal_point() {
+        let truth = [500.0, 500.0, 322.0, 238.0];
+        let (mut input, point_major, points) = intrinsics_scene(truth);
+        let mut camera = SharedIntrinsics {
+            params: [510.0, 510.0, 315.0, 245.0],
+            refine_focal_length: true,
+            refine_principal_point: true,
+        };
+        let result = optimize_point_major(
+            &mut input,
+            point_major,
+            100,
+            LossFunction::Trivial,
+            None,
+            Some(&mut camera),
+        )
+        .expect("solve");
+        for (got, want) in camera.params.iter().zip(truth) {
+            assert!(
+                (got - want).abs() < 1e-4,
+                "{:?} vs {truth:?}",
+                camera.params
+            );
+        }
+        assert!(result.final_cost < 1e-12, "cost {}", result.final_cost);
+        for (got, want) in input.points.iter().zip(&points) {
+            assert!((got - want).norm() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn camera_block_keeps_fixed_parameters() {
+        let truth = [500.0, 500.0, 322.0, 238.0];
+        let (mut input, point_major, _) = intrinsics_scene(truth);
+        let mut camera = SharedIntrinsics {
+            params: [510.0, 510.0, 322.0, 238.0],
+            refine_focal_length: true,
+            refine_principal_point: false,
+        };
+        optimize_point_major(
+            &mut input,
+            point_major,
+            100,
+            LossFunction::Trivial,
+            None,
+            Some(&mut camera),
+        )
+        .expect("solve");
+        assert_eq!(camera.params[2..], [322.0, 238.0]);
+        assert!(
+            (camera.params[0] - 500.0).abs() < 1e-4,
+            "{:?}",
+            camera.params
+        );
+        assert_eq!(camera.params[0], camera.params[1]);
     }
 }
 

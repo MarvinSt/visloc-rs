@@ -255,6 +255,22 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **COLMAP-port mapper: fewer allocations and cheaper scoring.** All
+  three changes are bit-identical; ETH3D outputs match the previous
+  version on all 13 scenes.
+  - A linearization keeps every point's `Jpose^T Jpoint` blocks in one
+    array instead of one vector per point (hundreds of thousands of
+    allocations per global BA), and the LM loop reuses the previous
+    array. One linearization of a 3M-observation problem went from
+    190 ms to 132 ms; the `large_global_ba` solve from about 8 s to
+    6.5 s.
+  - PnP RANSAC scores each hypothesis by inlier count and mean error
+    only. It used to sort every inlier error per hypothesis for a median
+    and maximum that only the final pose reports.
+  - Track completion and merging look up their claimed and visited sets
+    with the crate's FxHash-style hasher instead of SipHash, about 15%
+    faster.
+
 - **Less per-image overhead in the COLMAP-port mapper on large models.**
   The SmallCity replay also spent 435 s in local refinement outside the
   solver core: point filtering 107 s, choosing the local window 63 s,

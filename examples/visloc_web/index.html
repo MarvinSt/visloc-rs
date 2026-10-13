@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>visloc web</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #5d6676;
+  --line: #dde1e7; --accent: #2f6fde; --accent-ink: #ffffff;
+  --ok: #1f8a4c; --bad: #c43b3b; --warn: #b7791f;
+  --code-bg: #f0f2f5; --viewer-bg: #10141b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1a1f27; --ink: #e5e9f0; --muted: #98a2b3;
+    --line: #2c333e; --accent: #5b8ff0; --accent-ink: #0b1020;
+    --ok: #4cc27f; --bad: #f07070; --warn: #e3b04b;
+    --code-bg: #141920; --viewer-bg: #0b0e13;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex; align-items: baseline; gap: 4px 12px; flex-wrap: wrap;
+  padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+header h1 { font-size: 17px; margin: 0; letter-spacing: .2px; }
+header .sub { color: var(--muted); font-size: 13px; }
+main {
+  display: grid; grid-template-columns: minmax(300px, 380px) 1fr; gap: 16px;
+  padding: 16px 20px; max-width: 1500px; margin: 0 auto;
+}
+@media (max-width: 860px) { main { grid-template-columns: 1fr; padding: 12px 16px; } }
+section.card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 14px 16px; margin-bottom: 16px; min-width: 0;
+}
+h2 { font-size: 14px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+label { display: block; font-weight: 600; margin: 10px 0 4px; }
+.hint { color: var(--muted); font-size: 12px; font-weight: 400; }
+input:disabled { opacity: .5; }
+input[type=text], input[type=number] {
+  width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--ink); font: inherit;
+}
+.row { display: flex; gap: 8px; align-items: center; }
+.row > input[type=text] { flex: 1; min-width: 0; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+.modes { display: grid; gap: 6px; margin-top: 4px; }
+.modes label, .checks label { font-weight: 400; margin: 0; display: flex; gap: 8px; align-items: center; }
+.checks { display: grid; gap: 6px; margin-top: 10px; }
+button {
+  font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  padding: 7px 12px; border-radius: 6px; cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+button.danger { color: var(--bad); }
+button:disabled { opacity: .5; cursor: default; }
+details summary { cursor: pointer; color: var(--muted); margin-top: 12px; }
+.actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+.msg { margin-top: 10px; font-size: 13px; }
+.msg.err { color: var(--bad); }
+.runs { list-style: none; margin: 0; padding: 0; }
+.runs li {
+  padding: 8px 10px; border-radius: 6px; cursor: pointer; display: flex;
+  justify-content: space-between; gap: 8px; border: 1px solid transparent;
+}
+.runs li:hover { background: var(--bg); }
+.runs li.sel { border-color: var(--accent); }
+.runs .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { font-size: 12px; padding: 1px 8px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap; }
+.s-running { color: var(--accent); } .s-done { color: var(--ok); }
+.s-failed { color: var(--bad); } .s-cancelled { color: var(--warn); }
+.empty { color: var(--muted); font-size: 13px; }
+.head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+.head h3 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.meta { color: var(--muted); font-size: 12px; margin-top: 4px; overflow-wrap: anywhere; }
+.bar { height: 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 99px; overflow: hidden; margin: 12px 0 6px; }
+.bar > div { height: 100%; background: var(--accent); width: 0; transition: width .4s; }
+.stats { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+.stats b { color: var(--ink); font-weight: 600; }
+.viewer-wrap { position: relative; margin-top: 14px; }
+canvas#view {
+  width: 100%; height: 460px; display: block; border-radius: 8px; background: var(--viewer-bg);
+  touch-action: none; cursor: grab;
+}
+@media (max-width: 860px) { canvas#view { height: 320px; } }
+.viewer-tools { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 8px; font-size: 13px; color: var(--muted); }
+.viewer-tools label { font-weight: 400; margin: 0; display: flex; gap: 6px; align-items: center; }
+.overlay { position: absolute; left: 12px; top: 10px; color: #c8d0dc; font-size: 12px; pointer-events: none; }
+pre#log {
+  background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+  height: 260px; overflow: auto; margin: 10px 0 0; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.files { list-style: none; padding: 0; margin: 8px 0 0; }
+.files li { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid var(--line); }
+.files a { color: var(--accent); text-decoration: none; overflow-wrap: anywhere; }
+.files span { color: var(--muted); font-size: 12px; white-space: nowrap; }
+dialog {
+  border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--ink);
+  width: min(560px, calc(100vw - 32px)); padding: 16px;
+}
+dialog::backdrop { background: rgba(0,0,0,.45); }
+.crumb { font: 12px ui-monospace, monospace; color: var(--muted); overflow-wrap: anywhere; margin-bottom: 8px; }
+.dirs { list-style: none; padding: 0; margin: 0; max-height: 50vh; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+.dirs li { padding: 6px 10px; cursor: pointer; border-bottom: 1px solid var(--line); }
+.dirs li:last-child { border-bottom: 0; }
+.dirs li:hover { background: var(--bg); }
+.note { font-size: 13px; color: var(--muted); margin-top: 8px; }
+code { font-family: ui-monospace, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>visloc web</h1>
+  <span class="sub">photos → structure from motion → 3D Gaussian splats</span>
+</header>
+<main>
+  <div>
+    <section class="card">
+      <h2>New run</h2>
+      <label for="images">Photo folder</label>
+      <div class="row">
+        <input id="images" type="text" placeholder="/path/to/photos" autocomplete="off">
+        <button type="button" data-browse="images">Browse…</button>
+      </div>
+      <label for="out">Output folder <span class="hint">(empty: next to the photos)</span></label>
+      <input id="out" type="text" placeholder="/path/to/output" autocomplete="off">
+      <label>What to build</label>
+      <div class="modes">
+        <label><input type="radio" name="mode" value="sfm"> Cameras and sparse points (SfM only)</label>
+        <label><input type="radio" name="mode" value="splat" checked> + trained 3D Gaussian splats</label>
+        <label><input type="radio" name="mode" value="mesh"> + splats and a mesh</label>
+      </div>
+      <div class="grid2">
+        <div>
+          <label for="steps">Training steps</label>
+          <input id="steps" type="number" min="100" step="100" value="30000">
+        </div>
+        <div>
+          <label for="max_size">Max image size <span class="hint">px</span></label>
+          <input id="max_size" type="number" min="256" step="32" value="1600">
+        </div>
+      </div>
+      <label for="focal">Focal length <span class="hint">px, empty: EXIF or a prior</span></label>
+      <input id="focal" type="number" min="1" step="any" placeholder="auto">
+      <div class="checks">
+        <label><input id="refine" type="checkbox" checked> Self-calibrate focal length and principal point</label>
+        <label><input id="appearance" type="checkbox"> Per-photo colour correction (varying exposure)</label>
+      </div>
+      <details>
+        <summary>Advanced</summary>
+        <label for="extra">Extra <code>gsplat_photos</code> flags</label>
+        <input id="extra" type="text" placeholder="--exhaustive-max 300 --window 20 --retrieval 30" autocomplete="off">
+      </details>
+      <div class="actions">
+        <button id="start" class="primary" type="button">Start run</button>
+        <button type="button" id="open-result">Open existing result…</button>
+      </div>
+      <div id="form-msg" class="msg"></div>
+      <div id="binary-note" class="note" hidden></div>
+    </section>
+    <section class="card">
+      <h2>Runs</h2>
+      <ul id="runs" class="runs"></ul>
+      <div id="no-runs" class="empty">No runs yet.</div>
+    </section>
+  </div>
+  <div>
+    <section class="card" id="detail" hidden>
+      <div class="head">
+        <div style="min-width:0">
+          <h3 id="d-title"></h3>
+          <div class="meta" id="d-out"></div>
+        </div>
+        <div class="row">
+          <span id="d-badge" class="badge"></span>
+          <button id="cancel" class="danger" type="button" hidden>Cancel</button>
+        </div>
+      </div>
+      <div class="bar"><div id="d-bar"></div></div>
+      <div class="stats">
+        <span id="d-stage"></span>
+        <span>Registered <b id="d-reg">–</b></span>
+        <span id="d-step-wrap">Step <b id="d-step">–</b></span>
+        <span>Elapsed <b id="d-elapsed">–</b></span>
+      </div>
+      <div class="viewer-wrap" id="viewer-wrap" hidden>
+        <canvas id="view"></canvas>
+        <div class="overlay" id="v-info"></div>
+        <div class="viewer-tools">
+          <label><input type="checkbox" id="v-points" checked> Points</label>
+          <label><input type="checkbox" id="v-cams" checked> Cameras</label>
+          <label>Point size <input type="range" id="v-size" min="1" max="4" value="2"></label>
+          <button type="button" id="v-reset">Reset view</button>
+          <span>drag: rotate · shift/right-drag: pan · wheel: zoom</span>
+        </div>
+      </div>
+      <h2 style="margin-top:16px">Log</h2>
+      <pre id="log"></pre>
+      <h2 style="margin-top:16px">Files</h2>
+      <ul id="files" class="files"></ul>
+      <div id="no-files" class="empty">Nothing yet.</div>
+    </section>
+    <section class="card" id="welcome">
+      <h2>How it works</h2>
+      <p>Pick a folder of photos of one scene and press <b>Start run</b>. The photos are matched, the
+      cameras and a sparse point cloud are reconstructed with the COLMAP-port mapper, and
+      (optionally) 3D Gaussian splats are trained on the GPU. Progress, the log and the
+      reconstruction appear on the right; the outputs (<code>scene.ply</code>, <code>mesh.ply</code>,
+      COLMAP text model) can be downloaded when the run ends.</p>
+      <p class="note">Runs one at a time. Everything stays on this machine.</p>
+    </section>
+  </div>
+</main>
+
+<dialog id="browser">
+  <h2 id="b-title">Choose a folder</h2>
+  <div class="crumb" id="b-path"></div>
+  <ul class="dirs" id="b-dirs"></ul>
+  <div class="note" id="b-info"></div>
+  <div class="actions">
+    <button type="button" id="b-up">Up</button>
+    <button type="button" class="primary" id="b-use">Use this folder</button>
+    <button type="button" id="b-cancel">Cancel</button>
+  </div>
+</dialog>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let state = { jobs: [] };
+let selected = null;          // selected run id
+let logNext = 0;              // next log line to fetch for the selected run
+let viewerFor = null;         // run id whose model the viewer shows
+let lastStatus = {};
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || res.statusText);
+  return body;
+}
+
+function fmtTime(s) {
+  s = Math.round(s || 0);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${r}s` : `${r}s`;
+}
+function fmtBytes(b) {
+  const u = ["B", "KB", "MB", "GB"]; let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return `${b.toFixed(i ? 1 : 0)} ${u[i]}`;
+}
+function setMsg(text, err) { const m = $("form-msg"); m.textContent = text || ""; m.className = "msg" + (err ? " err" : ""); }
+
+// ---- Runs ---------------------------------------------------------------
+async function refreshState() {
+  try { state = await api("/api/state"); } catch (e) { return; }
+  $("start").disabled = state.busy;
+  const note = $("binary-note");
+  note.hidden = state.photos_binary_found;
+  note.textContent = state.photos_binary_found ? "" :
+    `gsplat_photos was not found at ${state.photos_binary}. Build it with "cargo build --release -p visloc-gsplat-train --features gpu,euroc --example gsplat_photos" or start the server with --bin-dir.`;
+  const ul = $("runs");
+  ul.innerHTML = "";
+  $("no-runs").hidden = state.jobs.length > 0;
+  for (const j of state.jobs) {
+    const li = document.createElement("li");
+    if (j.id === selected) li.className = "sel";
+    const t = document.createElement("span"); t.className = "t"; t.textContent = `#${j.id} ${j.title}`;
+    const b = document.createElement("span"); b.className = `badge s-${j.status}`;
+    b.textContent = j.status === "running" ? `${Math.round(j.fraction * 100)}%` : j.status;
+    li.append(t, b);
+    li.onclick = () => select(j.id);
+    ul.append(li);
+  }
+  if (selected === null && state.jobs.length) select(state.jobs[0].id);
+}
+
+function select(id) {
+  if (selected !== id) { selected = id; logNext = 0; $("log").textContent = ""; viewerFor = null; $("viewer-wrap").hidden = true; }
+  $("detail").hidden = false; $("welcome").hidden = true;
+  refreshState(); refreshJob();
+}
+
+async function refreshJob() {
+  if (selected === null) return;
+  let j;
+  try { j = await api(`/api/jobs/${selected}?from=${logNext}`); } catch (e) { return; }
+  if (j.id !== selected) return;
+  $("d-title").textContent = `#${j.id} ${j.title}`;
+  $("d-out").textContent = j.out;
+  const badge = $("d-badge"); badge.className = `badge s-${j.status}`; badge.textContent = j.status;
+  $("cancel").hidden = j.status !== "running";
+  $("d-bar").style.width = `${Math.round(j.fraction * 100)}%`;
+  $("d-stage").textContent = j.stage;
+  $("d-reg").textContent = j.images ? `${j.registered} / ${j.images}` : (j.registered || "–");
+  $("d-step-wrap").hidden = !j.steps;
+  $("d-step").textContent = j.steps ? `${j.step} / ${j.steps}` : "–";
+  $("d-elapsed").textContent = fmtTime(j.elapsed);
+  if (j.lines.length) {
+    const log = $("log");
+    const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+    log.textContent += j.lines.join("\n") + "\n";
+    const keep = 200000;
+    if (log.textContent.length > keep) log.textContent = log.textContent.slice(-keep);
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+  logNext = j.next;
+  const changed = lastStatus[j.id] !== j.status;
+  lastStatus[j.id] = j.status;
+  if (j.has_model && (viewerFor !== j.id || changed)) loadModel(j.id);
+  if (changed || j.status === "running") refreshFiles(j.id);
+}
+
+async function refreshFiles(id) {
+  let r; try { r = await api(`/api/jobs/${id}/files`); } catch (e) { return; }
+  const ul = $("files"); ul.innerHTML = "";
+  $("no-files").hidden = r.files.length > 0;
+  for (const f of r.files) {
+    const li = document.createElement("li");
+    const a = document.createElement("a");
+    a.href = `/api/jobs/${id}/download?path=${encodeURIComponent(f.path)}`;
+    a.textContent = f.path;
+    const s = document.createElement("span"); s.textContent = fmtBytes(f.bytes);
+    li.append(a, s); ul.append(li);
+  }
+}
+
+$("start").onclick = async () => {
+  const num = (id) => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
+  const body = {
+    images: $("images").value, out: $("out").value,
+    mode: document.querySelector("input[name=mode]:checked").value,
+    steps: num("steps"), max_size: num("max_size"), focal: num("focal"),
+    refine_intrinsics: $("refine").checked, appearance: $("appearance").checked,
+    extra: $("extra").value,
+  };
+  setMsg("Starting…");
+  try {
+    const r = await api("/api/jobs", { method: "POST", body: JSON.stringify(body) });
+    setMsg(""); select(r.id);
+  } catch (e) { setMsg(e.message, true); }
+};
+
+$("cancel").onclick = async () => {
+  if (!confirm("Cancel this run?")) return;
+  try { await api(`/api/jobs/${selected}/cancel`, { method: "POST" }); } catch (e) { alert(e.message); }
+  refreshJob(); refreshState();
+};
+
+for (const m of document.querySelectorAll("input[name=mode]")) {
+  m.onchange = () => { $("steps").disabled = m.value === "sfm" && m.checked; };
+}
+
+// ---- Folder browser -----------------------------------------------------
+let browsePath = null, browseTarget = null;
+async function browse(path) {
+  let r;
+  try { r = await api(`/api/browse?path=${encodeURIComponent(path || "")}`); } catch (e) { $("b-info").textContent = e.message; return; }
+  browsePath = r.path;
+  $("b-path").textContent = r.path;
+  const ul = $("b-dirs"); ul.innerHTML = "";
+  for (const d of r.dirs) {
+    const li = document.createElement("li"); li.textContent = "📁 " + d;
+    li.onclick = () => browse(r.path.replace(/[\\/]$/, "") + "/" + d);
+    ul.append(li);
+  }
+  if (!r.dirs.length) { const li = document.createElement("li"); li.textContent = "(no sub-folders)"; li.style.cursor = "default"; ul.append(li); }
+  $("b-up").disabled = !r.parent;
+  $("b-up").onclick = () => browse(r.parent);
+  $("b-info").textContent = browseTarget === "result"
+    ? (r.is_result ? "This folder holds a reconstruction." : "No reconstruction (sparse/0) in this folder.")
+    : `${r.images} photo${r.images === 1 ? "" : "s"} in this folder.`;
+  $("b-use").disabled = browseTarget === "result" ? !r.is_result : false;
+}
+function openBrowser(target, title) {
+  browseTarget = target; $("b-title").textContent = title;
+  const start = target === "result" ? $("out").value : $(target).value;
+  $("browser").showModal(); browse(start || (state.cwd || ""));
+}
+for (const b of document.querySelectorAll("[data-browse]")) b.onclick = () => openBrowser(b.dataset.browse, "Choose the photo folder");
+$("open-result").onclick = () => openBrowser("result", "Open a result folder");
+$("b-cancel").onclick = () => $("browser").close();
+$("b-use").onclick = async () => {
+  $("browser").close();
+  if (browseTarget === "result") {
+    try { const r = await api("/api/open", { method: "POST", body: JSON.stringify({ out: browsePath }) }); select(r.id); }
+    catch (e) { setMsg(e.message, true); }
+  } else {
+    $(browseTarget).value = browsePath;
+  }
+};
+
+// ---- 3D viewer ----------------------------------------------------------
+const view = { pts: null, cols: null, cams: null, center: [0,0,0], scale: 1, basis: null, yaw: 0.6, pitch: 0.5, dist: 3, pan: [0,0,0] };
+const canvas = $("view"), ctx = canvas.getContext("2d");
+const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const add = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+const mul = (a, s) => [a[0]*s, a[1]*s, a[2]*s];
+const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const norm = (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+
+async function loadModel(id) {
+  viewerFor = id;
+  let m; try { m = await api(`/api/jobs/${id}/model`); } catch (e) { return; }
+  if (selected !== id) return;
+  const nc = m.cameras.length / 9;
+  view.pts = new Float32Array(m.points); view.cols = new Uint8Array(m.colors); view.cams = m.cameras;
+  // Centre: median camera centre (or mean point); up: mean camera up.
+  const med = (k) => { const v = []; for (let i = 0; i < nc; i++) v.push(m.cameras[i*9+k]); v.sort((a,b)=>a-b); return v[v.length >> 1]; };
+  let up = [0, 0, 0];
+  for (let i = 0; i < nc; i++) up = add(up, [m.cameras[i*9+6], m.cameras[i*9+7], m.cameras[i*9+8]]);
+  view.center = nc ? [med(0), med(1), med(2)] : [0, 0, 0];
+  up = norm(nc ? up : [0, -1, 0]);
+  // Scale: 90th percentile distance of the points (or cameras) from the centre.
+  const d = [];
+  const src = view.pts.length ? view.pts : m.cameras, stride = view.pts.length ? 3 : 9;
+  for (let i = 0; i + 2 < src.length; i += stride * Math.max(1, Math.floor(src.length / stride / 5000)))
+    d.push(Math.hypot(src[i]-view.center[0], src[i+1]-view.center[1], src[i+2]-view.center[2]));
+  d.sort((a,b)=>a-b);
+  view.scale = d.length ? Math.max(d[Math.floor(d.length * 0.9)] || 1, 1e-6) : 1;
+  const any = Math.abs(up[0]) < 0.9 ? [1,0,0] : [0,1,0];
+  const right = norm(cross(any, up)), fwd = cross(up, right);
+  view.basis = { up, right, fwd };
+  resetView();
+  $("viewer-wrap").hidden = false;
+  $("v-info").textContent = `${nc} cameras · ${(m.points.length/3).toLocaleString()} points shown`;
+  draw();
+}
+
+function resetView() { view.yaw = 0.6; view.pitch = 0.45; view.dist = 2.6; view.pan = [0,0,0]; }
+
+function eyeFrame() {
+  const { up, right, fwd } = view.basis;
+  const cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+  const dir = add(add(mul(right, Math.sin(view.yaw) * cp), mul(fwd, Math.cos(view.yaw) * cp)), mul(up, sp));
+  const target = add(view.center, view.pan);
+  const eye = add(target, mul(dir, view.dist * view.scale));
+  const z = norm(sub(target, eye));            // looking direction
+  const x = norm(cross(z, up));                // screen right
+  const y = cross(x, z);                       // screen up
+  return { eye, x, y, z };
+}
+
+function draw() {
+  if (!view.basis || $("viewer-wrap").hidden) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(canvas.clientWidth * dpr)), h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  const { eye, x, y, z } = eyeFrame();
+  const f = 0.9 * Math.min(w, h), cx = w / 2, cy = h / 2, near = 0.01 * view.scale;
+  const img = ctx.createImageData(w, h), buf = new Uint32Array(img.data.buffer);
+  const bg = getComputedStyle(canvas).backgroundColor.match(/\d+/g).map(Number);
+  buf.fill((255 << 24) | (bg[2] << 16) | (bg[1] << 8) | bg[0]);
+  if ($("v-points").checked && view.pts) {
+    const p = view.pts, c = view.cols, s = Number($("v-size").value) * Math.max(1, Math.round(dpr));
+    const ex = eye[0], ey = eye[1], ez = eye[2];
+    for (let i = 0, k = 0; i < p.length; i += 3, k += 3) {
+      const dx = p[i]-ex, dy = p[i+1]-ey, dz = p[i+2]-ez;
+      const zc = dx*z[0] + dy*z[1] + dz*z[2];
+      if (zc <= near) continue;
+      const u = Math.round(cx + f * (dx*x[0] + dy*x[1] + dz*x[2]) / zc);
+      const v = Math.round(cy - f * (dx*y[0] + dy*y[1] + dz*y[2]) / zc);
+      if (u < 0 || v < 0 || u + s > w || v + s > h) continue;
+      const col = (255 << 24) | (c[k+2] << 16) | (c[k+1] << 8) | c[k];
+      for (let a = 0; a < s; a++) { const row = (v + a) * w + u; for (let b = 0; b < s; b++) buf[row + b] = col; }
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  if ($("v-cams").checked && view.cams) {
+    const cam = view.cams, n = cam.length / 9, size = 0.035 * view.scale;
+    const proj = (q) => {
+      const d = sub(q, eye), zc = dot(d, z);
+      return zc <= near ? null : [cx + f * dot(d, x) / zc, cy - f * dot(d, y) / zc];
+    };
+    ctx.lineWidth = Math.max(1, dpr);
+    for (let i = 0; i < n; i++) {
+      const o = [cam[i*9], cam[i*9+1], cam[i*9+2]], fw = [cam[i*9+3], cam[i*9+4], cam[i*9+5]], u = [cam[i*9+6], cam[i*9+7], cam[i*9+8]];
+      const r = cross(fw, u);
+      const base = add(o, mul(fw, size));
+      const corners = [[1,1],[1,-1],[-1,-1],[-1,1]].map(([a, b]) => add(base, add(mul(r, 0.6*a*size), mul(u, 0.45*b*size))));
+      const po = proj(o), pc = corners.map(proj);
+      if (!po || pc.some((q) => !q)) continue;
+      ctx.strokeStyle = `hsl(${210 - 180 * i / Math.max(1, n - 1)}, 85%, 60%)`;
+      ctx.beginPath();
+      for (const q of pc) { ctx.moveTo(po[0], po[1]); ctx.lineTo(q[0], q[1]); }
+      ctx.moveTo(pc[3][0], pc[3][1]); for (const q of pc) ctx.lineTo(q[0], q[1]);
+      ctx.stroke();
+    }
+  }
+}
+
+let drag = null, raf = 0;
+const redraw = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; draw(); }); };
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+canvas.addEventListener("pointerdown", (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  drag = { x: e.clientX, y: e.clientY, pan: e.shiftKey || e.button === 2 };
+  canvas.style.cursor = "grabbing";
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (!drag || !view.basis) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.x = e.clientX; drag.y = e.clientY;
+  if (drag.pan) {
+    const { x, y } = eyeFrame(), k = view.dist * view.scale / canvas.clientHeight;
+    view.pan = add(view.pan, add(mul(x, -dx * k), mul(y, dy * k)));
+  } else {
+    view.yaw -= dx * 0.008;
+    view.pitch = Math.max(-1.5, Math.min(1.5, view.pitch + dy * 0.008));
+  }
+  redraw();
+});
+const endDrag = () => { drag = null; canvas.style.cursor = "grab"; };
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+canvas.addEventListener("wheel", (e) => { e.preventDefault(); view.dist = Math.max(0.05, Math.min(50, view.dist * Math.exp(e.deltaY * 0.0012))); redraw(); }, { passive: false });
+canvas.addEventListener("dblclick", () => { resetView(); redraw(); });
+$("v-reset").onclick = () => { resetView(); redraw(); };
+for (const id of ["v-points", "v-cams", "v-size"]) $(id).oninput = redraw;
+window.addEventListener("resize", redraw);
+
+// ---- Polling ------------------------------------------------------------
+refreshState();
+setInterval(refreshState, 2000);
+setInterval(refreshJob, 1000);
+</script>
+</body>
+</html>

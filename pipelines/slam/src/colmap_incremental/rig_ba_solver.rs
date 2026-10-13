@@ -350,6 +350,9 @@ struct Problem {
     /// LM linearization), computed once here rather than rediscovered by
     /// scanning Jacobian-evaluated observations on every accepted step.
     point_free_frames: Vec<Vec<u32>>,
+    /// Where each point's blocks start in [`Linearization::hcp`]: the
+    /// prefix sum of `point_free_frames` lengths (`n_points + 1` entries).
+    hcp_off: Vec<usize>,
     /// Deduplicated, ascending `(free_slot_a, free_slot_b)` pairs (`a < b`)
     /// across every point's `point_free_frames` — the reduced camera
     /// system's off-diagonal sparsity pattern.
@@ -1126,6 +1129,12 @@ fn assemble_problem(
         );
     }
 
+    let mut hcp_off = Vec::with_capacity(point_free_frames.len() + 1);
+    hcp_off.push(0);
+    for frames in &point_free_frames {
+        hcp_off.push(hcp_off.last().copied().unwrap_or(0) + frames.len());
+    }
+
     Ok(Problem {
         free_frame_slot,
         n_free_frames,
@@ -1135,6 +1144,7 @@ fn assemble_problem(
         obs,
         point_obs_range,
         point_free_frames,
+        hcp_off,
         edges,
         point_pair_edge_idx,
         shard_boundaries,
@@ -1320,14 +1330,28 @@ impl Corrector {
 const FRAME_BLOCK: usize = 42;
 
 struct PointLin {
-    /// `Jpose^T Jpoint` per free frame (`problem.point_free_frames[p]`), only
-    /// meaningful if `free`.
-    hcp: Vec<SMatrix<f64, 6, 3>>,
     /// `JᵀJ` for the point block, only meaningful if `free`.
     hpp: Matrix3<f64>,
     /// `−Jᵀr` for the point block, only meaningful if `free`.
     bp: Vector3<f64>,
     free: bool,
+}
+
+/// Every point's linearization. The `Jpose^T Jpoint` blocks of all points
+/// share one array: point `p`'s, one per `point_free_frames[p]` (only
+/// meaningful if the point is free), are `hcp[problem.hcp_off[p]..
+/// problem.hcp_off[p + 1]]`. One array instead of one vector per point
+/// spares hundreds of thousands of allocations per linearization of a
+/// global BA, and is handed back to the next linearization for reuse.
+struct Linearization {
+    points: Vec<PointLin>,
+    hcp: Vec<SMatrix<f64, 6, 3>>,
+}
+
+impl Linearization {
+    fn hcp(&self, problem: &Problem, p: usize) -> &[SMatrix<f64, 6, 3>] {
+        &self.hcp[problem.hcp_off[p]..problem.hcp_off[p + 1]]
+    }
 }
 
 /// `d(u, v)/d(sensor_from_rig)` for the update `sensor_from_rig ∘ exp(ξ)`,
@@ -1391,12 +1415,13 @@ fn linearize_point(
     loss: LossFunction,
     (extras, n_frames): (&ExtraBlocks, u32),
     frame_blocks: &mut [f64],
+    hcp: &mut [SMatrix<f64, 6, 3>],
 ) -> (f64, PointLin, Vec<(u32, Matrix6<f64>)>) {
     frame_blocks.fill(0.0);
+    hcp.fill(SMatrix::<f64, 6, 3>::zeros());
     let mut cost = 0.0;
     let mut hpp = Matrix3::zeros();
     let mut bp = Vector3::zeros();
-    let mut hcp: Vec<SMatrix<f64, 6, 3>> = vec![SMatrix::<f64, 6, 3>::zeros(); target_frames.len()];
     let mut direct: Vec<(u32, Matrix6<f64>)> = Vec::new();
     let has_extras = extras.len() > 0;
     let camera_node = n_frames;
@@ -1510,7 +1535,6 @@ fn linearize_point(
     (
         cost,
         PointLin {
-            hcp,
             hpp,
             bp,
             free: point_free,
@@ -1534,9 +1558,10 @@ fn linearize_point(
 fn linearize(
     problem: &Problem,
     loss: LossFunction,
+    mut hcp: Vec<SMatrix<f64, 6, 3>>,
 ) -> (
     f64,
-    Vec<PointLin>,
+    Linearization,
     Vec<Matrix6<f64>>,
     Vec<Vector6<f64>>,
     Option<Vec<Matrix6<f64>>>,
@@ -1567,6 +1592,16 @@ fn linearize(
             bounds.push(n_points);
         }
     }
+    // `hcp` (the previous linearization's array, reused) split by shard.
+    hcp.resize(problem.hcp_off[n_points], SMatrix::<f64, 6, 3>::zeros());
+    let mut hcp_shards = Vec::with_capacity(n_shards);
+    let mut rest = hcp.as_mut_slice();
+    for shard in 0..n_shards {
+        let len = problem.hcp_off[bounds[shard + 1]] - problem.hcp_off[bounds[shard]];
+        let (head, tail) = rest.split_at_mut(len);
+        hcp_shards.push(head);
+        rest = tail;
+    }
     #[allow(clippy::type_complexity)]
     let shards: Vec<(
         f64,
@@ -1574,10 +1609,12 @@ fn linearize(
         Vec<Matrix6<f64>>,
         Vec<Vector6<f64>>,
         Vec<(usize, Vec<(u32, Matrix6<f64>)>)>,
-    )> = (0..n_shards)
+    )> = hcp_shards
         .into_par_iter()
-        .map(|shard| {
+        .enumerate()
+        .map(|(shard, shard_hcp)| {
             let range = bounds[shard]..bounds[shard + 1];
+            let shard_start = problem.hcp_off[range.start];
             let mut diag = vec![Matrix6::<f64>::zeros(); n_free];
             let mut bc = vec![Vector6::<f64>::zeros(); n_free];
             let mut cost = 0.0;
@@ -1597,6 +1634,8 @@ fn linearize(
                     loss,
                     (&problem.extras, problem.n_frames as u32),
                     &mut frame_blocks,
+                    &mut shard_hcp
+                        [problem.hcp_off[p] - shard_start..problem.hcp_off[p + 1] - shard_start],
                 );
                 for (&f, block) in frames.iter().zip(frame_blocks.chunks_exact(FRAME_BLOCK)) {
                     let slot = problem.free_frame_slot[f as usize].expect("free") as usize;
@@ -1639,7 +1678,10 @@ fn linearize(
 
     (
         full_cost,
-        points_lin,
+        Linearization {
+            points: points_lin,
+            hcp,
+        },
         frame_diag_raw,
         frame_bc_raw,
         offdiag_raw,
@@ -1717,13 +1759,13 @@ struct PhaseTimings {
 #[allow(clippy::needless_range_loop)]
 fn eliminate_and_accumulate(
     problem: &Problem,
-    points_lin: &[PointLin],
+    lin: &Linearization,
     edges_len: usize,
     mu: f64,
 ) -> (Vec<Matrix6<f64>>, Vec<Matrix6<f64>>, Vec<Vector6<f64>>) {
     let n_free = problem.n_free_frames;
     if let Some(index) = &problem.contributions {
-        return eliminate_by_output(problem, index, points_lin, edges_len, mu);
+        return eliminate_by_output(problem, index, lin, edges_len, mu);
     }
     let n_shards = problem.shard_boundaries.len().saturating_sub(1).max(1);
 
@@ -1737,18 +1779,19 @@ fn eliminate_and_accumulate(
             let mut local_diag = vec![Matrix6::<f64>::zeros(); n_free];
             let mut local_bc = vec![Vector6::<f64>::zeros(); n_free];
             let mut hcp_scaled: Vec<SMatrix<f64, 6, 3>> = Vec::new();
-            // Both `pl.hcp` and `problem.point_pair_edge_idx`
+            // Both `hcp` and `problem.point_pair_edge_idx`
             // are indexed by the same `p`, and the pair loop below indexes
-            // `hcp_scaled`/`pl.hcp` at two *different* offsets (`i`, `j`) in
+            // `hcp_scaled`/`hcp` at two *different* offsets (`i`, `j`) in
             // the same iteration — an index loop reads more directly than
             // threading multiple `.zip()`s through both (hence the
             // `needless_range_loop` allow above).
             for p in lo..hi.max(lo) {
-                let pl = &points_lin[p];
-                if !pl.free || pl.hcp.is_empty() {
+                let pl = &lin.points[p];
+                let hcp = lin.hcp(problem, p);
+                if !pl.free || hcp.is_empty() {
                     continue;
                 }
-                let n = pl.hcp.len();
+                let n = hcp.len();
                 let Some(hpp_inv) = damped_hpp_inverse(&pl.hpp, mu) else {
                     // Degenerate point block: contribute nothing rather than
                     // propagate a solve failure (see the original
@@ -1756,11 +1799,11 @@ fn eliminate_and_accumulate(
                     continue;
                 };
                 hcp_scaled.clear();
-                hcp_scaled.extend((0..n).map(|k| pl.hcp[k] * hpp_inv));
+                hcp_scaled.extend((0..n).map(|k| hcp[k] * hpp_inv));
                 for k in 0..n {
                     let slot = problem.free_frame_slot[problem.point_free_frames[p][k] as usize]
                         .expect("free") as usize;
-                    local_diag[slot] -= hcp_scaled[k] * pl.hcp[k].transpose();
+                    local_diag[slot] -= hcp_scaled[k] * hcp[k].transpose();
                     local_bc[slot] -= hcp_scaled[k] * pl.bp;
                 }
                 let pair_edge_idx = &problem.point_pair_edge_idx[p];
@@ -1769,7 +1812,7 @@ fn eliminate_and_accumulate(
                     for j in i + 1..n {
                         sub_outer_6x3(
                             &mut local_offdiag[pair_edge_idx[local_pair] as usize],
-                            &pl.hcp[j],
+                            &hcp[j],
                             &hcp_scaled[i],
                         );
                         local_pair += 1;
@@ -1830,16 +1873,18 @@ fn sub_outer_6x3(acc: &mut Matrix6<f64>, a: &SMatrix<f64, 6, 3>, b: &SMatrix<f64
 fn eliminate_by_output(
     problem: &Problem,
     index: &ContributionIndex,
-    points_lin: &[PointLin],
+    lin: &Linearization,
     edges_len: usize,
     mu: f64,
 ) -> (Vec<Matrix6<f64>>, Vec<Matrix6<f64>>, Vec<Vector6<f64>>) {
     let n_free = problem.n_free_frames;
     let point_pair_edge_idx = &problem.point_pair_edge_idx;
-    let hpp_inv: Vec<Option<Matrix3<f64>>> = points_lin
+    let hpp_inv: Vec<Option<Matrix3<f64>>> = lin
+        .points
         .par_iter()
-        .map(|pl| {
-            if !pl.free || pl.hcp.is_empty() {
+        .zip(&problem.point_free_frames)
+        .map(|(pl, frames)| {
+            if !pl.free || frames.is_empty() {
                 None
             } else {
                 damped_hpp_inverse(&pl.hpp, mu)
@@ -1884,7 +1929,8 @@ fn eliminate_by_output(
                 let Some(inv) = hpp_inv[p] else {
                     continue;
                 };
-                let pl = &points_lin[p];
+                let pl = &lin.points[p];
+                let hcp = lin.hcp(problem, p);
                 let point_shard = Some(index.point_shard[p]);
                 if current_shard != point_shard {
                     if current_shard.is_some() {
@@ -1892,15 +1938,15 @@ fn eliminate_by_output(
                     }
                     current_shard = point_shard;
                 }
-                let scaled = pl.hcp[k] * inv;
-                diag_acc -= scaled * pl.hcp[k].transpose();
+                let scaled = hcp[k] * inv;
+                diag_acc -= scaled * hcp[k].transpose();
                 bc_acc -= scaled * pl.bp;
-                let n = pl.hcp.len();
+                let n = hcp.len();
                 // `pair_slot(n, k, k + 1)` onwards: `k`'s pairs with later
                 // frames (empty for the last frame).
                 let pair_edge = &point_pair_edge_idx[p][k * (2 * n - k - 1) / 2..];
-                for (hcp, &e) in pl.hcp[k + 1..].iter().zip(pair_edge) {
-                    sub_outer_6x3(&mut acc[e as usize - base], hcp, &scaled);
+                for (block, &e) in hcp[k + 1..].iter().zip(pair_edge) {
+                    sub_outer_6x3(&mut acc[e as usize - base], block, &scaled);
                 }
             }
             if current_shard.is_some() {
@@ -1989,7 +2035,7 @@ fn balanced_shard_boundaries(point_free_frames: &[Vec<u32>], n_shards: usize) ->
 #[allow(clippy::too_many_arguments)]
 fn solve_step(
     problem: &Problem,
-    points_lin: &[PointLin],
+    lin: &Linearization,
     edges: &[(u32, u32)],
     frame_diag_raw: &[Matrix6<f64>],
     frame_bc_raw: &[Vector6<f64>],
@@ -2002,7 +2048,7 @@ fn solve_step(
     let n_free = problem.n_free_frames;
     let t = Instant::now();
     let (mut flat_offdiag, diag_delta, bc_delta) =
-        eliminate_and_accumulate(problem, points_lin, edges.len(), mu);
+        eliminate_and_accumulate(problem, lin, edges.len(), mu);
     // The extra nodes' direct couplings ([`linearize`]).
     if let Some(raw) = offdiag_raw {
         for (acc, term) in flat_offdiag.iter_mut().zip(raw) {
@@ -2102,7 +2148,7 @@ fn solve_step(
         timings.linsolve += t.elapsed();
         return Some(back_substitute(
             problem,
-            points_lin,
+            lin,
             frame_diag_raw,
             frame_bc_raw,
             dx_frames,
@@ -2152,7 +2198,7 @@ fn solve_step(
     timings.linsolve += t.elapsed();
     Some(back_substitute(
         problem,
-        points_lin,
+        lin,
         frame_diag_raw,
         frame_bc_raw,
         dx_frames,
@@ -2165,7 +2211,7 @@ fn solve_step(
 /// cost decrease, for [`solve_step`].
 fn back_substitute(
     problem: &Problem,
-    points_lin: &[PointLin],
+    lin: &Linearization,
     frame_diag_raw: &[Matrix6<f64>],
     frame_bc_raw: &[Vector6<f64>],
     dx_frames: Vec<Vector6<f64>>,
@@ -2174,10 +2220,12 @@ fn back_substitute(
 ) -> (Vec<Vector6<f64>>, Vec<Vector3<f64>>, f64) {
     let n_free = problem.n_free_frames;
     let t = Instant::now();
-    let dx_points: Vec<Vector3<f64>> = points_lin
+    let dx_points: Vec<Vector3<f64>> = lin
+        .points
         .par_iter()
         .zip(&problem.point_free_frames)
-        .map(|(pl, frames)| {
+        .enumerate()
+        .map(|(p, (pl, frames))| {
             if !pl.free {
                 return Vector3::zeros();
             }
@@ -2185,9 +2233,9 @@ fn back_substitute(
                 return Vector3::zeros();
             };
             let mut rhs = pl.bp;
-            for (k, &fidx) in frames.iter().enumerate() {
+            for (&fidx, hcp) in frames.iter().zip(lin.hcp(problem, p)) {
                 let slot = problem.free_frame_slot[fidx as usize].expect("free") as usize;
-                rhs -= pl.hcp[k].transpose() * dx_frames[slot];
+                rhs -= hcp.transpose() * dx_frames[slot];
             }
             hpp_inv * rhs
         })
@@ -2200,7 +2248,7 @@ fn back_substitute(
         let damped_dx = Vector6::from_iterator((0..6).map(|i| mu * d[i] * dx[i]));
         predicted += dx.dot(&(frame_bc_raw[a] + damped_dx));
     }
-    for (p, pl) in points_lin.iter().enumerate() {
+    for (p, pl) in lin.points.iter().enumerate() {
         if !pl.free {
             continue;
         }
@@ -2382,11 +2430,11 @@ fn optimize_rig_obs(
 /// count elements, not allocator slack. `elimination` is the reduced
 /// system's off-diagonal blocks (f64) built on every trial, `pcg_f32` their
 /// f32 copy on the PCG path.
-fn log_memory(problem: &Problem, rig_obs_bytes: usize, points_lin: &[PointLin]) {
+fn log_memory(problem: &Problem, rig_obs_bytes: usize, lin: &Linearization) {
     const MB: f64 = 1024.0 * 1024.0;
     let pair_idx: usize = problem.point_pair_edge_idx.iter().map(Vec::len).sum();
     let free_frames: usize = problem.point_free_frames.iter().map(Vec::len).sum();
-    let lin_hcp: usize = points_lin.iter().map(|pl| pl.hcp.len()).sum();
+    let lin_hcp = lin.hcp.len();
     let contributions = problem
         .contributions
         .as_ref()
@@ -2403,7 +2451,7 @@ fn log_memory(problem: &Problem, rig_obs_bytes: usize, points_lin: &[PointLin]) 
         (free_frames * 4) as f64 / MB,
         (pair_idx * 4) as f64 / MB,
         contributions as f64 / MB,
-        (std::mem::size_of_val(points_lin)
+        (std::mem::size_of_val(lin.points.as_slice())
             + lin_hcp * std::mem::size_of::<SMatrix<f64, 6, 3>>()) as f64
             / MB,
         (edges * std::mem::size_of::<Matrix6<f64>>()) as f64 / MB,
@@ -2478,9 +2526,9 @@ fn optimize_problem(
     let mut timings = PhaseTimings::default();
     let mut apply_ms = 0.0;
 
-    let (mut half_cost, mut points_lin, mut frame_diag_raw, mut frame_bc_raw, mut offdiag_raw) = {
+    let (mut half_cost, mut lin, mut frame_diag_raw, mut frame_bc_raw, mut offdiag_raw) = {
         let t = Instant::now();
-        let (full, pl, fd, fb, cl) = linearize(problem, loss);
+        let (full, pl, fd, fb, cl) = linearize(problem, loss, Vec::new());
         timings.linearize += t.elapsed();
         timings.linearize_calls += 1;
         (0.5 * full, pl, fd, fb, cl)
@@ -2489,7 +2537,7 @@ fn optimize_problem(
     if problem.n_free_frames >= problem.iterative_min_free_frames
         || std::env::var_os("VISLOC_BA_MEMORY").is_some()
     {
-        log_memory(problem, rig_obs_bytes, &points_lin);
+        log_memory(problem, rig_obs_bytes, &lin);
     }
 
     let mut radius = INITIAL_RADIUS;
@@ -2524,7 +2572,7 @@ fn optimize_problem(
     let mut consecutive_invalid_steps = 0usize;
 
     for it in 0..max_num_iterations {
-        let grad_norm = gradient_inf_norm(&points_lin, &frame_bc_raw);
+        let grad_norm = gradient_inf_norm(&lin.points, &frame_bc_raw);
         match gradient_tolerance_rel {
             // Legacy absolute criterion (unchanged).
             None => {
@@ -2553,7 +2601,7 @@ fn optimize_problem(
         let mu = 1.0 / radius;
         let Some((dx_frames, dx_points, predicted)) = solve_step(
             problem,
-            &points_lin,
+            &lin,
             &problem.edges,
             &frame_diag_raw,
             &frame_bc_raw,
@@ -2642,11 +2690,11 @@ fn optimize_problem(
                 break;
             }
             let t = Instant::now();
-            let (full, pl, fd, fb, cl) = linearize(problem, loss);
+            let (full, pl, fd, fb, cl) = linearize(problem, loss, std::mem::take(&mut lin.hcp));
             timings.linearize += t.elapsed();
             timings.linearize_calls += 1;
             half_cost = 0.5 * full;
-            points_lin = pl;
+            lin = pl;
             frame_diag_raw = fd;
             frame_bc_raw = fb;
             offdiag_raw = cl;
@@ -3582,11 +3630,11 @@ mod tests {
             problem.n_free_frames,
             &problem.shard_boundaries,
         );
-        let (_, points_lin, _, _, _) = linearize(&problem, LossFunction::Trivial);
+        let (_, lin, _, _, _) = linearize(&problem, LossFunction::Trivial, Vec::new());
         problem.contributions = None;
-        let sharded = eliminate_and_accumulate(&problem, &points_lin, problem.edges.len(), 1e-3);
+        let sharded = eliminate_and_accumulate(&problem, &lin, problem.edges.len(), 1e-3);
         problem.contributions = Some(index);
-        let by_output = eliminate_and_accumulate(&problem, &points_lin, problem.edges.len(), 1e-3);
+        let by_output = eliminate_and_accumulate(&problem, &lin, problem.edges.len(), 1e-3);
         assert!(sharded.0.iter().any(|b| b.norm() > 0.0));
         assert_eq!(sharded, by_output);
     }
@@ -4095,7 +4143,7 @@ mod iterative_bench {
                 .num_threads(threads)
                 .build()
                 .expect("thread pool")
-                .install(|| linearize(&problem, LossFunction::Trivial));
+                .install(|| linearize(&problem, LossFunction::Trivial, Vec::new()));
             (cost, diag, bc)
         };
         assert_eq!(run(1), run(3));
@@ -4119,14 +4167,19 @@ mod iterative_bench {
                 .min()
                 .expect("runs")
         };
+        // Each linearization reuses the previous one's block array, as the
+        // LM loop does.
+        let mut reuse = Vec::new();
         let t_linearize = best(Box::new(|| {
-            std::hint::black_box(linearize(&problem, LossFunction::Trivial));
+            let (_, lin, _, _, _) =
+                linearize(&problem, LossFunction::Trivial, std::mem::take(&mut reuse));
+            reuse = std::hint::black_box(lin).hcp;
         }));
-        let (_, points_lin, _, _, _) = linearize(&problem, LossFunction::Trivial);
+        let (_, lin, _, _, _) = linearize(&problem, LossFunction::Trivial, Vec::new());
         let t_eliminate = best(Box::new(|| {
             std::hint::black_box(eliminate_and_accumulate(
                 &problem,
-                &points_lin,
+                &lin,
                 problem.edges.len(),
                 1e-4,
             ));

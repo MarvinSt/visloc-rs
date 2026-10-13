@@ -4376,4 +4376,57 @@ mod iterative_bench {
         );
         assert!(max_diff < 1e-3 * x_pcg.amax().max(1.0));
     }
+
+    /// A smooth scale drift along a long street (the start scaled from 1
+    /// at one end to 1 + 8% at the other, as an incremental reconstruction
+    /// drifts) survives a COLMAP-style global BA, which stops on the
+    /// relative gradient tolerance after one LM step: the step's damping
+    /// (Ceres' initial trust radius) holds back that low-curvature mode.
+    /// Run to convergence, the trust radius grows and the drift goes.
+    /// About 25 s in release:
+    ///
+    /// `cargo test --release -p visloc-slam --lib global_ba_drift -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn global_ba_drift_needs_a_converged_solve() {
+        let n = 1500;
+        let solve = |gradient_tolerance_rel: Option<f64>| {
+            let (mut input, point_major) = street_scene(n);
+            let len = 0.1 * n as f64;
+            let warp = |p: Vector3<f64>| {
+                let k = 1.0 + 0.08 * p.x / len;
+                Vector3::new(p.x + 0.04 * p.x * p.x / len, k * p.y, k * p.z)
+            };
+            for pose in input.poses.iter_mut().skip(2) {
+                let centre = -(pose.rotation.inverse() * pose.translation);
+                pose.translation = -(pose.rotation * warp(centre));
+            }
+            for p in &mut input.points {
+                *p = Point3::from(warp(p.coords));
+            }
+            optimize_point_major(
+                &mut input,
+                point_major,
+                50,
+                LossFunction::Trivial,
+                gradient_tolerance_rel,
+                &mut ExtraBlocks::default(),
+            )
+            .expect("solve");
+            // Length of the first and the last tenth of the path (the very
+            // end, seen by few points, left out) over its true length.
+            let centre = |i: usize| {
+                let p = &input.poses[i];
+                -(p.rotation.inverse() * p.translation)
+            };
+            let w = (n - 60) / 10;
+            let scale = |a: usize| (centre(a + w) - centre(a)).norm() / (0.1 * w as f64);
+            scale(9 * w) / scale(0) - 1.0
+        };
+        let one_step = solve(Some(1.0));
+        let converged = solve(None);
+        eprintln!("drift left: one step {one_step:.4}, converged {converged:.4}");
+        assert!(one_step > 0.05, "one step {one_step}");
+        assert!(converged.abs() < 0.005, "converged {converged}");
+    }
 }

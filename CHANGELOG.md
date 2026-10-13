@@ -83,6 +83,29 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **COLMAP-port mapper: opt-in converged final BA
+  (`--mapper-opt ba_global_final_converge=1`).** This is not in COLMAP.
+  - **What it does:** each model ends with one more global refinement.
+    Its BA runs to convergence (absolute gradient stop, up to 50 LM
+    steps).
+  - **Why it is needed:** COLMAP's global BAs stop on the relative
+    `gradient_tolerance=1.0` after one or two steps. Each restarts from
+    Ceres' initial trust radius, whose damping holds back smooth,
+    low-curvature modes. Scale drift along a street is such a mode, so no
+    global BA of the incremental loop corrects it.
+  - **Synthetic test** (`global_ba_drift_needs_a_converged_solve`): a
+    1,500-frame street with an 8% scale drift.
+    - One step leaves 6.7% of the drift.
+    - The converged solve leaves 0.01%.
+  - **SmallCity:** its four passes are the four sides of the block, an
+    open path that ends about 26 m from its start. Its scale drifts
+    smoothly along the path, by about ±4% against the reference.
+  - **ETH3D, 13 scenes:** the change is within noise. Meadow goes from
+    5.73 to 4.94 cm and facade from 1.67 to 1.77 cm, so the option stays
+    off by default.
+  - `VISLOC_SNAPSHOT_BEFORE_FINAL=<dir>` writes the model as the
+    incremental loop left it, so one run gives both models.
+
 - **`visloc_web`: run the photo pipeline from a web browser.**
   `cargo run --release --example visloc_web` serves a page on
   127.0.0.1:8080. From it you can:

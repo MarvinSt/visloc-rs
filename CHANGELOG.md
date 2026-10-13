@@ -91,8 +91,11 @@ All notable changes to `visloc-rs` will be documented here.
   reduced system, solved by bordering the factored pose system. One focal
   step moves `fx` and `fy` together (square pixels). Local BA refines a
   camera only while every registered image of it is in the window, as
-  COLMAP does; solves large enough for the iterative (PCG) path keep it
-  fixed. Off by default in the mapper; `gsplat_photos` enables it unless
+  COLMAP does. Solves large enough for the iterative path (1000+ free
+  frames, e.g. SmallCity's global BAs) carry the camera as one more node
+  of the PCG system, padded to 6x6, with the border's rank-3 coupling in
+  the product; forcing every ETH3D solve onto that path reproduces the
+  direct solves' errors to 0.002 cm. Off by default in the mapper; `gsplat_photos` enables it unless
   `--no-refine-intrinsics`. On the 13 ETH3D DSLR scenes the centred
   principal point prior is ~4 px off, and fixed intrinsics had inflated
   the camera-centre errors 2-5x. Replaying the 8192-detection exports

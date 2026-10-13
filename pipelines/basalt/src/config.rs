@@ -1,7 +1,9 @@
 use crate::mapper::{GlobalBaConfig, MapperConfig, OfflineMapperConfig};
 use crate::stream::{MultiCameraFlowOptions, StereoMatchingGuess};
 use crate::vio::aom::LmConfig;
-use crate::vio::estimator::{EstimatorConfig, OutlierFilter, UrgentKeyframePolicy};
+use crate::vio::estimator::{
+    EstimatorConfig, OutlierFilter, UrgentKeyframePolicy, EARTH_ROTATION_RAD_S,
+};
 use crate::vio::margdata::WindowPolicy;
 use crate::vio::scalar::ScalarMode;
 use serde::{Deserialize, Serialize};
@@ -81,6 +83,9 @@ const OPTIONAL_KEYS: &[&str] = &[
     // Post-solve visual outlier removal with `vio_outlier_threshold`
     // (default false); see `EstimatorConfig::outlier_filter`.
     "config.vio_filter_outliers",
+    // Latitude in degrees for Earth-rotation compensation of the gyro
+    // (absent: off); see `EstimatorConfig::earth_rotation_up_rad_s`.
+    "config.vio_earth_rotation_latitude_deg",
 ];
 #[derive(Debug, Error, PartialEq)]
 pub enum ConfigError {
@@ -178,7 +183,23 @@ impl BasaltConfig {
             kf_connectivity_all_cameras: self
                 .optional_bool("config.vio_kf_connectivity_all_cameras")?,
             outlier_filter: self.outlier_filter()?,
+            earth_rotation_up_rad_s: self.earth_rotation_up_rad_s()?,
         })
+    }
+    /// `config.vio_earth_rotation_latitude_deg`: `w_e sin(latitude)`, or 0
+    /// when the key is absent.
+    fn earth_rotation_up_rad_s(&self) -> Result<f64, ConfigError> {
+        let key = "config.vio_earth_rotation_latitude_deg";
+        if !self.values.contains_key(key) {
+            return Ok(0.0);
+        }
+        let latitude: f64 = self.value(key)?;
+        if !(-90.0..=90.0).contains(&latitude) {
+            return Err(ConfigError::Value(format!(
+                "{key}: {latitude} is not a latitude in degrees"
+            )));
+        }
+        Ok(EARTH_ROTATION_RAD_S * latitude.to_radians().sin())
     }
     /// `config.vio_filter_outliers`: the threshold is upstream's
     /// `vio_outlier_threshold` (pixels), the minimum observation count is
@@ -457,6 +478,24 @@ mod tests {
         );
 
         v["value0"]["config.vio_outlier_threshold"] = serde_json::json!(0.0);
+        let c = BasaltConfig::from_json(&v.to_string()).unwrap();
+        assert!(matches!(c.estimator_config(), Err(ConfigError::Value(_))));
+    }
+    #[test]
+    fn earth_rotation_key_default_off_and_parses() {
+        let pinned = BasaltConfig::from_json(FIX).unwrap();
+        assert_eq!(
+            pinned.estimator_config().unwrap().earth_rotation_up_rad_s,
+            0.0
+        );
+
+        let mut v: Value = serde_json::from_str(FIX).unwrap();
+        v["value0"]["config.vio_earth_rotation_latitude_deg"] = serde_json::json!(30.0);
+        let c = BasaltConfig::from_json(&v.to_string()).unwrap();
+        let rate = c.estimator_config().unwrap().earth_rotation_up_rad_s;
+        assert!((rate - EARTH_ROTATION_RAD_S * 0.5).abs() < 1e-15);
+
+        v["value0"]["config.vio_earth_rotation_latitude_deg"] = serde_json::json!(91.0);
         let c = BasaltConfig::from_json(&v.to_string()).unwrap();
         assert!(matches!(c.estimator_config(), Err(ConfigError::Value(_))));
     }

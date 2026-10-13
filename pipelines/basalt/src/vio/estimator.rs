@@ -92,7 +92,22 @@ pub struct EstimatorConfig {
     /// reprojection error exceeds the threshold, then re-solves.  `None`
     /// keeps the pinned behaviour.
     pub outlier_filter: Option<OutlierFilter>,
+    /// Opt-in (not upstream; `config.vio_earth_rotation_latitude_deg`).
+    /// Vertical component of Earth's rotation in rad/s, `w_e sin(latitude)`.
+    /// A gyroscope also measures Earth's rotation, which a world fixed to the
+    /// ground does not have.  Yaw is unobservable to the VIO, so the vertical
+    /// part integrates into a heading drift of 0.18 deg/min at 47 deg
+    /// latitude; a gyro bias with a tight random walk cannot absorb it,
+    /// because its projection on the body axes changes as the body turns.
+    /// Non-zero subtracts `R_wb^T [0, 0, value]` from every gyro sample,
+    /// with `R_wb` the newest window state.  The horizontal part is left
+    /// alone: it would need the north direction, and gravity keeps the tilt
+    /// it causes observable.  `0.0` keeps the pinned behaviour.
+    pub earth_rotation_up_rad_s: f64,
 }
+
+/// Earth's sidereal rotation rate (WGS-84), rad/s.
+pub const EARTH_ROTATION_RAD_S: f64 = 7.292_115e-5;
 
 /// Post-solve visual outlier removal, after upstream's older
 /// `keypoint_vio.cpp` (`filterOutliers(vio_outlier_threshold, 4)`).
@@ -121,6 +136,7 @@ impl Default for EstimatorConfig {
             landmarks_all_cameras: false,
             kf_connectivity_all_cameras: false,
             outlier_filter: None,
+            earth_rotation_up_rad_s: 0.0,
         }
     }
 }
@@ -932,10 +948,17 @@ impl BasaltVioEstimator {
             }
             self.of_images.insert(frame_id, images);
         }
+        let earth_rotation_body = self.earth_rotation_in_body();
         let calibrated_imu = imu
             .iter()
             .copied()
-            .map(|sample| self.calibrate_imu(sample))
+            .map(|sample| {
+                let mut sample = self.calibrate_imu(sample);
+                if let Some(rate) = earth_rotation_body {
+                    sample.gyro_rad_s -= rate;
+                }
+                sample
+            })
             .collect::<Vec<_>>();
         let calibrated_initialization_imu =
             initialization_imu.map(|sample| self.calibrate_imu(sample));
@@ -2815,6 +2838,23 @@ impl BasaltVioEstimator {
             rhs,
             fej_point,
         })
+    }
+
+    /// Earth's vertical rotation in the IMU frame of the newest window
+    /// state, or `None` when compensation is off or no state exists yet.
+    fn earth_rotation_in_body(&self) -> Option<Vector3<f64>> {
+        if self.config.earth_rotation_up_rad_s == 0.0 {
+            return None;
+        }
+        let state = self.window_states.last()?;
+        let up_world = Vector3::new(0.0, 0.0, self.config.earth_rotation_up_rad_s);
+        Some(
+            state
+                .nav
+                .imu_to_world
+                .rotation
+                .inverse_transform_vector(&up_world),
+        )
     }
 
     fn calibrate_imu(&self, sample: ImuSample) -> ImuSample {
@@ -5840,6 +5880,42 @@ mod tests {
 
     fn cam() -> DoubleSphereCamera {
         DoubleSphereCamera::new(300., 300., 320., 240., 0.5, 0.7, 640, 480).unwrap()
+    }
+
+    #[test]
+    fn earth_rotation_is_expressed_in_the_newest_state_body_frame() {
+        let state = |imu_to_world: SE3| WindowState {
+            frame_id: 1,
+            timestamp_ns: 1,
+            nav: BasaltNavState {
+                imu_to_world,
+                ..BasaltNavState::default()
+            },
+            stored_current_nav: BasaltNavState::default(),
+            linearized_nav: BasaltNavState::default(),
+            linearized_delta: DVector::zeros(NAV_STATE_DOF),
+            is_keyframe: true,
+            is_latest: true,
+            linearized: false,
+        };
+        // Body x points up, as on Aria's IMU when the wearer looks ahead.
+        let x_up = SE3::new(
+            UnitQuaternion::rotation_between(&Vector3::x(), &Vector3::z()).unwrap(),
+            Vector3::zeros(),
+        );
+        let config = EstimatorConfig {
+            earth_rotation_up_rad_s: 5.0e-5,
+            ..EstimatorConfig::default()
+        };
+        let mut estimator = BasaltVioEstimator::new(cam(), config);
+        assert_eq!(estimator.earth_rotation_in_body(), None);
+        estimator.window_states.push(state(x_up.clone()));
+        let rate = estimator.earth_rotation_in_body().unwrap();
+        assert!((rate - Vector3::new(5.0e-5, 0.0, 0.0)).norm() < 1e-15);
+
+        let mut off = BasaltVioEstimator::new(cam(), EstimatorConfig::default());
+        off.window_states.push(state(x_up));
+        assert_eq!(off.earth_rotation_in_body(), None);
     }
 
     #[test]

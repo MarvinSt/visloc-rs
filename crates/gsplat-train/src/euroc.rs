@@ -360,7 +360,9 @@ pub(crate) fn run_colmap_port(
 /// `out_dir` (`port/model0/cameras.txt`, one PINHOLE camera).
 pub(crate) fn read_port_camera(out_dir: &Path) -> Option<[f64; 4]> {
     let text = std::fs::read_to_string(out_dir.join("port/model0/cameras.txt")).ok()?;
-    let row = text.lines().find(|l| !l.starts_with('#') && !l.trim().is_empty())?;
+    let row = text
+        .lines()
+        .find(|l| !l.starts_with('#') && !l.trim().is_empty())?;
     let t: Vec<&str> = row.split_whitespace().collect();
     if t.get(1) != Some(&"PINHOLE") || t.len() < 8 {
         return None;

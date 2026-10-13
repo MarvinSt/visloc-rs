@@ -247,7 +247,7 @@ impl IncrementalTriangulator {
         use rayon::prelude::*;
         let num_points2d = recon.image(image_id).num_points2d();
         let indices: Vec<Point2DT> = (0..num_points2d).collect();
-        let mut claimed: HashSet<(ImageT, Point2DT)> = HashSet::new();
+        let mut claimed = KeySet::default();
         for wave in indices.chunks(PLAN_WAVE) {
             claimed.clear();
             let recon_ref: &Reconstruction = recon;
@@ -378,7 +378,7 @@ impl IncrementalTriangulator {
         // serial code.
         use rayon::prelude::*;
         let num_points2d = recon.image(image_id).num_points2d();
-        let mut claimed: HashSet<(ImageT, Point2DT)> = HashSet::new();
+        let mut claimed = KeySet::default();
         let indices: Vec<Point2DT> = (0..num_points2d).collect();
         for wave in indices.chunks(PLAN_WAVE) {
             let recon_ref: &Reconstruction = recon;
@@ -442,7 +442,7 @@ impl IncrementalTriangulator {
         obs: &mut ObservationManager,
         image_id: ImageT,
         point2d_idx: Point2DT,
-        claimed: &mut HashSet<(ImageT, Point2DT)>,
+        claimed: &mut KeySet,
     ) -> usize {
         let point3d_id = recon.image(image_id).points2d[point2d_idx].point3d_id;
         if let Some(point3d_id) = point3d_id {
@@ -504,7 +504,7 @@ impl IncrementalTriangulator {
         use rayon::prelude::*;
         self.clear_caches();
         let mut n = 0;
-        let mut claimed: HashSet<(ImageT, Point2DT)> = HashSet::new();
+        let mut claimed = KeySet::default();
         for wave in point3d_ids.chunks(PLAN_WAVE) {
             let recon_ref: &Reconstruction = recon;
             let plans: Vec<Option<CompletePlan>> = wave
@@ -567,7 +567,7 @@ impl IncrementalTriangulator {
         self.clear_caches();
         let mut n = 0;
         // Points created or deleted by merges in this pass.
-        let mut touched: HashSet<Point3DT> = HashSet::new();
+        let mut touched: IdSet<Point3DT> = IdSet::default();
         for wave in point3d_ids.chunks(PLAN_WAVE) {
             let recon_ref: &Reconstruction = recon;
             let plans: Vec<Option<MergePlan>> = wave
@@ -1020,7 +1020,12 @@ const PLAN_WAVE: usize = 16_384;
 
 /// Visited set of the track-completion BFS (membership only; never
 /// iterated, so its order does not matter).
-type KeySet = HashSet<(ImageT, Point2DT), std::hash::BuildHasherDefault<IdPairHasher>>;
+type KeySet = IdSet<(ImageT, Point2DT)>;
+
+/// A membership-only set of small integer ids (never iterated, so the
+/// hasher cannot change any order); SipHash cost several milliseconds per
+/// image in the track completion's claim checks.
+type IdSet<T> = HashSet<T, std::hash::BuildHasherDefault<IdPairHasher>>;
 
 /// Read-only replay of [`IncrementalTriangulator::complete`]'s BFS.
 struct CompletePlan {
@@ -1204,7 +1209,7 @@ fn plan_triangulate_image_point(
             })
             .collect();
         let track_length = track.len();
-        let in_track: HashSet<(ImageT, Point2DT)> = track
+        let in_track: KeySet = track
             .iter()
             .map(|el| (el.image_id, el.point2d_idx))
             .collect();
@@ -1397,7 +1402,7 @@ fn plan_merge(
     }
     let max_sq_reproj_error = options.merge_max_reproj_error * options.merge_max_reproj_error;
     let p3d = recon.point3d(point3d_id);
-    let mut seen: HashSet<Point3DT> = HashSet::new();
+    let mut seen: IdSet<Point3DT> = IdSet::default();
     let mut plan = MergePlan {
         candidates: Vec::new(),
         merges: false,

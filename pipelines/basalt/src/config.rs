@@ -1,7 +1,7 @@
 use crate::mapper::{GlobalBaConfig, MapperConfig, OfflineMapperConfig};
 use crate::stream::{MultiCameraFlowOptions, StereoMatchingGuess};
 use crate::vio::aom::LmConfig;
-use crate::vio::estimator::{EstimatorConfig, UrgentKeyframePolicy};
+use crate::vio::estimator::{EstimatorConfig, OutlierFilter, UrgentKeyframePolicy};
 use crate::vio::margdata::WindowPolicy;
 use crate::vio::scalar::ScalarMode;
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,9 @@ const OPTIONAL_KEYS: &[&str] = &[
     "config.optical_flow_detect_all_cameras",
     "config.vio_landmarks_all_cameras",
     "config.vio_kf_connectivity_all_cameras",
+    // Post-solve visual outlier removal with `vio_outlier_threshold`
+    // (default false); see `EstimatorConfig::outlier_filter`.
+    "config.vio_filter_outliers",
 ];
 #[derive(Debug, Error, PartialEq)]
 pub enum ConfigError {
@@ -174,7 +177,30 @@ impl BasaltConfig {
             landmarks_all_cameras: self.optional_bool("config.vio_landmarks_all_cameras")?,
             kf_connectivity_all_cameras: self
                 .optional_bool("config.vio_kf_connectivity_all_cameras")?,
+            outlier_filter: self.outlier_filter()?,
         })
+    }
+    /// `config.vio_filter_outliers`: the threshold is upstream's
+    /// `vio_outlier_threshold` (pixels), the minimum observation count is
+    /// `keypoint_vio.cpp`'s 4, and the re-solve gets the iterations that
+    /// remain after `vio_filter_iteration`.
+    fn outlier_filter(&self) -> Result<Option<OutlierFilter>, ConfigError> {
+        if !self.optional_bool("config.vio_filter_outliers")? {
+            return Ok(None);
+        }
+        let threshold_px: f64 = self.value("config.vio_outlier_threshold")?;
+        if !(threshold_px.is_finite() && threshold_px > 0.0) {
+            return Err(ConfigError::Value(format!(
+                "config.vio_outlier_threshold: {threshold_px} must be positive"
+            )));
+        }
+        let max_iterations: usize = self.value("config.vio_max_iterations")?;
+        let filter_iteration: usize = self.value("config.vio_filter_iteration")?;
+        Ok(Some(OutlierFilter {
+            threshold_px,
+            min_num_obs: 4,
+            refine_iterations: max_iterations.saturating_sub(filter_iteration).max(1),
+        }))
     }
     /// An optional boolean key; absent means `false`.
     pub fn optional_bool(&self, key: &str) -> Result<bool, ConfigError> {
@@ -412,6 +438,27 @@ mod tests {
                 bad.0
             );
         }
+    }
+    #[test]
+    fn outlier_filter_key_default_off_and_parses() {
+        let pinned = BasaltConfig::from_json(FIX).unwrap();
+        assert_eq!(pinned.estimator_config().unwrap().outlier_filter, None);
+
+        let mut v: Value = serde_json::from_str(FIX).unwrap();
+        v["value0"]["config.vio_filter_outliers"] = serde_json::json!(true);
+        let c = BasaltConfig::from_json(&v.to_string()).unwrap();
+        assert_eq!(
+            c.estimator_config().unwrap().outlier_filter,
+            Some(OutlierFilter {
+                threshold_px: 3.0,
+                min_num_obs: 4,
+                refine_iterations: 3,
+            })
+        );
+
+        v["value0"]["config.vio_outlier_threshold"] = serde_json::json!(0.0);
+        let c = BasaltConfig::from_json(&v.to_string()).unwrap();
+        assert!(matches!(c.estimator_config(), Err(ConfigError::Value(_))));
     }
     #[test]
     fn lamaria_multicam_variant_parses() {

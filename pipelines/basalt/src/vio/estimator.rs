@@ -85,6 +85,25 @@ pub struct EstimatorConfig {
     /// keyframe connectivity ratio counts distinct tracks observed by any
     /// camera instead of camera-0 tracks only.
     pub kf_connectivity_all_cameras: bool,
+    /// Opt-in (not upstream; `config.vio_filter_outliers`).  The pinned
+    /// `sqrt_keypoint_vio.cpp` leaves `filterOutliers` as a TODO, so a
+    /// visual outlier stays in every later solve, bounded only by Huber.
+    /// `Some` removes, after each window solve, the observations whose
+    /// reprojection error exceeds the threshold, then re-solves.  `None`
+    /// keeps the pinned behaviour.
+    pub outlier_filter: Option<OutlierFilter>,
+}
+
+/// Post-solve visual outlier removal, after upstream's older
+/// `keypoint_vio.cpp` (`filterOutliers(vio_outlier_threshold, 4)`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutlierFilter {
+    /// Reprojection error in pixels above which an observation is removed.
+    pub threshold_px: f64,
+    /// A landmark left with fewer observations than this is removed.
+    pub min_num_obs: usize,
+    /// LM iterations of the re-solve after a removal.
+    pub refine_iterations: usize,
 }
 
 impl Default for EstimatorConfig {
@@ -101,6 +120,7 @@ impl Default for EstimatorConfig {
             initial_gyro_bias_weight: 1.0e2,
             landmarks_all_cameras: false,
             kf_connectivity_all_cameras: false,
+            outlier_filter: None,
         }
     }
 }
@@ -1120,40 +1140,42 @@ impl BasaltVioEstimator {
             let mut problem = self.build_problem();
             self.timing
                 .finish(TimingBucket::EstimatorBuildProblem, build_started);
-            let initial_state = problem.initial_state();
-            let lm_started = self.timing.start();
-            let solution_result = if retain_marg_data {
-                if self.lean_marg_data {
-                    // MargData needs the post-solve factor snapshot, not the
-                    // diagnostic LM payloads.  Use the compact f32 preparation
-                    // path (byte-identical trajectory, verified by the
-                    // retained-vs-lean regression test) instead of the
-                    // per-trial landmark re-factorization the diagnostic path
-                    // performs.
-                    problem.solve_lean_with_factors_with_timing(
-                        initial_state,
-                        self.config.solver,
-                        &mut self.timing,
-                    )
-                } else {
-                    problem.solve_with_timing(initial_state, self.config.solver, &mut self.timing)
+            let mut solution = self.solve_window(
+                &mut problem,
+                self.config.solver,
+                retain_marg_data,
+                retain_trace_payload,
+            )?;
+            if let Some(filter) = self.config.outlier_filter {
+                // Measure reprojection errors at the solution, then re-solve
+                // without the removed observations so that neither this
+                // frame's estimate nor a marginalization prior keeps them.
+                write_blocks_with_mode(
+                    &mut problem.poses,
+                    &mut problem.states,
+                    &solution.state,
+                    self.config.scalar_mode,
+                );
+                self.window_poses = problem.poses.clone();
+                self.window_states = problem.states.clone();
+                self.apply_landmark_writeback(&problem.landmarks);
+                if self.filter_outliers(filter) > 0 {
+                    let build_started = self.timing.start();
+                    problem = self.build_problem();
+                    self.timing
+                        .finish(TimingBucket::EstimatorBuildProblem, build_started);
+                    let solver = LmConfig {
+                        max_iterations: filter.refine_iterations,
+                        ..self.config.solver
+                    };
+                    solution = self.solve_window(
+                        &mut problem,
+                        solver,
+                        retain_marg_data,
+                        retain_trace_payload,
+                    )?;
                 }
-            } else if retain_trace_payload {
-                problem.solve_without_factors_with_timing(
-                    initial_state,
-                    self.config.solver,
-                    &mut self.timing,
-                )
-            } else {
-                problem.solve_without_diagnostics_with_timing(
-                    initial_state,
-                    self.config.solver,
-                    &mut self.timing,
-                )
-            };
-            self.timing
-                .finish(TimingBucket::EstimatorLmSolve, lm_started);
-            let solution = solution_result.map_err(|error| error.to_string())?;
+            }
             let WindowSolveResult {
                 state: solution_state,
                 factors: solution_factors,
@@ -2410,6 +2432,120 @@ impl BasaltVioEstimator {
                 .unwrap_or_else(|| Vector3::new(0.0, 0.0, -9.81)),
             scalar_mode: self.config.scalar_mode,
         }
+    }
+
+    /// Run the LM solve variant matching the requested outputs.
+    fn solve_window(
+        &mut self,
+        problem: &mut WindowProblem,
+        solver: LmConfig,
+        retain_marg_data: bool,
+        retain_trace_payload: bool,
+    ) -> Result<WindowSolveResult, String> {
+        let initial_state = problem.initial_state();
+        let lm_started = self.timing.start();
+        let solution_result = if retain_marg_data {
+            if self.lean_marg_data {
+                // MargData needs the post-solve factor snapshot, not the
+                // diagnostic LM payloads.  Use the compact f32 preparation
+                // path (byte-identical trajectory, verified by the
+                // retained-vs-lean regression test) instead of the
+                // per-trial landmark re-factorization the diagnostic path
+                // performs.
+                problem.solve_lean_with_factors_with_timing(initial_state, solver, &mut self.timing)
+            } else {
+                problem.solve_with_timing(initial_state, solver, &mut self.timing)
+            }
+        } else if retain_trace_payload {
+            problem.solve_without_factors_with_timing(initial_state, solver, &mut self.timing)
+        } else {
+            problem.solve_without_diagnostics_with_timing(initial_state, solver, &mut self.timing)
+        };
+        self.timing
+            .finish(TimingBucket::EstimatorLmSolve, lm_started);
+        solution_result.map_err(|error| error.to_string())
+    }
+
+    /// Remove the visual observations whose reprojection error at the
+    /// current window estimate exceeds `filter.threshold_px`, and every
+    /// landmark left with fewer than `filter.min_num_obs` observations.
+    /// A projection that fails counts as an outlier, as upstream's
+    /// `computeError` does.  The host observation is never tested.  Returns
+    /// the number of removed observations, including those of removed
+    /// landmarks.
+    fn filter_outliers(&mut self, filter: OutlierFilter) -> usize {
+        let mut removed = 0;
+        let mut removed_landmarks = Vec::new();
+        for (track_id, records) in &mut self.window_observations {
+            let Some(record) = self.landmarks.landmarks.get(track_id) else {
+                continue;
+            };
+            if record.status == LandmarkStatus::Removed {
+                continue;
+            }
+            let landmark = record.landmark;
+            let pose_of = |frame_id: u64| {
+                self.window_poses
+                    .iter()
+                    .find(|pose| pose.frame_id == frame_id)
+                    .map(|pose| &pose.pose)
+                    .or_else(|| {
+                        self.window_states
+                            .iter()
+                            .find(|state| state.frame_id == frame_id)
+                            .map(|state| &state.nav.imu_to_world)
+                    })
+            };
+            let camera_pose = |frame_id: u64, camera_id: u16| {
+                Some(pose_of(frame_id)?.compose(self.t_imu_cam.get(camera_id as usize)?))
+            };
+            let Some(anchor) = camera_pose(landmark.anchor_pose, landmark.anchor_camera_id) else {
+                continue;
+            };
+            let bearing = landmark.direction.bearing();
+            let is_inlier = |observation: &StoredObservation| {
+                if observation.frame_id == landmark.anchor_pose
+                    && observation.camera_id == landmark.anchor_camera_id
+                {
+                    return true;
+                }
+                let error = (|| {
+                    let target = camera_pose(observation.frame_id, observation.camera_id)?;
+                    let relative = target.inverse().compose(&anchor);
+                    let point = relative.rotation.transform_vector(&bearing)
+                        + relative.translation * landmark.inverse_distance;
+                    let projected = self
+                        .camera_models
+                        .get(observation.camera_id as usize)?
+                        .project(&Point3::from(point))?;
+                    Some((projected - observation.pixel).norm())
+                })();
+                error.is_some_and(|error| error <= filter.threshold_px)
+            };
+            let inliers = records
+                .iter()
+                .filter(|observation| is_inlier(observation))
+                .count();
+            if inliers == records.len() {
+                continue;
+            }
+            if inliers < filter.min_num_obs {
+                removed += records.len();
+                removed_landmarks.push(*track_id);
+            } else {
+                removed += records.len() - inliers;
+                records.retain(|observation| is_inlier(observation));
+            }
+        }
+        if !removed_landmarks.is_empty() {
+            for track_id in &removed_landmarks {
+                self.window_observations.remove(track_id);
+            }
+            self.landmarks.remove_landmarks(&removed_landmarks);
+            self.prune_landmark_world_cache();
+            self.prune_native_host_order();
+        }
+        removed
     }
 
     /// Construct the exact pre-shift problem used by the upstream
@@ -5704,6 +5840,86 @@ mod tests {
 
     fn cam() -> DoubleSphereCamera {
         DoubleSphereCamera::new(300., 300., 320., 240., 0.5, 0.7, 640, 480).unwrap()
+    }
+
+    #[test]
+    fn outlier_filter_removes_observations_and_starved_landmarks() {
+        let camera = cam();
+        let mut estimator = BasaltVioEstimator::new(camera, EstimatorConfig::default());
+        for frame_id in 1..=6_u64 {
+            let pose = SE3::new(
+                UnitQuaternion::identity(),
+                Vector3::new(0.1 * frame_id as f64, 0.0, 0.0),
+            );
+            estimator.window_poses.push(WindowPose {
+                frame_id,
+                timestamp_ns: frame_id as i64,
+                pose: pose.clone(),
+                stored_current_pose: pose.clone(),
+                linearized_pose: pose,
+                linearized_delta: DVector::zeros(POSE_DOF),
+                is_keyframe: true,
+            });
+        }
+        let point_world = Point3::new(0.4, 0.2, 4.0);
+        // Hosted in frame 1, whose camera sits at x = 0.1.
+        let point_anchor = point_world.coords - Vector3::new(0.1, 0.0, 0.0);
+        let landmark = InverseDistanceLandmark {
+            anchor_pose: 1,
+            anchor_camera_id: 0,
+            direction: StereographicDirection::from_bearing(point_anchor.normalize()).unwrap(),
+            inverse_distance: 1.0 / point_anchor.norm(),
+        };
+        let observe = |frame_id: u64, offset_px: f64| {
+            let in_camera = point_world - Vector3::new(0.1 * frame_id as f64, 0.0, 0.0);
+            let pixel = camera.project(&in_camera).unwrap();
+            StoredObservation {
+                frame_id,
+                camera_id: 0,
+                pixel: Point2::new(pixel.x + offset_px, pixel.y),
+            }
+        };
+        // Track 1: one 10 px outlier among six observations.  Track 2: one
+        // outlier among four, leaving three.  Track 3: all consistent.
+        let tracks = [
+            (
+                1_u64,
+                vec![(1, 0.0), (2, 0.0), (3, 0.0), (4, 10.0), (5, 0.0), (6, 0.0)],
+            ),
+            (2, vec![(1, 0.0), (2, 0.0), (3, 10.0), (4, 0.0)]),
+            (3, vec![(1, 0.0), (2, 0.0), (3, 0.0), (4, 2.5)]),
+        ];
+        for (track_id, observations) in &tracks {
+            estimator.landmarks.insert(*track_id, landmark);
+            estimator.window_observations.insert(
+                *track_id,
+                observations
+                    .iter()
+                    .map(|&(frame_id, offset)| observe(frame_id, offset))
+                    .collect(),
+            );
+        }
+
+        let filter = OutlierFilter {
+            threshold_px: 3.0,
+            min_num_obs: 4,
+            refine_iterations: 3,
+        };
+        assert_eq!(estimator.filter_outliers(filter), 1 + 4);
+        let frames = |track_id: u64| {
+            estimator.window_observations.get(&track_id).map(|records| {
+                records
+                    .iter()
+                    .map(|record| record.frame_id)
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(frames(1), Some(vec![1, 2, 3, 5, 6]));
+        assert_eq!(frames(2), None);
+        assert!(!estimator.landmarks.landmarks.contains_key(&2));
+        assert_eq!(frames(3), Some(vec![1, 2, 3, 4]));
+        // A second pass finds nothing left to remove.
+        assert_eq!(estimator.filter_outliers(filter), 0);
     }
 
     fn obs(

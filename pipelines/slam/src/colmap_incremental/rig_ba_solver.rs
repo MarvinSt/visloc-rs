@@ -289,6 +289,9 @@ struct Problem {
     contributions: Option<ContributionIndex>,
     /// The shared camera block, when the intrinsics are refined.
     intrinsics: Option<SharedIntrinsics>,
+    /// Free frames from which the reduced system is solved iteratively
+    /// ([`iterative_min_free_frames`]; tests lower it).
+    iterative_min_free_frames: usize,
 }
 
 /// Which points observe each free frame of the reduced camera system, in
@@ -1017,6 +1020,7 @@ fn assemble_problem(
         shard_boundaries,
         contributions,
         intrinsics: None,
+        iterative_min_free_frames: iterative_min_free_frames(),
     })
 }
 
@@ -1772,6 +1776,60 @@ fn eliminate_camera(
     (hck, hkk, bk)
 }
 
+/// The camera block's rows of the damped, Schur-reduced bordered system:
+/// `B` (per free frame), `C` and `bk`. Fixed camera parameters get an
+/// identity row and column in `C` and zero in `B` and `bk`, so their step
+/// is exactly zero.
+struct CameraBorder {
+    border: Vec<SMatrix<f64, 6, 3>>,
+    c: Matrix3<f64>,
+    g: Vector3<f64>,
+}
+
+impl CameraBorder {
+    /// `C` padded to a 6×6 block (identity in the pad): the camera's node in
+    /// the iterative solve.
+    fn c_padded(&self) -> Matrix6<f64> {
+        let mut m = Matrix6::identity();
+        m.fixed_view_mut::<3, 3>(0, 0).copy_from(&self.c);
+        m
+    }
+}
+
+fn camera_border(
+    problem: &Problem,
+    points_lin: &[PointLin],
+    cl: &CameraLin,
+    mu: f64,
+) -> CameraBorder {
+    let (hck_delta, hkk_delta, bk_delta) = eliminate_camera(problem, points_lin, mu);
+    let mut border: Vec<SMatrix<f64, 6, 3>> = cl
+        .hck
+        .iter()
+        .zip(&hck_delta)
+        .map(|(raw, d)| raw + d)
+        .collect();
+    let mut c = cl.hkk + hkk_delta;
+    let d = clamp_diag3(&cl.hkk);
+    for i in 0..3 {
+        c[(i, i)] += mu * d[i];
+    }
+    let mut g = cl.bk + bk_delta;
+    let free = problem.intrinsics.expect("camera block").free();
+    for i in (0..3).filter(|&i| !free[i]) {
+        for j in 0..3 {
+            c[(i, j)] = 0.0;
+            c[(j, i)] = 0.0;
+        }
+        c[(i, i)] = 1.0;
+        g[i] = 0.0;
+        for block in &mut border {
+            block.column_mut(i).fill(0.0);
+        }
+    }
+    CameraBorder { border, c, g }
+}
+
 /// Shard count for [`eliminate_and_accumulate`]: capped so the transient
 /// per-shard `edges_len`-sized buffers (`3 shards worth` — see its `local_*`
 /// locals — of `Matrix6` = 288 bytes each) never exceed roughly 256MB in
@@ -1872,8 +1930,12 @@ fn solve_step(
             frame_diag[a][(i, i)] += mu * d[i];
         }
     }
+    // With the camera block, the system is bordered:
+    //   [A  B] [dx]   [b ]
+    //   [Bᵀ C] [dk] = [bk]
+    let border = camera_lin.map(|cl| camera_border(problem, points_lin, cl, mu));
 
-    if n_free >= iterative_min_free_frames() && order.is_none() {
+    if n_free >= problem.iterative_min_free_frames && order.is_none() {
         // Iterative solve straight from the edge list: each off-diagonal
         // block is read once per product, contributing to both of its
         // rows (`y_b += A x_a`, `y_a += Aᵀ x_b`). The product is limited by
@@ -1912,19 +1974,55 @@ fn solve_step(
                 })
                 .collect()
         };
-        let mut rhs = DMatrix::<f64>::zeros(n_free * 6, 1);
+        // The camera block joins as one more node, padded to 6 (identity in
+        // the pad): the bordered system stays SPD, the product adds the
+        // border's rank-3 coupling, and the preconditioner inverts the
+        // camera's own block.
+        let n_nodes = n_free + usize::from(border.is_some());
+        let matvec_bordered = |x: &[Vector6<f64>]| -> Vec<Vector6<f64>> {
+            let mut y = matvec(&x[..n_free]);
+            if let Some(b) = &border {
+                let dk: Vector3<f64> = x[n_free].fixed_rows::<3>(0).into_owned();
+                let mut cam = b.c_padded() * x[n_free];
+                let mut coupling = Vector3::zeros();
+                for (a, block) in b.border.iter().enumerate() {
+                    y[a] += block * dk;
+                    coupling += block.transpose() * x[a];
+                }
+                for i in 0..3 {
+                    cam[i] += coupling[i];
+                }
+                y.push(cam);
+            }
+            y
+        };
+        let mut rhs = DMatrix::<f64>::zeros(n_nodes * 6, 1);
         for a in 0..n_free {
             for i in 0..6 {
                 rhs[(a * 6 + i, 0)] = frame_bc[a][i];
             }
         }
+        let mut diag = frame_diag.clone();
+        if let Some(b) = &border {
+            for i in 0..3 {
+                rhs[(n_free * 6 + i, 0)] = b.g[i];
+            }
+            diag.push(b.c_padded());
+        }
         timings.assemble += t.elapsed();
         let t = Instant::now();
         let clusters = pcg_cluster_size()
-            .and_then(|k| cluster_preconditioner(&frame_diag, edges, &flat_offdiag, k));
+            .and_then(|k| cluster_preconditioner(&frame_diag, edges, &flat_offdiag, k))
+            .and_then(|mut clusters| {
+                if let Some(b) = &border {
+                    let inv = b.c_padded().try_inverse()?;
+                    clusters.push((n_free, DMatrix::from_column_slice(6, 6, inv.as_slice())));
+                }
+                Some(clusters)
+            });
         let (solved, iterations) = pcg_core(
-            &frame_diag,
-            matvec,
+            &diag,
+            matvec_bordered,
             &rhs,
             pcg_relative_tolerance(),
             clusters.as_deref(),
@@ -1936,17 +2034,21 @@ fn solve_step(
                 dx_frames[a][i] = solved[(a * 6 + i, 0)];
             }
         }
+        let dk = border.as_ref().map(|_| {
+            Vector3::new(
+                solved[(n_free * 6, 0)],
+                solved[(n_free * 6 + 1, 0)],
+                solved[(n_free * 6 + 2, 0)],
+            )
+        });
         timings.linsolve += t.elapsed();
-        // The camera block is never refined on this path (see
-        // `optimize_point_major`).
-        debug_assert!(camera_lin.is_none());
         return Some(back_substitute(
             problem,
             points_lin,
             frame_diag_raw,
             frame_bc_raw,
             dx_frames,
-            None,
+            camera_lin.zip(dk),
             mu,
             timings,
         ));
@@ -1970,35 +2072,17 @@ fn solve_step(
             columns[pb].insert(pa, val.transpose());
         }
     }
-    // With the camera block, the system is bordered:
-    //   [A  B] [dx]   [b ]
-    //   [Bᵀ C] [dk] = [bk]
     // A (the pose system above) is factored once against [b | B], giving
     // y = A⁻¹b and Z = A⁻¹B; then (C − BᵀZ) dk = bk − Bᵀy and dx = y − Z dk.
-    let camera_terms = camera_lin.map(|cl| {
-        let (hck_delta, hkk_delta, bk_delta) = eliminate_camera(problem, points_lin, mu);
-        let border: Vec<SMatrix<f64, 6, 3>> = cl
-            .hck
-            .iter()
-            .zip(&hck_delta)
-            .map(|(raw, d)| raw + d)
-            .collect();
-        let mut c = cl.hkk + hkk_delta;
-        let d = clamp_diag3(&cl.hkk);
-        for i in 0..3 {
-            c[(i, i)] += mu * d[i];
-        }
-        (border, c, cl.bk + bk_delta)
-    });
-    let n_rhs = if camera_terms.is_some() { 4 } else { 1 };
+    let n_rhs = if border.is_some() { 4 } else { 1 };
     let mut rhs = DMatrix::<f64>::zeros(n_free * 6, n_rhs);
     for a in 0..n_free {
         for i in 0..6 {
             rhs[(pos(a) * 6 + i, 0)] = frame_bc[a][i];
         }
     }
-    if let Some((border, _, _)) = &camera_terms {
-        for (a, block) in border.iter().enumerate() {
+    if let Some(b) = &border {
+        for (a, block) in b.border.iter().enumerate() {
             for col in 0..3 {
                 for i in 0..6 {
                     rhs[(pos(a) * 6 + i, 1 + col)] = block[(i, col)];
@@ -2009,8 +2093,8 @@ fn solve_step(
     timings.assemble += t.elapsed();
 
     let t = Instant::now();
-    let solved = if n_free >= iterative_min_free_frames() {
-        debug_assert!(camera_terms.is_none());
+    let solved = if n_free >= problem.iterative_min_free_frames {
+        debug_assert!(border.is_none());
         pcg_blocks6(&columns, &rhs, pcg_relative_tolerance())?
     } else {
         solve_spd_blocks6_cached(cache, columns, &rhs).ok()?
@@ -2022,24 +2106,14 @@ fn solve_step(
         }
     }
     let mut dk = None;
-    if let (Some((border, c, bk)), Some(cl)) = (&camera_terms, camera_lin) {
+    if let (Some(b), Some(cl)) = (&border, camera_lin) {
         let z_of =
             |a: usize| SMatrix::<f64, 6, 3>::from_fn(|i, col| solved[(pos(a) * 6 + i, 1 + col)]);
-        let mut schur = *c;
-        let mut g = *bk;
-        for (a, block) in border.iter().enumerate() {
+        let mut schur = b.c;
+        let mut g = b.g;
+        for (a, block) in b.border.iter().enumerate() {
             schur -= block.transpose() * z_of(a);
             g -= block.transpose() * dx_frames[a];
-        }
-        // Fixed camera parameters keep a zero step.
-        let free = problem.intrinsics.expect("camera block").free();
-        for i in (0..3).filter(|&i| !free[i]) {
-            for j in 0..3 {
-                schur[(i, j)] = 0.0;
-                schur[(j, i)] = 0.0;
-            }
-            schur[(i, i)] = 1.0;
-            g[i] = 0.0;
         }
         let step = schur.try_inverse()? * g;
         if !step.iter().all(|v| v.is_finite()) {
@@ -2367,9 +2441,7 @@ pub(crate) fn optimize_rig_input(
 /// image-ordered [`RigObs`] list and its regrouping.
 ///
 /// `intrinsics`, when given, is the one camera of every observation, refined
-/// in place (see [`SharedIntrinsics`]). Solves on the iterative (PCG) path,
-/// from [`ITERATIVE_MIN_FREE_FRAMES`] free frames, keep it fixed: the
-/// bordered solve needs the factored pose system.
+/// in place (see [`SharedIntrinsics`]).
 pub(crate) fn optimize_point_major(
     input: &mut RigBaInput,
     point_major: PointMajorObs,
@@ -2380,16 +2452,6 @@ pub(crate) fn optimize_point_major(
 ) -> Result<BaResult, BaError> {
     let t_build = Instant::now();
     let mut problem = assemble_problem(input, point_major, 0.0)?;
-    let intrinsics = intrinsics.filter(|_| {
-        let direct = problem.n_free_frames < iterative_min_free_frames();
-        if !direct {
-            eprintln!(
-                "BA_INTRINSICS fixed: {} free frames take the iterative solve",
-                problem.n_free_frames
-            );
-        }
-        direct
-    });
     problem.intrinsics = intrinsics.as_deref().copied();
     let result = optimize_problem(
         input,
@@ -2429,7 +2491,7 @@ fn optimize_problem(
         (0.5 * full, pl, fd, fb, cl)
     };
     let initial_cost = 2.0 * half_cost;
-    if problem.n_free_frames >= iterative_min_free_frames()
+    if problem.n_free_frames >= problem.iterative_min_free_frames
         || std::env::var_os("VISLOC_BA_MEMORY").is_some()
     {
         log_memory(problem, rig_obs_bytes, &points_lin);
@@ -2441,25 +2503,25 @@ fn optimize_problem(
     // Fill-reducing block order of the reduced camera system (its pattern,
     // `problem.edges`, is fixed for this solve). Natural order otherwise.
     let order: Option<Vec<u32>> = (problem.n_free_frames >= REORDER_MIN_FREE_FRAMES
-        && problem.n_free_frames < iterative_min_free_frames())
-    .then(|| {
-        let t = Instant::now();
-        let mut adjacency = vec![Vec::new(); problem.n_free_frames];
-        for &(a, b) in &problem.edges {
-            adjacency[a as usize].push(b as usize);
-            adjacency[b as usize].push(a as usize);
-        }
-        for neighbours in adjacency.iter_mut() {
-            neighbours.sort_unstable();
-        }
-        let elimination = crate::reordering::fast_fill_reducing_block_order(&adjacency);
-        let mut pos = vec![0u32; problem.n_free_frames];
-        for (k, &block) in elimination.iter().enumerate() {
-            pos[block] = k as u32;
-        }
-        timings.reorder += t.elapsed();
-        pos
-    });
+        && problem.n_free_frames < problem.iterative_min_free_frames)
+        .then(|| {
+            let t = Instant::now();
+            let mut adjacency = vec![Vec::new(); problem.n_free_frames];
+            for &(a, b) in &problem.edges {
+                adjacency[a as usize].push(b as usize);
+                adjacency[b as usize].push(a as usize);
+            }
+            for neighbours in adjacency.iter_mut() {
+                neighbours.sort_unstable();
+            }
+            let elimination = crate::reordering::fast_fill_reducing_block_order(&adjacency);
+            let mut pos = vec![0u32; problem.n_free_frames];
+            for (k, &block) in elimination.iter().enumerate() {
+                pos[block] = k as u32;
+            }
+            timings.reorder += t.elapsed();
+            pos
+        });
     let mut iterations: Vec<BaIterationStats> = Vec::new();
     let mut trace_lines: Vec<String> = Vec::new();
     let mut converged = false;
@@ -3549,6 +3611,39 @@ mod tests {
         for (got, want) in input.points.iter().zip(&points) {
             assert!((got - want).norm() < 1e-6);
         }
+    }
+
+    #[test]
+    fn camera_block_recovers_intrinsics_on_the_iterative_path() {
+        let truth = [500.0, 500.0, 322.0, 238.0];
+        let (mut input, point_major, _) = intrinsics_scene(truth);
+        let mut problem = assemble_problem(&input, point_major, 0.0).expect("problem");
+        // Every solve takes the edge-list PCG, the camera as its extra node.
+        problem.iterative_min_free_frames = 1;
+        problem.intrinsics = Some(SharedIntrinsics {
+            params: [510.0, 510.0, 315.0, 245.0],
+            refine_focal_length: true,
+            refine_principal_point: true,
+        });
+        let result = optimize_problem(
+            &mut input,
+            &mut problem,
+            Instant::now(),
+            0,
+            100,
+            LossFunction::Trivial,
+            None,
+        )
+        .expect("solve");
+        let camera = problem.intrinsics.expect("camera");
+        for (got, want) in camera.params.iter().zip(truth) {
+            assert!(
+                (got - want).abs() < 1e-3,
+                "{:?} vs {truth:?}",
+                camera.params
+            );
+        }
+        assert!(result.final_cost < 1e-8, "cost {}", result.final_cost);
     }
 
     #[test]

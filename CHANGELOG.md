@@ -234,6 +234,19 @@ All notable changes to `visloc-rs` will be documented here.
   matching takes 2-3.5x longer (facade 317 s -> 1100 s). `--max-keypoints
   4000` restores the old cap.
 
+- **CPU descriptor matching runs on a 16-bit integer kernel for byte
+  descriptors, about 2x faster.** `BruteForceMatcher::
+  match_descriptors_cross_checked` (the CPU matcher of `gsplat_photos` and
+  `gsplat_euroc`) computed every dot product with an f32 matrix product,
+  stored the `n x m` result and scanned it for the top two in both
+  directions. Descriptors that are bytes over a power-of-two scale
+  (`gsplat_photos` keeps COLMAP's bytes / 512) now go through an AVX2
+  `pmaddwd` kernel on 4 x 16 tiles with the top-2 scan fused in. Such dot
+  products are exact in both f32 and integers, and rows are visited in the
+  same order, so the matches are bit-identical; other descriptors keep the
+  f32 path. 11,000 x 11,000 descriptors: 1.06 s -> 0.50 s a pair on one
+  core (`match_bench` example).
+
 - **COLMAP-port BA builds its problem point by point.** The native solve
   used to list every observation image by image (with a camera id each),
   copy that list twice, and have the solver regroup it by point with a

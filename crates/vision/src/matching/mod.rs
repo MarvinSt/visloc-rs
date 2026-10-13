@@ -1,5 +1,6 @@
 pub mod ivf;
 pub mod mutual_softmax;
+mod quantized;
 
 pub use ivf::{IvfConfig, IvfMatcher};
 pub use mutual_softmax::{MutualSoftmaxConfig, MutualSoftmaxMatcher};
@@ -127,9 +128,6 @@ impl BruteForceMatcher {
                 .collect();
         }
 
-        let q = nalgebra::DMatrix::from_fn(n_query, dim, |i, k| query[i][k]);
-        let t = nalgebra::DMatrix::from_fn(n_train, dim, |j, k| train[j][k]);
-        let dots = q * t.transpose();
         let query_norm_sq: Vec<f32> = query
             .iter()
             .map(|descriptor| descriptor.iter().map(|value| value * value).sum())
@@ -139,44 +137,19 @@ impl BruteForceMatcher {
             .map(|descriptor| descriptor.iter().map(|value| value * value).sum())
             .collect();
 
-        // nalgebra matrices are column-major. Walk every dot product once in
-        // its contiguous order and update both directional top-2 states. The
-        // query index still increases within each train column, and each
-        // query observes train indices in increasing outer-loop order, so the
-        // original strict-`<` first-wins tie behavior is preserved.
-        let mut forward_best = vec![None; n_query];
-        let mut forward_second = vec![None; n_query];
-        let mut reverse_best = vec![None; n_train];
-        let mut reverse_second = vec![None; n_train];
-        for train_index in 0..n_train {
-            for query_index in 0..n_query {
-                let dot = dots[(query_index, train_index)];
-                let reverse_score = query_norm_sq[query_index] - 2.0 * dot;
-                if reverse_best[train_index]
-                    .is_none_or(|(_, best_score)| reverse_score < best_score)
-                {
-                    reverse_second[train_index] =
-                        reverse_best[train_index].map(|(_, best_score)| best_score);
-                    reverse_best[train_index] = Some((query_index, reverse_score));
-                } else if reverse_second[train_index]
-                    .is_none_or(|second_score| reverse_score < second_score)
-                {
-                    reverse_second[train_index] = Some(reverse_score);
-                }
-
-                let forward_score = train_norm_sq[train_index] - 2.0 * dot;
-                if forward_best[query_index]
-                    .is_none_or(|(_, best_score)| forward_score < best_score)
-                {
-                    forward_second[query_index] = forward_best[query_index];
-                    forward_best[query_index] = Some((train_index, forward_score));
-                } else if forward_second[query_index]
-                    .is_none_or(|(_, second_score)| forward_score < second_score)
-                {
-                    forward_second[query_index] = Some((train_index, forward_score));
-                }
+        // Byte-quantized descriptors take the integer kernel, which finds the
+        // same scores (see `quantized`).
+        let Top2 {
+            forward_best,
+            forward_second,
+            reverse_best,
+            reverse_second,
+        } = match quantized::byte_scale(query, train, dim) {
+            Some(scale) => {
+                quantized::top2(query, train, dim, scale, &query_norm_sq, &train_norm_sq)
             }
-        }
+            None => Self::top2_f32(query, train, dim, &query_norm_sq, &train_norm_sq),
+        };
 
         let mut reverse_best_query_by_train = vec![None; n_train];
         for train_index in 0..n_train {
@@ -226,6 +199,76 @@ impl BruteForceMatcher {
         }
         matches
     }
+
+    /// Top-2 scores in both directions from one f32 matrix product.
+    fn top2_f32(
+        query: &[Vec<f32>],
+        train: &[Vec<f32>],
+        dim: usize,
+        query_norm_sq: &[f32],
+        train_norm_sq: &[f32],
+    ) -> Top2 {
+        let (n_query, n_train) = (query.len(), train.len());
+        let q = nalgebra::DMatrix::from_fn(n_query, dim, |i, k| query[i][k]);
+        let t = nalgebra::DMatrix::from_fn(n_train, dim, |j, k| train[j][k]);
+        let dots = q * t.transpose();
+
+        // nalgebra matrices are column-major. Walk every dot product once in
+        // its contiguous order and update both directional top-2 states. The
+        // query index still increases within each train column, and each
+        // query observes train indices in increasing outer-loop order, so the
+        // original strict-`<` first-wins tie behavior is preserved.
+        let mut forward_best = vec![None; n_query];
+        let mut forward_second = vec![None; n_query];
+        let mut reverse_best = vec![None; n_train];
+        let mut reverse_second = vec![None; n_train];
+        for train_index in 0..n_train {
+            for query_index in 0..n_query {
+                let dot = dots[(query_index, train_index)];
+                let reverse_score = query_norm_sq[query_index] - 2.0 * dot;
+                if reverse_best[train_index]
+                    .is_none_or(|(_, best_score)| reverse_score < best_score)
+                {
+                    reverse_second[train_index] =
+                        reverse_best[train_index].map(|(_, best_score)| best_score);
+                    reverse_best[train_index] = Some((query_index, reverse_score));
+                } else if reverse_second[train_index]
+                    .is_none_or(|second_score| reverse_score < second_score)
+                {
+                    reverse_second[train_index] = Some(reverse_score);
+                }
+
+                let forward_score = train_norm_sq[train_index] - 2.0 * dot;
+                if forward_best[query_index]
+                    .is_none_or(|(_, best_score)| forward_score < best_score)
+                {
+                    forward_second[query_index] = forward_best[query_index];
+                    forward_best[query_index] = Some((train_index, forward_score));
+                } else if forward_second[query_index]
+                    .is_none_or(|(_, second_score)| forward_score < second_score)
+                {
+                    forward_second[query_index] = Some((train_index, forward_score));
+                }
+            }
+        }
+        Top2 {
+            forward_best,
+            forward_second,
+            reverse_best,
+            reverse_second,
+        }
+    }
+}
+
+/// Best `(index, score)` and second-best score per row in both directions,
+/// as [`BruteForceMatcher::match_descriptors_cross_checked`] tracks them
+/// (forward: per query row, reverse: per train row).
+#[derive(Debug, PartialEq)]
+struct Top2 {
+    forward_best: Vec<Option<(usize, f32)>>,
+    forward_second: Vec<Option<(usize, f32)>>,
+    reverse_best: Vec<Option<(usize, f32)>>,
+    reverse_second: Vec<Option<f32>>,
 }
 
 impl Matcher for BruteForceMatcher {

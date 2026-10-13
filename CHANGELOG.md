@@ -274,6 +274,32 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **COLMAP-port BA: cheaper gradient stop and PCG product.**
+  - **Gradient stop.** After an accepted step, nearly every solve stops
+    on the gradient tolerance at the top of the next iteration. That
+    check reads only `Jᵀr`, but it used to come after a full
+    re-linearization. A gradient-only pass now decides it first. It
+    runs the same code, so the sums and their order are the same. The
+    `JᵀJ` blocks are built only when the solve goes on, and not at all
+    after the last iteration. Results are bit-identical: ETH3D outputs
+    match on all 13 scenes, and the mapper is about 6% faster there
+    (37.5 s → 35.3 s). `BA_PHASES` reports the passes as `gradient_ms`.
+  - **PCG product.** The edge-list PCG of large global BAs (1,000+
+    free frames) computes each off-diagonal block's two products
+    (`B x_a` and `Bᵀ x_b`) in one fused pass over the block. It no
+    longer converts every block to an f64 matrix first. Each iteration
+    is about 25% faster on the 4-thread `large_global_ba` bench.
+  - **SmallCity measurement** (#276–#278, before and after on one pod):
+    - Mapper time 27:53 → 27:01. Per step, elimination is 3.8× and
+      linearization 1.9× faster.
+    - The rounding changes moved the reconstruction to a different
+      path. One 2,374-frame global BA then ran 25 LM steps instead of
+      one, and PCG iterations doubled, eating most of the gain.
+    - The median camera-centre error went from 0.640 m to 0.210 m
+      (p90 2.19 m → 0.75 m). The previous binary reproduced 0.640 m
+      exactly, so the mapper is deterministic and the change comes from
+      the code. A single run cannot say whether the gain is systematic.
+
 - **COLMAP-port mapper: fewer allocations and cheaper scoring.** All
   three changes are bit-identical; ETH3D outputs match the previous
   version on all 13 scenes.

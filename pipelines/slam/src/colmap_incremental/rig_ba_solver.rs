@@ -747,6 +747,30 @@ fn cluster_preconditioner(
         .collect()
 }
 
+/// One off-diagonal block's share of the PCG product: `(Bᵀ x_b, B x_a)`
+/// for the column-major (row b, column a) block `B`, read once, in f64
+/// whatever the block's storage type.
+#[inline(always)]
+fn edge_product<T: Copy + Into<f64>>(
+    blk: &[T],
+    xa: &Vector6<f64>,
+    xb: &Vector6<f64>,
+) -> (Vector6<f64>, Vector6<f64>) {
+    let mut to_a = [0.0f64; 6];
+    let mut to_b = [0.0f64; 6];
+    for (c, column) in blk.chunks_exact(6).enumerate() {
+        let xac = xa[c];
+        let mut dot = 0.0f64;
+        for r in 0..6 {
+            let v: f64 = column[r].into();
+            to_b[r] = v.mul_add(xac, to_b[r]);
+            dot = v.mul_add(xb[r], dot);
+        }
+        to_a[c] = dot;
+    }
+    (Vector6::from(to_a), Vector6::from(to_b))
+}
+
 /// Iteration cap of [`pcg_blocks6`] (Ceres' `max_linear_solver_iterations`).
 const PCG_MAX_ITERATIONS: usize = 500;
 
@@ -1416,6 +1440,7 @@ fn linearize_point(
     (extras, n_frames): (&ExtraBlocks, u32),
     frame_blocks: &mut [f64],
     hcp: &mut [SMatrix<f64, 6, 3>],
+    full: bool,
 ) -> (f64, PointLin, Vec<(u32, Matrix6<f64>)>) {
     frame_blocks.fill(0.0);
     hcp.fill(SMatrix::<f64, 6, 3>::zeros());
@@ -1485,7 +1510,9 @@ fn linearize_point(
         };
         cost += rho0;
         if point_free {
-            hpp += j_point.transpose() * j_point;
+            if full {
+                hpp += j_point.transpose() * j_point;
+            }
             bp += -(j_point.transpose() * r);
         }
         // The observation's nodes in `target_frames` (fixed frames have
@@ -1499,10 +1526,13 @@ fn linearize_point(
             let block = &mut frame_blocks[slot * FRAME_BLOCK..(slot + 1) * FRAME_BLOCK];
             let (diag, bc) = block.split_at_mut(36);
             let g = -(j.transpose() * r);
-            let jtj = j.transpose() * j;
             for (acc, v) in bc.iter_mut().zip(g.as_slice()) {
                 *acc += v;
             }
+            if !full {
+                continue;
+            }
+            let jtj = j.transpose() * j;
             for (acc, v) in diag.iter_mut().zip(jtj.as_slice()) {
                 *acc += v;
             }
@@ -1511,7 +1541,7 @@ fn linearize_point(
             }
             touched[t] = Some((slot, j));
         }
-        if has_extras {
+        if has_extras && full {
             let touched: Vec<(usize, SMatrix<f64, 2, 6>)> = touched.into_iter().flatten().collect();
             for (i, &(a, ja)) in touched.iter().enumerate() {
                 for &(b, jb) in &touched[i + 1..] {
@@ -1559,6 +1589,7 @@ fn linearize(
     problem: &Problem,
     loss: LossFunction,
     mut hcp: Vec<SMatrix<f64, 6, 3>>,
+    full: bool,
 ) -> (
     f64,
     Linearization,
@@ -1592,12 +1623,19 @@ fn linearize(
             bounds.push(n_points);
         }
     }
-    // `hcp` (the previous linearization's array, reused) split by shard.
-    hcp.resize(problem.hcp_off[n_points], SMatrix::<f64, 6, 3>::zeros());
+    // `hcp` (the previous linearization's array, reused) split by shard;
+    // a gradient-only pass leaves it alone.
+    if full {
+        hcp.resize(problem.hcp_off[n_points], SMatrix::<f64, 6, 3>::zeros());
+    }
     let mut hcp_shards = Vec::with_capacity(n_shards);
     let mut rest = hcp.as_mut_slice();
     for shard in 0..n_shards {
-        let len = problem.hcp_off[bounds[shard + 1]] - problem.hcp_off[bounds[shard]];
+        let len = if full {
+            problem.hcp_off[bounds[shard + 1]] - problem.hcp_off[bounds[shard]]
+        } else {
+            0
+        };
         let (head, tail) = rest.split_at_mut(len);
         hcp_shards.push(head);
         rest = tail;
@@ -1634,12 +1672,19 @@ fn linearize(
                     loss,
                     (&problem.extras, problem.n_frames as u32),
                     &mut frame_blocks,
-                    &mut shard_hcp
-                        [problem.hcp_off[p] - shard_start..problem.hcp_off[p + 1] - shard_start],
+                    if full {
+                        &mut shard_hcp
+                            [problem.hcp_off[p] - shard_start..problem.hcp_off[p + 1] - shard_start]
+                    } else {
+                        &mut []
+                    },
+                    full,
                 );
                 for (&f, block) in frames.iter().zip(frame_blocks.chunks_exact(FRAME_BLOCK)) {
                     let slot = problem.free_frame_slot[f as usize].expect("free") as usize;
-                    diag[slot] += Matrix6::from_column_slice(&block[..36]);
+                    if full {
+                        diag[slot] += Matrix6::from_column_slice(&block[..36]);
+                    }
                     bc[slot] += Vector6::from_column_slice(&block[36..]);
                 }
                 cost += point_cost;
@@ -1723,6 +1768,8 @@ fn damped_hpp_inverse(hpp: &Matrix3<f64>, mu: f64) -> Option<Matrix3<f64>> {
 #[derive(Default, Debug, Clone, Copy)]
 struct PhaseTimings {
     linearize: Duration,
+    /// Gradient-only passes deciding the gradient stop ([`linearize`]).
+    gradient: Duration,
     eliminate: Duration,
     assemble: Duration,
     linsolve: Duration,
@@ -2102,12 +2149,12 @@ fn solve_step(
                     let mut y = vec![Vector6::zeros(); n_free];
                     for e in bounds[c]..bounds[c + 1] {
                         let (a, b) = (edges[e].0 as usize, edges[e].1 as usize);
-                        let blk = match &blocks32 {
-                            Some(blocks) => blocks[e].cast::<f64>(),
-                            None => flat_offdiag[e],
+                        let (ya, yb) = match &blocks32 {
+                            Some(blocks) => edge_product(blocks[e].as_slice(), &x[a], &x[b]),
+                            None => edge_product(flat_offdiag[e].as_slice(), &x[a], &x[b]),
                         };
-                        y[b] += blk * x[a];
-                        y[a] += blk.tr_mul(&x[b]);
+                        y[a] += ya;
+                        y[b] += yb;
                     }
                     y
                 })
@@ -2347,6 +2394,17 @@ fn apply_step(
     (poses, points, extras)
 }
 
+/// The LM loop's gradient stop, once the initial gradient is known:
+/// `grad_norm` at or below the absolute [`GRADIENT_TOLERANCE`], or below
+/// `rel` times the initial gradient.
+fn gradient_converged(grad_norm: f64, rel: Option<f64>, initial: Option<f64>) -> bool {
+    match (rel, initial) {
+        (None, _) => grad_norm <= GRADIENT_TOLERANCE,
+        (Some(rel), Some(g0)) => grad_norm <= rel * g0,
+        (Some(_), None) => false,
+    }
+}
+
 fn gradient_inf_norm(points_lin: &[PointLin], frame_bc_raw: &[Vector6<f64>]) -> f64 {
     let mut m: f64 = 0.0;
     for v in frame_bc_raw {
@@ -2528,7 +2586,7 @@ fn optimize_problem(
 
     let (mut half_cost, mut lin, mut frame_diag_raw, mut frame_bc_raw, mut offdiag_raw) = {
         let t = Instant::now();
-        let (full, pl, fd, fb, cl) = linearize(problem, loss, Vec::new());
+        let (full, pl, fd, fb, cl) = linearize(problem, loss, Vec::new(), true);
         timings.linearize += t.elapsed();
         timings.linearize_calls += 1;
         (0.5 * full, pl, fd, fb, cl)
@@ -2689,8 +2747,30 @@ fn optimize_problem(
                 converged = true;
                 break;
             }
+            // Nearly every solve then stops on the gradient tolerance at the
+            // top of the next iteration, which reads only `Jᵀr`. A
+            // gradient-only pass (the same sums, in the same order, as a
+            // full linearization) decides that first; the `JᵀJ` blocks are
+            // built only when the solve goes on. The last iteration needs
+            // neither.
             let t = Instant::now();
-            let (full, pl, fd, fb, cl) = linearize(problem, loss, std::mem::take(&mut lin.hcp));
+            let (g_full, g_lin, _, g_bc, _) = linearize(problem, loss, Vec::new(), false);
+            timings.gradient += t.elapsed();
+            let last = it + 1 == max_num_iterations;
+            if last
+                || gradient_converged(
+                    gradient_inf_norm(&g_lin.points, &g_bc),
+                    gradient_tolerance_rel,
+                    initial_grad_norm,
+                )
+            {
+                half_cost = 0.5 * g_full;
+                converged = !last;
+                break;
+            }
+            let t = Instant::now();
+            let (full, pl, fd, fb, cl) =
+                linearize(problem, loss, std::mem::take(&mut lin.hcp), true);
             timings.linearize += t.elapsed();
             timings.linearize_calls += 1;
             half_cost = 0.5 * full;
@@ -2708,7 +2788,7 @@ fn optimize_problem(
     input.points = problem.points.clone();
 
     eprintln!(
-        "BA_PHASES trials={} linearize_calls={} n_free_frames={} n_points={} edges={} shards={} linearize_ms={:.1} eliminate_ms={:.1} assemble_ms={:.1} linsolve_ms={:.1} backsub_ms={:.1} evaluate_cost_ms={:.1} build_ms={build_ms:.1} apply_ms={apply_ms:.1} reorder_ms={:.1} pcg_iterations={}",
+        "BA_PHASES trials={} linearize_calls={} n_free_frames={} n_points={} edges={} shards={} linearize_ms={:.1} eliminate_ms={:.1} assemble_ms={:.1} linsolve_ms={:.1} backsub_ms={:.1} evaluate_cost_ms={:.1} build_ms={build_ms:.1} apply_ms={apply_ms:.1} reorder_ms={:.1} pcg_iterations={} gradient_ms={:.1}",
         timings.trials,
         timings.linearize_calls,
         problem.n_free_frames,
@@ -2723,6 +2803,7 @@ fn optimize_problem(
         timings.evaluate_cost.as_secs_f64() * 1e3,
         timings.reorder.as_secs_f64() * 1e3,
         timings.pcg_iterations,
+        timings.gradient.as_secs_f64() * 1e3,
     );
     if iterations.len() >= 30 {
         for line in &trace_lines {
@@ -3614,6 +3695,22 @@ mod tests {
         )
     }
 
+    /// The fused PCG edge product is `(Bᵀ x_b, B x_a)`, for f64 and f32
+    /// blocks alike.
+    #[test]
+    fn edge_product_matches_the_matrix_products() {
+        let blk = Matrix6::<f64>::from_fn(|r, c| (r * 7 + c * 3) as f64 * 0.125 - 1.5);
+        let xa = Vector6::new(0.5, -1.0, 2.0, 0.25, -0.75, 1.5);
+        let xb = Vector6::new(-2.0, 1.0, 0.5, 3.0, -0.5, 0.125);
+        let (to_a, to_b) = edge_product(blk.as_slice(), &xa, &xb);
+        assert!((to_a - blk.tr_mul(&xb)).amax() < 1e-12);
+        assert!((to_b - blk * xa).amax() < 1e-12);
+        let blk32 = blk.cast::<f32>();
+        let (to_a, to_b) = edge_product(blk32.as_slice(), &xa, &xb);
+        assert!((to_a - blk.tr_mul(&xb)).amax() < 1e-12);
+        assert!((to_b - blk * xa).amax() < 1e-12);
+    }
+
     /// The per-output elimination (iterative path, tight memory) and the
     /// sharded per-point loop add the same terms in the same order.
     #[test]
@@ -3630,7 +3727,7 @@ mod tests {
             problem.n_free_frames,
             &problem.shard_boundaries,
         );
-        let (_, lin, _, _, _) = linearize(&problem, LossFunction::Trivial, Vec::new());
+        let (_, lin, _, _, _) = linearize(&problem, LossFunction::Trivial, Vec::new(), true);
         problem.contributions = None;
         let sharded = eliminate_and_accumulate(&problem, &lin, problem.edges.len(), 1e-3);
         problem.contributions = Some(index);
@@ -4013,11 +4110,21 @@ mod iterative_bench {
     /// frames, one in twenty 40-120), noisy observations and a perturbed
     /// start. Prints the solver's `BA_PHASES` line.
     ///
-    /// `VISLOC_BENCH_FRAMES=1200 cargo test --release -p visloc-slam --lib \
-    ///     large_global_ba -- --ignored --nocapture`
+    /// `VISLOC_BENCH_FRAMES=1200 [VISLOC_BENCH_PASSES=4] cargo test --release \
+    ///     -p visloc-slam --lib large_global_ba -- --ignored --nocapture`
     /// The scene of [`large_global_ba`]: `n` frames, about 2,500
     /// observations each.
     fn street_scene(n: usize) -> (RigBaInput, PointMajorObs) {
+        street_scene_passes(n, 1)
+    }
+
+    /// [`street_scene`] driven `passes` times down the same street (`n`
+    /// frames in all, capture order pass by pass, each pass a little to the
+    /// side), as SmallCity's four loops: a point seen in one pass is seen by
+    /// the same stretch of each other pass with probability 0.7, so frames
+    /// far apart in capture order share many points.
+    fn street_scene_passes(n: usize, passes: usize) -> (RigBaInput, PointMajorObs) {
+        let per_pass = n / passes;
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut random = move || {
             state ^= state << 13;
@@ -4028,9 +4135,11 @@ mod iterative_bench {
         let (f, c) = (600.0, (320.0, 240.0));
         let poses: Vec<SE3> = (0..n)
             .map(|i| {
-                let yaw = 0.05 * (i as f64 * 0.01).sin();
+                let (pass, s) = (i / per_pass, (i % per_pass) as f64);
+                let yaw = 0.05 * (s * 0.01).sin() + 0.02 * pass as f64;
                 let rotation = UnitQuaternion::from_euler_angles(0.0, yaw, 0.0);
-                let centre = Vector3::new(i as f64 * 0.1, 0.05 * (i as f64 * 0.03).cos(), 0.0);
+                let centre =
+                    Vector3::new(s * 0.1, 0.05 * (s * 0.03).cos() + 0.3 * pass as f64, 0.0);
                 SE3::new(rotation, -(rotation * centre))
             })
             .collect();
@@ -4043,9 +4152,18 @@ mod iterative_bench {
             } else {
                 3 + (random() * random() * 13.0) as usize
             };
-            let first = (random() * n.saturating_sub(track) as f64) as usize;
-            let frames = first..(first + track).min(n);
-            let mid = (frames.start + frames.end) as f64 * 0.05;
+            let first = (random() * per_pass.saturating_sub(track) as f64) as usize;
+            let stretch = first..(first + track).min(per_pass);
+            let mid = (stretch.start + stretch.end) as f64 * 0.05;
+            let seen_pass = if passes > 1 {
+                (random() * passes as f64) as usize
+            } else {
+                0
+            };
+            let frames: Vec<usize> = (0..passes)
+                .filter(|&p| passes == 1 || p == seen_pass || random() < 0.7)
+                .flat_map(|p| stretch.clone().map(move |s| p * per_pass + s))
+                .collect();
             let point = Point3::new(
                 mid + (random() - 0.5) * 2.0,
                 (random() - 0.5) * 4.0,
@@ -4105,7 +4223,11 @@ mod iterative_bench {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1200);
-        let (mut input, point_major) = street_scene(n);
+        let passes: usize = std::env::var("VISLOC_BENCH_PASSES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let (mut input, point_major) = street_scene_passes(n, passes);
         let (n_points, n_obs) = (input.points.len(), point_major.obs.len());
         let t = Instant::now();
         let result = optimize_point_major(
@@ -4143,7 +4265,7 @@ mod iterative_bench {
                 .num_threads(threads)
                 .build()
                 .expect("thread pool")
-                .install(|| linearize(&problem, LossFunction::Trivial, Vec::new()));
+                .install(|| linearize(&problem, LossFunction::Trivial, Vec::new(), true));
             (cost, diag, bc)
         };
         assert_eq!(run(1), run(3));
@@ -4171,11 +4293,15 @@ mod iterative_bench {
         // LM loop does.
         let mut reuse = Vec::new();
         let t_linearize = best(Box::new(|| {
-            let (_, lin, _, _, _) =
-                linearize(&problem, LossFunction::Trivial, std::mem::take(&mut reuse));
+            let (_, lin, _, _, _) = linearize(
+                &problem,
+                LossFunction::Trivial,
+                std::mem::take(&mut reuse),
+                true,
+            );
             reuse = std::hint::black_box(lin).hcp;
         }));
-        let (_, lin, _, _, _) = linearize(&problem, LossFunction::Trivial, Vec::new());
+        let (_, lin, _, _, _) = linearize(&problem, LossFunction::Trivial, Vec::new(), true);
         let t_eliminate = best(Box::new(|| {
             std::hint::black_box(eliminate_and_accumulate(
                 &problem,

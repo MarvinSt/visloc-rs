@@ -528,6 +528,7 @@ dependencies = [
  "serde",
  "serde_json",
  "visloc-core",
+ "wide",
 ]
 
 [[package]]

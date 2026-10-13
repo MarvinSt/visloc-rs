@@ -255,6 +255,29 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **Faster COLMAP-port bundle adjustment.** Profiling a SmallCity replay
+  (5,816 images, 18.5 min mapper) put 400 s in global-BA solves and
+  76 s in local-BA solves, nearly all of them a single LM step. Three
+  changes:
+  - A solve that stops on the function tolerance no longer
+    re-linearizes at the accepted point first. Ceres does not either. The
+    old order spent one of every two linearizations of a one-step solve
+    on nothing.
+  - The Schur complement's per-pair term reuses the point's
+    inverse-Hessian-scaled block and accumulates with fused
+    multiply-adds (it recomputed the scaled block per pair).
+  - A point's frame pairs are stored frame-major, so the per-row
+    elimination of the iterative path reads them contiguously. It also
+    adds each point shard's partial sums once at the shard's end instead
+    of tracking shards per block.
+
+  Both elimination paths stay bit-identical to each other (new test). On
+  a synthetic 1,200-frame / 3M-observation global BA (`large_global_ba`
+  bench, 4 threads) the solve went from 11.9 s to 8.1 s: elimination
+  6.1 → 3.1 s, linearization 3.0 → 2.0 s. On the 13 ETH3D DSLR scenes
+  (intrinsics refined) every centre error is unchanged to the reported
+  digit, and mapper wall time fell from 51.5 s to 41.1 s.
+
 - **`gsplat_photos` keeps up to 8192 SIFT detections per image (was
   4000), COLMAP's `max_num_features`.** On textured scenes 4000 kept
   about half of COLMAP's features (playground: 5,934 against 10,000-13,500

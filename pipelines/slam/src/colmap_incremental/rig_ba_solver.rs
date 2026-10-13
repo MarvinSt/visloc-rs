@@ -356,8 +356,8 @@ struct Problem {
     edges: Vec<(u32, u32)>,
     /// Per point, the `edges`-index of each of its
     /// `point_free_frames[p].len() * (len-1) / 2` distinct frame pairs, in
-    /// the canonical `for j in 1..n { for i in 0..j }` order over
-    /// `point_free_frames[p]`.
+    /// the order `for i in 0..n { for j in i + 1..n }` over
+    /// `point_free_frames[p]` ([`pair_slot`]).
     point_pair_edge_idx: Vec<Vec<u32>>,
     /// Performance fix #3 (see [`eliminate_and_accumulate`]'s doc): point
     /// index range `[shard_boundaries[s], shard_boundaries[s+1])` for shard
@@ -570,7 +570,7 @@ fn build_reduced_system_pattern(
                 for j in i + 1..n {
                     pos += row[pos..].partition_point(|&(_, b)| b < slots[j]);
                     debug_assert_eq!(row[pos], (slots[i], slots[j]), "pair is an edge");
-                    idxs[j * (j - 1) / 2 + i] = (row_off[a] + pos) as u32;
+                    idxs[pair_slot(n, i, j)] = (row_off[a] + pos) as u32;
                 }
             }
             idxs
@@ -578,6 +578,16 @@ fn build_reduced_system_pattern(
         .collect();
 
     (point_free_frames, edges, point_pair_edge_idx)
+}
+
+/// Position of the pair `(i, j)`, `i < j < n`, among a point's `n (n - 1) / 2`
+/// frame pairs ordered `for i in 0..n { for j in i + 1..n }`: one frame's
+/// pairs with the frames after it are contiguous, which is how
+/// [`eliminate_by_output`] reads them.
+#[inline]
+fn pair_slot(n: usize, i: usize, j: usize) -> usize {
+    debug_assert!(i < j && j < n);
+    i * (2 * n - i - 1) / 2 + (j - i - 1)
 }
 
 /// Reduced camera systems with at least this many free frames are solved
@@ -1481,7 +1491,7 @@ fn linearize_point(
                     } else {
                         (b, a, jb, ja)
                     };
-                    let key = (hi * (hi - 1) / 2 + lo) as u32;
+                    let key = pair_slot(target_frames.len(), lo, hi) as u32;
                     let term = j_hi.transpose() * j_lo;
                     match direct.iter_mut().find(|(k, _)| *k == key) {
                         Some((_, acc)) => *acc += term,
@@ -1733,10 +1743,13 @@ fn eliminate_and_accumulate(
                 }
                 let pair_edge_idx = &problem.point_pair_edge_idx[p];
                 let mut local_pair = 0usize;
-                for j in 1..n {
-                    for i in 0..j {
-                        let val = hcp_scaled[j] * pl.hcp[i].transpose();
-                        local_offdiag[pair_edge_idx[local_pair] as usize] -= val;
+                for i in 0..n {
+                    for j in i + 1..n {
+                        sub_outer_6x3(
+                            &mut local_offdiag[pair_edge_idx[local_pair] as usize],
+                            &pl.hcp[j],
+                            &hcp_scaled[i],
+                        );
                         local_pair += 1;
                     }
                 }
@@ -1765,6 +1778,23 @@ fn eliminate_and_accumulate(
     (flat_offdiag, diag_delta, bc_delta)
 }
 
+/// `acc -= a bᵀ`, the Schur complement's per-pair term (`b` is the
+/// partner block already scaled by the point's inverse Hessian): three
+/// fused multiply-adds per entry straight into the accumulator, column by
+/// column, which the compiler vectorizes (a fifth off the elimination of
+/// the `large_global_ba` bench against the generic product and a separate
+/// subtraction). Both elimination paths use it, so they stay bit-identical.
+#[inline(always)]
+fn sub_outer_6x3(acc: &mut Matrix6<f64>, a: &SMatrix<f64, 6, 3>, b: &SMatrix<f64, 6, 3>) {
+    let (a, b) = (a.as_slice(), b.as_slice());
+    for (c, column) in acc.as_mut_slice().chunks_exact_mut(6).enumerate() {
+        let (b0, b1, b2) = (-b[c], -b[6 + c], -b[12 + c]);
+        for (r, value) in column.iter_mut().enumerate() {
+            *value = a[12 + r].mul_add(b2, a[6 + r].mul_add(b1, a[r].mul_add(b0, *value)));
+        }
+    }
+}
+
 /// [`eliminate_and_accumulate`] computed per output block, in parallel:
 /// each off-diagonal block, diagonal block and right-hand side sums its
 /// points' contributions in ascending point order, starting a fresh partial
@@ -1783,8 +1813,7 @@ fn eliminate_by_output(
     mu: f64,
 ) -> (Vec<Matrix6<f64>>, Vec<Matrix6<f64>>, Vec<Vector6<f64>>) {
     let n_free = problem.n_free_frames;
-    let (point_free_frames, point_pair_edge_idx) =
-        (&problem.point_free_frames, &problem.point_pair_edge_idx);
+    let point_pair_edge_idx = &problem.point_pair_edge_idx;
     let hpp_inv: Vec<Option<Matrix3<f64>>> = points_lin
         .par_iter()
         .map(|pl| {
@@ -1803,64 +1832,60 @@ fn eliminate_by_output(
     #[allow(clippy::type_complexity)]
     let per_row: Vec<(Vec<Matrix6<f64>>, Matrix6<f64>, Vector6<f64>)> = (0..n_free)
         .into_par_iter()
-        .map_init(
-            || (Vec::new(), Vec::new()),
-            |(acc, shard), s| {
-                let len = index.row_off[s + 1] - index.row_off[s];
-                let mut total = vec![Matrix6::<f64>::zeros(); len];
-                acc.clear();
-                acc.resize(len, Matrix6::<f64>::zeros());
-                shard.clear();
-                shard.resize(len, None);
-                let (mut diag_total, mut diag_acc) = (Matrix6::<f64>::zeros(), Matrix6::zeros());
-                let (mut bc_total, mut bc_acc) = (Vector6::<f64>::zeros(), Vector6::zeros());
-                let mut diag_shard = None;
-                let base = index.row_off[s];
-                for &[p, k] in &index.slot[index.slot_off[s]..index.slot_off[s + 1]] {
-                    let (p, k) = (p as usize, k as usize);
-                    let Some(inv) = hpp_inv[p] else {
-                        continue;
-                    };
-                    let pl = &points_lin[p];
-                    let point_shard = Some(index.point_shard[p]);
-                    if diag_shard != point_shard {
-                        if diag_shard.is_some() {
-                            diag_total += diag_acc;
-                            bc_total += bc_acc;
-                        }
-                        diag_acc = Matrix6::zeros();
-                        bc_acc = Vector6::zeros();
-                        diag_shard = point_shard;
-                    }
-                    let scaled = pl.hcp[k] * inv;
-                    diag_acc -= scaled * pl.hcp[k].transpose();
-                    bc_acc -= scaled * pl.bp;
-                    let pair_edge = &point_pair_edge_idx[p];
-                    for j in k + 1..point_free_frames[p].len() {
-                        let e = pair_edge[j * (j - 1) / 2 + k] as usize - base;
-                        let term = (pl.hcp[j] * inv) * pl.hcp[k].transpose();
-                        if shard[e] != point_shard {
-                            if shard[e].is_some() {
-                                total[e] += acc[e];
-                            }
-                            acc[e] = Matrix6::zeros();
-                            shard[e] = point_shard;
-                        }
-                        acc[e] -= term;
-                    }
+        .map_init(Vec::new, |acc, s| {
+            let len = index.row_off[s + 1] - index.row_off[s];
+            let mut total = vec![Matrix6::<f64>::zeros(); len];
+            acc.clear();
+            acc.resize(len, Matrix6::<f64>::zeros());
+            let (mut diag_total, mut diag_acc) = (Matrix6::<f64>::zeros(), Matrix6::zeros());
+            let (mut bc_total, mut bc_acc) = (Vector6::<f64>::zeros(), Vector6::zeros());
+            // One shard's partial sums at a time (points ascend, so each
+            // shard's points are contiguous), added to the totals when
+            // the shard ends. Blocks the shard did not touch add zero,
+            // which leaves a total unchanged (it starts at +0, never -0).
+            let mut current_shard = None;
+            let mut flush = |acc: &mut Vec<Matrix6<f64>>,
+                             diag_acc: &mut Matrix6<f64>,
+                             bc_acc: &mut Vector6<f64>| {
+                for (t, a) in total.iter_mut().zip(acc.iter_mut()) {
+                    *t += *a;
+                    *a = Matrix6::zeros();
                 }
-                if diag_shard.is_some() {
-                    diag_total += diag_acc;
-                    bc_total += bc_acc;
-                }
-                for ((t, a), sh) in total.iter_mut().zip(acc.iter()).zip(shard.iter()) {
-                    if sh.is_some() {
-                        *t += *a;
+                diag_total += *diag_acc;
+                bc_total += *bc_acc;
+                *diag_acc = Matrix6::zeros();
+                *bc_acc = Vector6::zeros();
+            };
+            let base = index.row_off[s];
+            for &[p, k] in &index.slot[index.slot_off[s]..index.slot_off[s + 1]] {
+                let (p, k) = (p as usize, k as usize);
+                let Some(inv) = hpp_inv[p] else {
+                    continue;
+                };
+                let pl = &points_lin[p];
+                let point_shard = Some(index.point_shard[p]);
+                if current_shard != point_shard {
+                    if current_shard.is_some() {
+                        flush(acc, &mut diag_acc, &mut bc_acc);
                     }
+                    current_shard = point_shard;
                 }
-                (total, diag_total, bc_total)
-            },
-        )
+                let scaled = pl.hcp[k] * inv;
+                diag_acc -= scaled * pl.hcp[k].transpose();
+                bc_acc -= scaled * pl.bp;
+                let n = pl.hcp.len();
+                // `pair_slot(n, k, k + 1)` onwards: `k`'s pairs with later
+                // frames (empty for the last frame).
+                let pair_edge = &point_pair_edge_idx[p][k * (2 * n - k - 1) / 2..];
+                for (hcp, &e) in pl.hcp[k + 1..].iter().zip(pair_edge) {
+                    sub_outer_6x3(&mut acc[e as usize - base], hcp, &scaled);
+                }
+            }
+            if current_shard.is_some() {
+                flush(acc, &mut diag_acc, &mut bc_acc);
+            }
+            (total, diag_total, bc_total)
+        })
         .collect();
     let mut flat_offdiag = Vec::with_capacity(edges_len);
     let mut diag_delta = Vec::with_capacity(n_free);
@@ -2587,6 +2612,14 @@ fn optimize_problem(
             problem.extras = trial_extras;
             radius /= (1.0 / 3.0_f64).max(1.0 - (2.0 * rho - 1.0).powi(3));
             decrease_factor = 2.0;
+            if small_decrease {
+                // Ceres stops on the function tolerance before evaluating
+                // the Jacobian at the accepted point; so does this, saving
+                // a linearization (about a sixth of a one-step global BA).
+                half_cost = trial_half_cost;
+                converged = true;
+                break;
+            }
             let t = Instant::now();
             let (full, pl, fd, fb, cl) = linearize(problem, loss);
             timings.linearize += t.elapsed();
@@ -2596,10 +2629,6 @@ fn optimize_problem(
             frame_diag_raw = fd;
             frame_bc_raw = fb;
             offdiag_raw = cl;
-            if small_decrease {
-                converged = true;
-                break;
-            }
         } else {
             radius /= decrease_factor;
             decrease_factor *= 2.0;
@@ -3516,6 +3545,31 @@ mod tests {
         )
     }
 
+    /// The per-output elimination (iterative path, tight memory) and the
+    /// sharded per-point loop add the same terms in the same order.
+    #[test]
+    fn elimination_paths_are_bit_identical() {
+        let (input, point_major, _) = intrinsics_scene([500.0, 500.0, 322.0, 238.0]);
+        let mut problem =
+            assemble_problem(&input, point_major, 0.0, ExtraBlocks::default()).expect("problem");
+        // Several shards, so the per-output path restarts partial sums.
+        problem.shard_boundaries = balanced_shard_boundaries(&problem.point_free_frames, 3);
+        let index = ContributionIndex::new(
+            &problem.point_free_frames,
+            &problem.free_frame_slot,
+            &problem.edges,
+            problem.n_free_frames,
+            &problem.shard_boundaries,
+        );
+        let (_, points_lin, _, _, _) = linearize(&problem, LossFunction::Trivial);
+        problem.contributions = None;
+        let sharded = eliminate_and_accumulate(&problem, &points_lin, problem.edges.len(), 1e-3);
+        problem.contributions = Some(index);
+        let by_output = eliminate_and_accumulate(&problem, &points_lin, problem.edges.len(), 1e-3);
+        assert!(sharded.0.iter().any(|b| b.norm() > 0.0));
+        assert_eq!(sharded, by_output);
+    }
+
     #[test]
     fn camera_block_recovers_focal_and_principal_point() {
         let truth = [500.0, 500.0, 322.0, 238.0];
@@ -3797,6 +3851,7 @@ mod tests {
 #[cfg(test)]
 mod iterative_bench {
     use super::*;
+    use nalgebra::{UnitQuaternion, Vector2, Vector3};
 
     /// A reduced camera system shaped like a city block revisited in several
     /// passes: each camera couples to its ±150 capture-order neighbours and
@@ -3881,6 +3936,115 @@ mod iterative_bench {
         assert!(
             it_clustered < it_jacobi,
             "clustered {it_clustered} vs block-Jacobi {it_jacobi} iterations"
+        );
+    }
+
+    /// A global BA shaped like a long street capture: `n` frames along a
+    /// line, points on a facade with heavy-tailed track lengths (most 3-15
+    /// frames, one in twenty 40-120), noisy observations and a perturbed
+    /// start. Prints the solver's `BA_PHASES` line.
+    ///
+    /// `VISLOC_BENCH_FRAMES=1200 cargo test --release -p visloc-slam --lib \
+    ///     large_global_ba -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn large_global_ba() {
+        let n: usize = std::env::var("VISLOC_BENCH_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1200);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (f, c) = (600.0, (320.0, 240.0));
+        let poses: Vec<SE3> = (0..n)
+            .map(|i| {
+                let yaw = 0.05 * (i as f64 * 0.01).sin();
+                let rotation = UnitQuaternion::from_euler_angles(0.0, yaw, 0.0);
+                let centre = Vector3::new(i as f64 * 0.1, 0.05 * (i as f64 * 0.03).cos(), 0.0);
+                SE3::new(rotation, -(rotation * centre))
+            })
+            .collect();
+        let mut points = Vec::new();
+        let mut obs = Vec::new();
+        let mut ranges = Vec::new();
+        while obs.len() < n * 2500 {
+            let track = if random() < 0.05 {
+                40 + (random() * 80.0) as usize
+            } else {
+                3 + (random() * random() * 13.0) as usize
+            };
+            let first = (random() * n.saturating_sub(track) as f64) as usize;
+            let frames = first..(first + track).min(n);
+            let mid = (frames.start + frames.end) as f64 * 0.05;
+            let point = Point3::new(
+                mid + (random() - 0.5) * 2.0,
+                (random() - 0.5) * 4.0,
+                6.0 + random() * 4.0,
+            );
+            let start = obs.len() as u32;
+            for frame in frames {
+                let x = poses[frame].transform_point(&point);
+                let noise = Vector2::new(random() - 0.5, random() - 0.5);
+                let xy = Point2::new(f * x.x / x.z + c.0, f * x.y / x.z + c.1) + noise;
+                obs.push(Obs::new(
+                    frame as u32,
+                    xy,
+                    (f, f, c.0, c.1),
+                    SE3::identity(),
+                ));
+            }
+            ranges.push((start, obs.len() as u32));
+            points.push(point);
+        }
+        let start_poses = poses
+            .iter()
+            .enumerate()
+            .map(|(i, pose)| {
+                let d = Vector6::from_fn(|_, _| (random() - 0.5) * 2e-3);
+                if i < 2 {
+                    pose.clone()
+                } else {
+                    pose.compose(&SE3::exp(&d))
+                }
+            })
+            .collect();
+        let mut input = RigBaInput {
+            frame_ids: (0..n as u64).collect(),
+            frame_fixed: (0..n).map(|i| i < 2).collect(),
+            poses: start_poses,
+            point_ids: (0..points.len() as u64).collect(),
+            point_fixed: vec![false; points.len()],
+            points: points
+                .iter()
+                .map(|p| p + Vector3::from_fn(|_, _| (random() - 0.5) * 0.02))
+                .collect(),
+        };
+        let n_obs = obs.len();
+        let t = Instant::now();
+        let result = optimize_point_major(
+            &mut input,
+            PointMajorObs {
+                obs,
+                point_obs_range: ranges,
+            },
+            50,
+            LossFunction::Trivial,
+            None,
+            &mut ExtraBlocks::default(),
+        )
+        .expect("solve");
+        eprintln!(
+            "{n} frames, {} points, {n_obs} observations: {:?}, {} iterations, cost {:.1} -> {:.1}",
+            points.len(),
+            t.elapsed(),
+            result.iterations.len(),
+            result.initial_cost,
+            result.final_cost
         );
     }
 

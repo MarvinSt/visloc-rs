@@ -210,16 +210,6 @@ pub struct OnlineMapperConfig {
     /// *match itself*, which always feeds the global problem. A single
     /// ungated false loop was measured to destroy the V2_03 estimate.
     pub loop_match_max_rotation_error_deg: f64,
-    /// Position gate for loop matches, in metres: a loop is rejected when the
-    /// two keyframes' current map positions are farther apart than
-    /// `loop_match_max_distance_m + loop_match_distance_per_travelled_m *
-    /// (path length between them)`. A true revisit can only be as far apart
-    /// as the drift accumulated in between; repeated structure elsewhere on
-    /// the route usually is not. `INFINITY` (the default) disables the gate.
-    pub loop_match_max_distance_m: f64,
-    /// Drift allowance of the position gate per metre travelled between the
-    /// two keyframes (e.g. `0.02` = 2 %).
-    pub loop_match_distance_per_travelled_m: f64,
     /// Candidates considered per new keyframe query in
     /// `match_new_keyframe`, i.e. the `num_results` truncation passed to
     /// `query_bow_candidates` -- independent of (and by default smaller
@@ -321,8 +311,6 @@ impl Default for OnlineMapperConfig {
             loop_gap_keyframes: 30,
             loop_matching: true,
             loop_match_max_rotation_error_deg: 30.0,
-            loop_match_max_distance_m: f64::INFINITY,
-            loop_match_distance_per_travelled_m: 0.0,
             match_top_k: 5,
             headless: NfrMapperHeadlessConfig::default(),
             projection_rematch: false,
@@ -1122,24 +1110,18 @@ impl OnlineNfrMapper {
             }
             if is_loop {
                 let rotation_error = self.loop_match_rotation_error_deg(left_id, right_id, &t_i_j);
-                let geometry = self.loop_match_geometry(left_id, right_id);
                 let verdict = if self.config.loop_match_max_rotation_error_deg < 180.0
                     && rotation_error
                         .is_some_and(|angle| angle > self.config.loop_match_max_rotation_error_deg)
                 {
                     "reject-rotation"
-                } else if geometry.is_some_and(|(distance, travelled, _)| {
-                    distance
-                        > self.config.loop_match_max_distance_m
-                            + self.config.loop_match_distance_per_travelled_m * travelled
-                }) {
-                    "reject-distance"
                 } else {
                     "accept"
                 };
                 if loop_log_enabled() {
-                    let (distance, travelled, seconds) =
-                        geometry.unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+                    let (distance, travelled, seconds) = self
+                        .loop_match_geometry(left_id, right_id)
+                        .unwrap_or((f64::NAN, f64::NAN, f64::NAN));
                     let timestamp = |id: TimeCamId| {
                         self.mapper
                             .frame_timestamps

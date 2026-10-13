@@ -115,8 +115,6 @@ struct Args {
     no_loop_matching: bool,
     /// Loop-match rotation gate override in degrees (None keeps the default).
     loop_match_max_rotation_error_deg: Option<f64>,
-    loop_match_max_distance_m: Option<f64>,
-    loop_match_distance_per_travelled_m: Option<f64>,
     /// Enable loop-closure relative-pose factors recovered from map landmarks.
     loop_closure_factors: bool,
     /// Minimum 3D-3D correspondences for a loop factor.
@@ -343,12 +341,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             loop_match_max_rotation_error_deg: args
                 .loop_match_max_rotation_error_deg
                 .unwrap_or(OnlineMapperConfig::default().loop_match_max_rotation_error_deg),
-            loop_match_max_distance_m: args
-                .loop_match_max_distance_m
-                .unwrap_or(OnlineMapperConfig::default().loop_match_max_distance_m),
-            loop_match_distance_per_travelled_m: args
-                .loop_match_distance_per_travelled_m
-                .unwrap_or(OnlineMapperConfig::default().loop_match_distance_per_travelled_m),
             loop_closure_factors: args.loop_closure_factors,
             loop_closure_min_correspondences: args.loop_closure_min_correspondences,
             loop_closure_weight: args.loop_closure_weight,
@@ -1050,8 +1042,6 @@ impl Args {
         let mut projection_radius_px = None;
         let mut no_loop_matching = false;
         let mut loop_match_max_rotation_error_deg = None;
-        let mut loop_match_max_distance_m = None;
-        let mut loop_match_distance_per_travelled_m = None;
         let mut loop_closure_factors = false;
         let mut loop_closure_min_correspondences =
             OnlineMapperConfig::default().loop_closure_min_correspondences;
@@ -1174,22 +1164,6 @@ impl Args {
                             .map_err(|e| format!("invalid --loop-match-max-rot-error: {e}"))?,
                     )
                 }
-                "--loop-match-max-dist" => {
-                    loop_match_max_distance_m = Some(
-                        next(&mut arguments, &option)?
-                            .to_string_lossy()
-                            .parse::<f64>()
-                            .map_err(|e| format!("invalid --loop-match-max-dist: {e}"))?,
-                    )
-                }
-                "--loop-match-dist-per-travelled" => {
-                    loop_match_distance_per_travelled_m = Some(
-                        next(&mut arguments, &option)?
-                            .to_string_lossy()
-                            .parse::<f64>()
-                            .map_err(|e| format!("invalid --loop-match-dist-per-travelled: {e}"))?,
-                    )
-                }
                 "--loop-closure-factors" => loop_closure_factors = true,
                 "--loop-closure-min-corr" => {
                     loop_closure_min_correspondences = next(&mut arguments, &option)?
@@ -1304,8 +1278,6 @@ impl Args {
             projection_radius_px,
             no_loop_matching,
             loop_match_max_rotation_error_deg,
-            loop_match_max_distance_m,
-            loop_match_distance_per_travelled_m,
             loop_closure_factors,
             loop_closure_min_correspondences,
             loop_closure_weight,
@@ -1328,7 +1300,7 @@ impl Args {
          [--match-top-k N] [--frontend-stats-csv <path>] \
          [--projection-rematch] [--local-mapping] [--imu-seed-klt] \
          [--projection-host-window N] [--projection-radius PX] \
-         [--loop-match-max-rot-error DEG] [--loop-match-max-dist M] [--loop-match-dist-per-travelled R] \
+         [--loop-match-max-rot-error DEG] \
          [--loop-closure-factors] [--loop-closure-min-corr N] [--loop-closure-weight W] \
          [--loop-closure-max-rot-error DEG] [--local-ba-window N] [--local-ba-iterations N] \
          [--relative-pose-weight W] [--roll-pitch-weight W] [--imu-preintegration-weight W] \

@@ -29,6 +29,7 @@ class EstimatorCommandTests(unittest.TestCase):
             make_args(slam_exe=Path("slam_demo")), Path("seq"), Path("calib.json"), Path("out"))
         self.assertEqual(command[0], Path("slam_demo"))
         self.assertIn("--no-urgent-keyframes", command)
+        self.assertEqual(command[command.index("--loop-match-max-rot-error") + 1], 5)
         self.assertNotIn("--no-marg-data", command)
         self.assertEqual(command[command.index("--euroc-dir") + 1], Path("seq"))
         self.assertEqual(command[command.index("--calibration") + 1], Path("calib.json"))

@@ -1300,6 +1300,7 @@ impl Args {
          [--match-top-k N] [--frontend-stats-csv <path>] \
          [--projection-rematch] [--local-mapping] [--imu-seed-klt] \
          [--projection-host-window N] [--projection-radius PX] \
+         [--loop-match-max-rot-error DEG] \
          [--loop-closure-factors] [--loop-closure-min-corr N] [--loop-closure-weight W] \
          [--loop-closure-max-rot-error DEG] [--local-ba-window N] [--local-ba-iterations N] \
          [--relative-pose-weight W] [--roll-pitch-weight W] [--imu-preintegration-weight W] \

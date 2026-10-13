@@ -166,7 +166,10 @@ before/after on training sequences.
    every sequence with pseudo-GT, for roughly 1.15–1.4× the run time
    ([`lamaria_online_mapper.md`](lamaria_online_mapper.md)). At 1e-8 its
    effect is erratic (one wrong loop costs up to 10 points), and joint VI-BA
-   does not beat the default mapper.
+   does not beat the default mapper. A frame mix-up in the mapper's loop
+   rotation check (IMU vs camera frame) was fixed; with a 5° gate the mapper
+   mean rises to 44.95 (+1.29; Medium +4.94, Long +1.03, Short +0.47, no
+   track worse).
 
 ## 5. Test-set operational pipeline
 

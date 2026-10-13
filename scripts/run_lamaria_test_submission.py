@@ -72,6 +72,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aria_factory_imu_rectify import VRS_HEAD_BYTES, extract_record, rectify_csv  # noqa: E402
 
+LOOP_MATCH_MAX_ROT_ERROR_DEG = 5
 TRACK_COUNTS = {1: 18, 2: 10, 3: 16, 4: 9, 5: 10}
 BASE_URL = "https://cvg-data.inf.ethz.ch/lamaria"
 DEFAULT_VARIANT_A_NOISE = {
@@ -144,7 +145,12 @@ def estimator_command(args, inner: Path, calibration: Path, out_dir: Path):
     if args.slam_exe:
         # Same VIO as basalt_euroc_vio_demo (bit-identical trajectory_vio.tum)
         # plus the online mapper; trajectory_online.tum has every frame.
-        return ([args.slam_exe, *common, "--no-urgent-keyframes"],
+        # 5 deg loop rotation gate: with the camera-frame comparison, genuine
+        # loops disagree with the map by ~1 deg (median on sequence_1_19), so
+        # 5 deg drops only broken two-view estimates
+        # (docs/lamaria_online_mapper.md#loop-rotation-gate).
+        return ([args.slam_exe, *common, "--no-urgent-keyframes",
+                 "--loop-match-max-rot-error", LOOP_MATCH_MAX_ROT_ERROR_DEG],
                 [out_dir / "trajectory_online.tum", out_dir / "trajectory_vio.tum"])
     return ([args.vio_exe, *common, "--pipeline", "--no-trace", "--no-marg-data"],
             [out_dir / "trajectory.tum"])

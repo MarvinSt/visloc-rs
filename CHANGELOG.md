@@ -83,6 +83,53 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **COLMAP-port mapper: a converged final BA on large models.** This is
+  not in COLMAP.
+  - **What it does:** each model of 1,000 or more registered frames ends
+    with one more global refinement. Its BA runs to convergence (absolute
+    gradient stop, up to 50 LM steps).
+  - **When it runs:** 1,000 frames is where global BAs switch to the
+    iterative solver. Smaller models, such as the ETH3D scenes and
+    Courthouse, are unchanged.
+  - **Setting it:** `ba_global_final_converge_min_frames=N` sets the
+    threshold. Pass it as `gsplat_euroc --mapper-opt`, or as a line in a
+    replay's `mapper_options.txt`. `0` runs it on every model, and a
+    number above any model's size turns it off.
+  - **Why it is needed:** COLMAP's global BAs stop on the relative
+    `gradient_tolerance=1.0` after one or two steps. Each restarts from
+    Ceres' initial trust radius, whose damping holds back smooth,
+    low-curvature modes. Scale drift along a street is such a mode, so no
+    global BA of the incremental loop corrects it.
+  - **Synthetic test** (`global_ba_drift_needs_a_converged_solve`): a
+    1,500-frame street with an 8% scale drift.
+    - One step leaves 6.7% of the drift.
+    - The converged solve leaves 0.01%.
+  - **SmallCity:** its four passes are the four sides of the block, an
+    open path that ends about 26 m from its start. Its scale drifts
+    smoothly along the path, by about ±4% against the reference. One
+    replay on an RTX 3090 pod (32 vCPUs) compared the model before and
+    after the final converged BA (`VISLOC_SNAPSHOT_BEFORE_FINAL`):
+
+    | | before | after |
+    |---|---|---|
+    | Median centre error | 0.611 m | 0.178 m |
+    | p90 centre error | 2.10 m | 0.354 m |
+    | Max centre error | 2.92 m | 1.12 m |
+    | Scale drift along the path | ±4% | about ±1% |
+    | Per-pass fitted scales | 3.92 to 4.19 | 3.92 to 3.98 |
+
+    - The "before" model matches the earlier replay without this BA byte
+      for byte.
+    - The final BA ran 41 LM steps (20,102 PCG iterations) and stopped on
+      the function tolerance. It took 11 minutes, so the mapper's wall
+      time went from 21:00 to 30:26.
+  - **ETH3D, 13 scenes, forced on with a threshold of 0:** the change is
+    within noise. Meadow goes from 5.73 to 4.94 cm and facade from 1.67
+    to 1.77 cm. That is why small models are left out. At the default
+    threshold, all 15 ETH3D models are byte-identical to before.
+  - `VISLOC_SNAPSHOT_BEFORE_FINAL=<dir>` writes the model as the
+    incremental loop left it, so one run gives both models.
+
 - **`visloc_web`: run the photo pipeline from a web browser.**
   `cargo run --release --example visloc_web` serves a page on
   127.0.0.1:8080. From it you can:
@@ -299,6 +346,17 @@ All notable changes to `visloc-rs` will be documented here.
       (p90 2.19 m → 0.75 m). The previous binary reproduced 0.640 m
       exactly, so the mapper is deterministic and the change comes from
       the code. A single run cannot say whether the gain is systematic.
+    - **Follow-up: the gain was not systematic.** The same replay
+      with this release (#280) gives 0.611 m (p90 2.10 m) in 21:00. Each
+      of the four passes alone fits the reference to about 0.1 m, but
+      their fitted scales differ by up to 7% (3.92 to 4.19). So the
+      centre error is the drift between passes, not BA precision, and
+      it moves with the reconstruction path.
+    - **PCG tolerance 0.1 tried and rejected** (`VISLOC_PORT_PCG_TOL`,
+      same pod). The looser solves made the large BAs take 143 LM steps
+      instead of 77, and their PCG iterations went from 10,249 to
+      22,972. Wall time rose from 21:00 to 24:03. The median error was
+      0.522 m, inside the run-to-run spread. The default stays 1e-2.
 
 - **COLMAP-port mapper: fewer allocations and cheaper scoring.** All
   three changes are bit-identical; ETH3D outputs match the previous

@@ -83,6 +83,53 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **COLMAP-port BA: two-level PCG preconditioner for converging
+  solves.** Once a large global BA (1,000+ free frames) is past its first
+  three LM steps, its iterative solve adds a coarse correction to the
+  run-of-frames preconditioner. In practice that means the converged
+  final BA.
+  - **What it does:** one shared 6-vector step per aggregate of 32
+    consecutive frames, solved densely (`P (PᵀAP)⁻¹ Pᵀ r`). A frame's step
+    is a world-frame motion, so a shared step moves the aggregate rigidly.
+  - **Why it helps:** smooth deformations of a long capture, such as scale
+    drifting along a street, are close to rigid at that scale. They are
+    the low-curvature modes conjugate gradients converge on slowest, and
+    the run-of-frames level cannot see them. Under heavy LM damping the
+    damping holds them down, so the correction waits until the damping is
+    at most 1e-5 (trust radius 1e5 or more). From the first step on, it
+    made SmallCity's one-step incremental BAs run up to 13 steps and
+    changed the reconstruction's path.
+  - **Cost:** at most 256 aggregates. SmallCity's coarse factor (1,092
+    rows) takes 55 ms a solve and 0.5 ms a PCG iteration, against about
+    26 ms for one PCG product. `VISLOC_PORT_PCG_COARSE=0` turns it off.
+  - **PCG iterations, 4-thread benches:**
+
+    | Bench | without | with |
+    |---|---|---|
+    | 1,500-frame drift test, converged solve | 3,620 (5.6 s) | 1,165 (2.1 s) |
+    | `large_global_ba`, 1,200 frames, one pass | 803 | 256 |
+    | `large_global_ba`, 1,200 frames, four passes (3 steps) | 149 | 149 (identical) |
+
+    The final costs match.
+  - **SmallCity** (one RTX 3090 pod replay). The model before the final
+    BA is byte-identical to the replay without the coarse level:
+
+    | | without | with |
+    |---|---|---|
+    | Final BA LM steps | 41 | 14 |
+    | Final BA PCG iterations | 20,102 | 6,425 |
+    | Final BA time | 661 s | 204 s |
+    | Mapper wall time | 30:26 | 23:20 |
+    | Median centre error | 0.178 m | 0.146 m |
+    | p90 centre error | 0.354 m | 0.281 m |
+    | Max centre error | 1.12 m | 0.76 m |
+
+    Applying the coarse level from the first step instead changed the
+    path: the mapper took 27:46 and ended at 0.524 m, with a 2% scale step
+    between passes 2 and 3 left in place.
+  - **Smaller problems are unchanged:** all 15 ETH3D models are
+    byte-identical, since none reaches the iterative solve.
+
 - **COLMAP-port mapper: a converged final BA on large models.** This is
   not in COLMAP.
   - **What it does:** each model of 1,000 or more registered frames ends
@@ -123,6 +170,9 @@ All notable changes to `visloc-rs` will be documented here.
     - The final BA ran 41 LM steps (20,102 PCG iterations) and stopped on
       the function tolerance. It took 11 minutes, so the mapper's wall
       time went from 21:00 to 30:26.
+    - With the two-level PCG preconditioner (the entry above), the same
+      final BA takes 14 steps and 204 s and reaches 0.146 m. The mapper
+      then takes 23:20.
   - **ETH3D, 13 scenes, forced on with a threshold of 0:** the change is
     within noise. Meadow goes from 5.73 to 4.94 cm and facade from 1.67
     to 1.77 cm. That is why small models are left out. At the default

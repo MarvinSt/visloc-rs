@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use nalgebra::{DMatrix, Point2, Point3};
+use nalgebra::{DMatrix, Point2, Point3, SMatrix};
 use visloc_vision::two_view::CorrespondenceGraph;
 
 use super::observation_manager::{
@@ -1069,10 +1069,12 @@ impl IncrementalTriangulator {
 
         let mut curr_queue: Vec<TrackElement> = recon.point3d(point3d_id).track.clone();
         let mut next_queue: Vec<TrackElement> = Vec::new();
-        let mut visited: KeySet = curr_queue
-            .iter()
-            .map(|el| (el.image_id, el.point2d_idx))
-            .collect();
+        // COLMAP marks the track and every 2D point it reaches as visited.
+        // The two checks below reject the track and every 2D point with a 3D
+        // point, at each visit alike (a 2D point here only ever gains a 3D
+        // point), so only the 2D points passing them need marking: the same
+        // visits, with a far smaller set.
+        let mut visited = KeySet::default();
 
         let max_transitivity = options.complete_max_transitivity;
         for transitivity in 1..=max_transitivity {
@@ -1083,13 +1085,13 @@ impl IncrementalTriangulator {
                     .map(|c| (c.image_id as ImageT, c.point2d_idx))
                     .collect();
                 for (corr_image_id, corr_point2d_idx) in corrs {
-                    if !visited.insert((corr_image_id, corr_point2d_idx)) {
-                        continue;
-                    }
                     if !recon.is_image_registered(corr_image_id) {
                         continue;
                     }
                     if recon.image(corr_image_id).points2d[corr_point2d_idx].has_point3d() {
+                        continue;
+                    }
+                    if !visited.insert((corr_image_id, corr_point2d_idx)) {
                         continue;
                     }
                     let camera = recon.camera(recon.image(corr_image_id).camera_id).clone();
@@ -1471,10 +1473,9 @@ fn plan_complete(
     let xyz = recon.point3d(point3d_id).xyz;
     let mut curr_queue: Vec<TrackElement> = recon.point3d(point3d_id).track.clone();
     let mut next_queue: Vec<TrackElement> = Vec::new();
-    let mut visited: KeySet = curr_queue
-        .iter()
-        .map(|el| (el.image_id, el.point2d_idx))
-        .collect();
+    // Only the 2D points passing the checks below need marking visited, as
+    // in [`IncrementalTriangulator::complete`] (here nothing changes at all).
+    let mut visited = KeySet::default();
     let mut plan = CompletePlan {
         examined: Vec::new(),
         adds: Vec::new(),
@@ -1484,14 +1485,14 @@ fn plan_complete(
         while let Some(elem) = curr_queue.pop() {
             for corr in graph.find_correspondences(elem.image_id as usize, elem.point2d_idx) {
                 let key = (corr.image_id as ImageT, corr.point2d_idx);
-                if !visited.insert(key) {
-                    continue;
-                }
                 let (corr_image_id, corr_point2d_idx) = key;
                 let image = recon.image(corr_image_id);
                 if image.points2d[corr_point2d_idx].has_point3d()
                     || !recon.is_image_registered(corr_image_id)
                 {
+                    continue;
+                }
+                if !visited.insert(key) {
                     continue;
                 }
                 plan.examined.push(key);
@@ -1994,34 +1995,71 @@ fn cam_center(cam_from_world: &SE3) -> Point3<f64> {
 /// *normalized* (undistorted, calibrated) ray so it applies uniformly
 /// across cameras with different intrinsics, and take the right singular
 /// vector of smallest singular value.
+///
+/// nalgebra's SVD returns the same `V`, bit for bit, without `U` and on a
+/// fixed-size matrix as on a `DMatrix` of the same values, so the systems of
+/// up to four views (nearly all) skip the heap and the unused `U`.
 pub(super) fn triangulate_dlt(views: &[(&SE3, Point2<f64>, &Camera)]) -> Option<Point3<f64>> {
     let n = views.len();
     if n < 2 {
         return None;
     }
-    let mut a = DMatrix::<f64>::zeros(2 * n, 4);
-    for (row, (cam_from_world, xy, camera)) in views.iter().enumerate() {
-        let normalized = camera.normalize_pixel(xy)?;
-        let r = cam_from_world.rotation.to_rotation_matrix();
-        let t = cam_from_world.translation;
-        // Projection rows in the normalized (unit-focal, zero-principal-point)
-        // camera frame: P = [R | t].
-        let p0 = [r[(0, 0)], r[(0, 1)], r[(0, 2)], t.x];
-        let p1 = [r[(1, 0)], r[(1, 1)], r[(1, 2)], t.y];
-        let p2 = [r[(2, 0)], r[(2, 1)], r[(2, 2)], t.z];
-        for c in 0..4 {
-            a[(2 * row, c)] = normalized.x * p2[c] - p0[c];
-            a[(2 * row + 1, c)] = normalized.y * p2[c] - p1[c];
+    let v_t_last: [f64; 4] = if n <= 4 {
+        let mut rows = [[0.0; 4]; 8];
+        for (k, view) in views.iter().enumerate() {
+            [rows[2 * k], rows[2 * k + 1]] = dlt_rows(view)?;
         }
-    }
-    let svd = a.svd(true, true);
-    let v_t = svd.v_t?;
-    let last = v_t.row(v_t.nrows() - 1);
-    let w = last[3];
+        // The last row of `Vᵀ` (4 × 4) of the fixed-size `R × 4` system.
+        macro_rules! last_v_row {
+            ($r:literal) => {{
+                let a = SMatrix::<f64, $r, 4>::from_fn(|r, c| rows[r][c]);
+                let v_t = a.svd(false, true).v_t?;
+                [v_t[(3, 0)], v_t[(3, 1)], v_t[(3, 2)], v_t[(3, 3)]]
+            }};
+        }
+        match n {
+            2 => last_v_row!(4),
+            3 => last_v_row!(6),
+            _ => last_v_row!(8),
+        }
+    } else {
+        let mut a = DMatrix::<f64>::zeros(2 * n, 4);
+        for (k, view) in views.iter().enumerate() {
+            let [r0, r1] = dlt_rows(view)?;
+            for c in 0..4 {
+                a[(2 * k, c)] = r0[c];
+                a[(2 * k + 1, c)] = r1[c];
+            }
+        }
+        let v_t = a.svd(false, true).v_t?;
+        let last = v_t.row(v_t.nrows() - 1);
+        [last[0], last[1], last[2], last[3]]
+    };
+    let w = v_t_last[3];
     if w.abs() < 1e-12 {
         return None;
     }
-    Some(Point3::new(last[0] / w, last[1] / w, last[2] / w))
+    Some(Point3::new(
+        v_t_last[0] / w,
+        v_t_last[1] / w,
+        v_t_last[2] / w,
+    ))
+}
+
+/// One view's two DLT rows, `x * P_row2 - P_row0` and `y * P_row2 - P_row1`,
+/// with `P = [R | t]` in the normalized (unit-focal, zero-principal-point)
+/// camera frame; `None` when the pixel cannot be normalized.
+fn dlt_rows((cam_from_world, xy, camera): &(&SE3, Point2<f64>, &Camera)) -> Option<[[f64; 4]; 2]> {
+    let normalized = camera.normalize_pixel(xy)?;
+    let r = cam_from_world.rotation.to_rotation_matrix();
+    let t = cam_from_world.translation;
+    let p0 = [r[(0, 0)], r[(0, 1)], r[(0, 2)], t.x];
+    let p1 = [r[(1, 0)], r[(1, 1)], r[(1, 2)], t.y];
+    let p2 = [r[(2, 0)], r[(2, 1)], r[(2, 2)], t.z];
+    Some([
+        std::array::from_fn(|c| normalized.x * p2[c] - p0[c]),
+        std::array::from_fn(|c| normalized.y * p2[c] - p1[c]),
+    ])
 }
 
 #[cfg(test)]

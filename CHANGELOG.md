@@ -173,6 +173,21 @@ All notable changes to `visloc-rs` will be documented here.
     - With the two-level PCG preconditioner (the entry above), the same
       final BA takes 14 steps and 204 s and reaches 0.146 m. The mapper
       then takes 23:20.
+    - **Follow-up: the gain depends on the reconstruction path.** Three
+      replays with the same matches and `--random-seed` 0, 1 and 2 give
+      these median centre errors:
+
+      | seed | before the final BA | after |
+      |---|---|---|
+      | 0 | 0.611 m | 0.146 m |
+      | 1 | 0.496 m | 0.366 m |
+      | 2 | 0.840 m | 0.711 m |
+
+      The final BA improves every path, but it removes the scale drift
+      (about ±4% along the path) only on seed 0. Seed 2's BA stops after
+      seven accepted steps on the function tolerance, while its trust
+      radius is still small. In seed 1's BA, 7 of 18 trials are
+      rejected.
   - **ETH3D, 13 scenes, forced on with a threshold of 0:** the change is
     within noise. Meadow goes from 5.73 to 4.94 cm and facade from 1.67
     to 1.77 cm. That is why small models are left out. At the default
@@ -370,6 +385,53 @@ All notable changes to `visloc-rs` will be documented here.
   fixed unless `refine_distortion` is set). Default off.
 
 ### Changed
+
+- **COLMAP-port mapper: cheaper local refinement.** Results are
+  bit-identical: all 15 ETH3D models match (`images.txt` and
+  `points3D.txt`).
+  - **Why:** on SmallCity, local refinement is a third of the mapper's
+    time (465 s of 23:20):
+    - local BA 177 s;
+    - track merging and completion 124 s;
+    - point filtering 112 s.
+
+    A callgrind profile of ETH3D facade put the track-completion search
+    (`plan_complete`) first, at 10% of all instructions.
+  - **Track completion.**
+    - `CompleteTracks` and `CompleteImage` run back to back. The second
+      searched again from most of the new image's 3D points, which the
+      first had just searched.
+    - A search that added nothing, and examined no 2D point the first
+      pass then gave a 3D point, would add nothing again. The image pass
+      now reuses it. On facade, 88% of these searches are reused.
+    - A completion plan now records only the 2D points that can still
+      gain a 3D point during the pass: those of registered images
+      without one. These are the only ones that can make the plan stale.
+      The search also checks a 2D point's 3D point before its image's
+      registration.
+    - A 2D point without a 3D point builds its correspondences' data (a
+      camera copy and a pose each) only when it is about to be
+      triangulated. Most stop earlier, because a correspondence already
+      has a 3D point.
+  - **Point filtering.**
+    - `AdjustLocalBundle` filters the points of the window images, then
+      the modified points, and most of the second set is in the first.
+    - A point the first filter left untouched would be untouched again,
+      because filtering changes no other point and moves nothing. The
+      second filter now skips those points: on facade it checks 38
+      points instead of 4,197.
+    - The filters' pose table holds a 4-byte slot per image id instead
+      of the poses themselves.
+  - **Local BA setup.** A window's points are deduplicated with a bitmap
+    over point ids before sorting, instead of sorting every sighting.
+  - **ETH3D, before and after:**
+    - On facade (76 images), local refinement takes 3.63 s instead of
+      4.05 s, global refinement 3.99 s instead of 4.26 s, and the mapper
+      11.6 s instead of 12.5 s.
+    - The smaller scenes change only within noise.
+    - Per facade local refinement: track completion takes 3.7 ms instead
+      of 5.8 ms, filtering 4.6 ms instead of 6.2 ms, and local BA setup
+      2.7 ms instead of 3.3 ms.
 
 - **COLMAP-port BA: cheaper gradient stop and PCG product.**
   - **Gradient stop.** After an accepted step, nearly every solve stops

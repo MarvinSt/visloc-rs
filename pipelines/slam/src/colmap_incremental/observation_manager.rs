@@ -235,12 +235,12 @@ pub(crate) struct ImagePose {
 /// observation's image id to find the images; on a large model that was most
 /// of a local filter's time. Images are collected through a table indexed
 /// by id instead, and each pose is computed once.
-pub(crate) fn track_image_poses(
-    recon: &Reconstruction,
-    point3d_ids: &[Point3DT],
-) -> IdMap<ImagePose> {
+pub(crate) fn track_image_poses(recon: &Reconstruction, point3d_ids: &[Point3DT]) -> ImagePoses {
     use rayon::prelude::*;
-    let mut seen: Vec<bool> = Vec::new();
+    // Slot of each image id in `image_ids` (`u32::MAX`: not observed); four
+    // bytes per id, where a table of the poses themselves zeroed ~100 bytes
+    // per image of the model on every filter call.
+    let mut slot: Vec<u32> = Vec::new();
     let mut image_ids: Vec<ImageT> = Vec::new();
     for &id in point3d_ids {
         if !recon.exists_point3d(id) {
@@ -248,31 +248,41 @@ pub(crate) fn track_image_poses(
         }
         for el in &recon.point3d(id).track {
             let index = el.image_id as usize;
-            if index >= seen.len() {
-                seen.resize(index + 1, false);
+            if index >= slot.len() {
+                slot.resize(index + 1, u32::MAX);
             }
-            if !seen[index] {
-                seen[index] = true;
+            if slot[index] == u32::MAX {
+                slot[index] = image_ids.len() as u32;
                 image_ids.push(el.image_id);
             }
         }
     }
-    image_ids
+    let poses = image_ids
         .par_iter()
         .map(|&id| {
             let cam_from_world = image_cam_from_world(recon, id);
             let centre = Point3::from(cam_from_world.inverse().translation);
-            (
-                id,
-                ImagePose {
-                    cam_from_world,
-                    centre,
-                },
-            )
+            ImagePose {
+                cam_from_world,
+                centre,
+            }
         })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect()
+        .collect();
+    ImagePoses { slot, poses }
+}
+
+/// [`track_image_poses`]' table, indexed by image id.
+pub(crate) struct ImagePoses {
+    slot: Vec<u32>,
+    poses: Vec<ImagePose>,
+}
+
+impl std::ops::Index<&ImageT> for ImagePoses {
+    type Output = ImagePose;
+
+    fn index(&self, image_id: &ImageT) -> &ImagePose {
+        &self.poses[self.slot[*image_id as usize] as usize]
+    }
 }
 
 /// `Camera::HasBogusParams` equivalent. The control configuration
@@ -682,6 +692,30 @@ impl ObservationManager {
         min_tri_angle_deg: f64,
         image_ids: &[ImageT],
     ) -> usize {
+        self.filter_points3d_in_images_unchanged(
+            recon,
+            graph,
+            max_reproj_error,
+            min_tri_angle_deg,
+            image_ids,
+        )
+        .0
+    }
+
+    /// [`Self::filter_points3d_in_images`], also returning (ascending) the
+    /// points it checked and left as they were. Filtering another point
+    /// changes no point but that one and moves nothing, so filtering such a
+    /// point again right after would decide the same way and change nothing
+    /// (it only rewrites the same mean error): `AdjustLocalBundle`'s second
+    /// filter, of the modified points, can skip them.
+    pub fn filter_points3d_in_images_unchanged(
+        &mut self,
+        recon: &mut Reconstruction,
+        graph: &CorrespondenceGraph,
+        max_reproj_error: f64,
+        min_tri_angle_deg: f64,
+        image_ids: &[ImageT],
+    ) -> (usize, Vec<Point3DT>) {
         let mut point3d_ids = Vec::new();
         for &image_id in image_ids {
             for p in &recon.image(image_id).points2d {
@@ -692,13 +726,26 @@ impl ObservationManager {
         }
         point3d_ids.sort_unstable();
         point3d_ids.dedup();
-        self.filter_points3d(
+        // Filters only remove track elements, so an unchanged track length
+        // means an untouched point.
+        let track_lens: Vec<usize> = point3d_ids
+            .iter()
+            .map(|&id| recon.point3d(id).track.len())
+            .collect();
+        let n = self.filter_points3d(
             recon,
             graph,
             max_reproj_error,
             min_tri_angle_deg,
             &point3d_ids,
-        )
+        );
+        let unchanged = point3d_ids
+            .into_iter()
+            .zip(track_lens)
+            .filter(|&(id, len)| recon.exists_point3d(id) && recon.point3d(id).track.len() == len)
+            .map(|(id, _)| id)
+            .collect();
+        (n, unchanged)
     }
 
     pub fn filter_all_points3d(
@@ -783,7 +830,7 @@ impl ObservationManager {
         graph: &CorrespondenceGraph,
         min_tri_angle_deg: f64,
         point3d_ids: &[Point3DT],
-        poses: &IdMap<ImagePose>,
+        poses: &ImagePoses,
     ) -> usize {
         use rayon::prelude::*;
         let min_tri_angle_rad = min_tri_angle_deg.to_radians();
@@ -841,7 +888,7 @@ impl ObservationManager {
         graph: &CorrespondenceGraph,
         max_error: f64,
         point3d_ids: &[Point3DT],
-        poses: &IdMap<ImagePose>,
+        poses: &ImagePoses,
     ) -> usize {
         use rayon::prelude::*;
         enum Decision {

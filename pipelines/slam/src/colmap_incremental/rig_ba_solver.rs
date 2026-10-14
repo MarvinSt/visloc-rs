@@ -757,6 +757,15 @@ const PCG_COARSE_FRAMES: usize = 32;
 /// a PCG iteration. SmallCity's 5,816 frames stay at 32 a group (1,092
 /// rows: 55 ms and 0.5 ms, against ~26 ms for one PCG product).
 const PCG_COARSE_MAX_AGGREGATES: usize = 256;
+/// The coarse correction applies once the LM damping `mu = 1/radius` is at
+/// most this, from the fourth accepted step of a solve on (Ceres' initial
+/// radius 1e4, tripling per good step). Heavier damping holds the smooth
+/// modes down by itself; the one-to-three-step global BAs of the
+/// incremental loop then solve exactly as without it. On SmallCity,
+/// applying it from the first step made those BAs run up to 13 steps
+/// (their relative gradient stop rarely fired) and changed the
+/// reconstruction's path.
+const PCG_COARSE_MAX_MU: f64 = 1e-5;
 fn pcg_coarse_size() -> Option<usize> {
     static G: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
@@ -2286,6 +2295,7 @@ fn solve_step(
         let clusters = pcg_cluster_size()
             .and_then(|k| cluster_preconditioner(&frame_diag, edges, &flat_offdiag, k));
         let coarse = pcg_coarse_size()
+            .filter(|_| mu <= PCG_COARSE_MAX_MU)
             .and_then(|g| coarse_correction(&frame_diag, edges, &flat_offdiag, first_extra, g));
         let (solved, iterations) = pcg_core(
             &frame_diag,

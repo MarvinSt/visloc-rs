@@ -83,16 +83,22 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
-- **COLMAP-port BA: two-level PCG preconditioner.** The iterative
-  solve of large global BAs (1,000+ free frames) adds a coarse correction
-  to its run-of-frames preconditioner.
+- **COLMAP-port BA: two-level PCG preconditioner for converging
+  solves.** Once a large global BA (1,000+ free frames) is past its first
+  three LM steps, its iterative solve adds a coarse correction to the
+  run-of-frames preconditioner. In practice that means the converged
+  final BA.
   - **What it does:** one shared 6-vector step per aggregate of 32
     consecutive frames, solved densely (`P (PᵀAP)⁻¹ Pᵀ r`). A frame's step
     is a world-frame motion, so a shared step moves the aggregate rigidly.
   - **Why it helps:** smooth deformations of a long capture, such as scale
     drifting along a street, are close to rigid at that scale. They are
     the low-curvature modes conjugate gradients converge on slowest, and
-    the run-of-frames level cannot see them.
+    the run-of-frames level cannot see them. Under heavy LM damping the
+    damping holds them down, so the correction waits until the damping is
+    at most 1e-5 (trust radius 1e5 or more). From the first step on, it
+    made SmallCity's one-step incremental BAs run up to 13 steps and
+    changed the reconstruction's path.
   - **Cost:** at most 256 aggregates. SmallCity's coarse factor (1,092
     rows) takes 55 ms a solve and 0.5 ms a PCG iteration, against about
     26 ms for one PCG product. `VISLOC_PORT_PCG_COARSE=0` turns it off.
@@ -100,11 +106,17 @@ All notable changes to `visloc-rs` will be documented here.
 
     | Bench | without | with |
     |---|---|---|
-    | 1,500-frame drift test, converged solve | 3,620 (5.2 s) | 942 (1.7 s) |
-    | `large_global_ba`, 1,200 frames, one pass | 803 | 207 |
-    | `large_global_ba`, 1,200 frames, four passes | 149 | 80 |
+    | 1,500-frame drift test, converged solve | 3,620 (5.6 s) | 1,165 (2.1 s) |
+    | `large_global_ba`, 1,200 frames, one pass | 803 | 256 |
+    | `large_global_ba`, 1,200 frames, four passes (3 steps) | 149 | 149 (identical) |
 
     The final costs match.
+  - **SmallCity, coarse level applied from the first step** (one pod
+    replay):
+    - The final BA took 12 steps and 135 s instead of 41 steps and 661 s.
+    - The mapper took 27:46 instead of 30:26.
+    - The path changed, and a 2% scale step between passes 2 and 3
+      remained: median error 0.645 m before the final BA, 0.524 m after.
   - **Smaller problems are unchanged:** all 15 ETH3D models are
     byte-identical, since none reaches the iterative solve.
 

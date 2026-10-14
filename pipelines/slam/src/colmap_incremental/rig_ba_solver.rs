@@ -553,6 +553,10 @@ fn build_reduced_system_pattern(
     for (a, row) in rows.iter().enumerate() {
         edges.extend(row.iter().map(|&b| (a as u32, b)));
     }
+    // A pair's edge index is its row's offset plus the row's columns below
+    // the partner's slot: one popcount in the rows' bitmaps up to
+    // `EDGE_RANK_MAX_SLOTS` frames, a search of the row past it.
+    let rank = (n_slots <= EDGE_RANK_MAX_SLOTS).then(|| EdgeRank::new(&rows, n_slots));
     drop(rows);
 
     let point_pair_edge_idx: Vec<Vec<u32>> = point_free_frames
@@ -568,6 +572,14 @@ fn build_reduced_system_pattern(
             let mut idxs = vec![0u32; n * (n - 1) / 2];
             for i in 0..n {
                 let a = slots[i] as usize;
+                if let Some(rank) = &rank {
+                    for j in i + 1..n {
+                        let e = row_off[a] + rank.position(a, slots[j]);
+                        debug_assert_eq!(edges[e], (slots[i], slots[j]), "pair is an edge");
+                        idxs[pair_slot(n, i, j)] = e as u32;
+                    }
+                    continue;
+                }
                 let row = &edges[row_off[a]..row_off[a + 1]];
                 let mut pos = 0usize;
                 for j in i + 1..n {
@@ -581,6 +593,57 @@ fn build_reduced_system_pattern(
         .collect();
 
     (point_free_frames, edges, point_pair_edge_idx)
+}
+
+/// Frame slots up to which [`EdgeRank`] indexes the edge rows: its bitmaps
+/// take `n² / 8` bytes and their counts half that again (6 MB at SmallCity's
+/// 5,800 frames, 48 MB here).
+const EDGE_RANK_MAX_SLOTS: usize = 16_384;
+
+/// The reduced camera system's edge rows as bitmaps over the frame slots,
+/// with each 64-bit word's count of the row's earlier columns, so a column's
+/// position in its row is one popcount. Building a point's pair -> edge
+/// indices by searching each row instead cost most of a large global BA's
+/// setup (tracks of tens of frames have hundreds of pairs each).
+struct EdgeRank {
+    words: usize,
+    bits: Vec<u64>,
+    before: Vec<u32>,
+}
+
+impl EdgeRank {
+    /// `rows[a]`: the slots `b > a` sharing a point with `a`, ascending.
+    fn new(rows: &[Vec<u32>], n_slots: usize) -> Self {
+        let words = n_slots.div_ceil(64).max(1);
+        let mut bits = vec![0u64; rows.len() * words];
+        let mut before = vec![0u32; rows.len() * words];
+        bits.par_chunks_mut(words)
+            .zip(before.par_chunks_mut(words))
+            .zip(rows.par_iter())
+            .for_each(|((bits, before), row)| {
+                for &b in row {
+                    bits[b as usize / 64] |= 1 << (b % 64);
+                }
+                let mut count = 0u32;
+                for (word, before) in bits.iter().zip(before.iter_mut()) {
+                    *before = count;
+                    count += word.count_ones();
+                }
+            });
+        Self {
+            words,
+            bits,
+            before,
+        }
+    }
+
+    /// The position of column `b` in row `a`: the row's columns below `b`.
+    #[inline]
+    fn position(&self, a: usize, b: u32) -> usize {
+        let w = a * self.words + b as usize / 64;
+        let below = self.bits[w] & ((1u64 << (b % 64)) - 1);
+        self.before[w] as usize + below.count_ones() as usize
+    }
 }
 
 /// Position of the pair `(i, j)`, `i < j < n`, among a point's `n (n - 1) / 2`

@@ -623,6 +623,12 @@ fn iterative_min_free_frames() -> usize {
 /// 50-iteration cap at ~1e-6 relative decrease per step, about a third of
 /// the mapper's time, for no visible change. Overridable with
 /// `VISLOC_PORT_BA_FUNCTION_TOLERANCE` (`0` disables the stop).
+///
+/// A solve with the absolute gradient criterion (the mapper's final
+/// converged BA) stops only when the model's predicted decrease is that small
+/// as well. On SmallCity (mapper seed 2) the final BA otherwise stopped after
+/// a step that lowered the cost by 4% of its predicted decrease, at 0.711 m
+/// median centre error, while the solve run on reaches 0.650 m.
 const FUNCTION_TOLERANCE: f64 = 1e-5;
 fn function_tolerance() -> f64 {
     static TOL: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -2853,7 +2859,16 @@ fn optimize_problem(
         ));
 
         if step_accepted {
-            let small_decrease = actual < function_tolerance() * half_cost;
+            // A solve meant to converge (the absolute gradient criterion,
+            // `gradient_tolerance_rel == None`) also needs the model to
+            // predict a small decrease: a step that barely passed the
+            // acceptance test lowers the cost little however far the
+            // optimum is (see `FUNCTION_TOLERANCE`).
+            let decrease = match gradient_tolerance_rel {
+                None => actual.max(predicted),
+                Some(_) => actual,
+            };
+            let small_decrease = decrease < function_tolerance() * half_cost;
             problem.poses = trial_poses;
             problem.points = trial_points;
             problem.extras = trial_extras;

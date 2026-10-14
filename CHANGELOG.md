@@ -27,6 +27,7 @@ All notable changes to `visloc-rs` will be documented here.
 
     | seed | before the final BA | final BA before | now |
     |---|---|---|---|
+    | 0 | 0.611 m | 0.146 m | 0.147 m |
     | 1 | 0.496 m | 0.366 m | 0.161 m |
     | 2 | 0.840 m | 0.711 m | 0.648 m |
 
@@ -36,11 +37,12 @@ All notable changes to `visloc-rs` will be documented here.
     - Seed 2's remaining drift (3.9% between passes) is in the BA optimum
       itself. Run with no function tolerance, the same solve also ends at
       0.650 m.
+    - Seed 0 is unchanged within 1 mm (p90 0.281 m to 0.283 m).
   - **What did not help:** more refinement rounds (BA, merge, filter) after
     the converged BA. Restarted at the initial trust radius, each round
     stops after one or two steps. Started from the previous round's
-    radius, the rounds took seed 1 from 0.161 m back to 0.352 m over four
-    rounds.
+    radius, four more rounds took seed 0 from 0.147 m to 0.328 m and seed
+    1 from 0.161 m to 0.352 m, worse with every round.
   - **Unchanged:** the one- or two-step incremental BAs keep the plain
     evaluation. All 16 ETH3D models are byte-identical.
 
@@ -226,7 +228,8 @@ All notable changes to `visloc-rs` will be documented here.
       seven accepted steps on the function tolerance, while its trust
       radius is still small. In seed 1's BA, 7 of 18 trials are
       rejected. Both causes are fixed (under Fixed: "the converged final
-      BA stalled"), and seeds 1 and 2 now reach 0.161 m and 0.648 m.
+      BA stalled"): seeds 0, 1 and 2 now reach 0.147 m, 0.161 m and
+      0.648 m.
   - **ETH3D, 13 scenes, forced on with a threshold of 0:** the change is
     within noise. Meadow goes from 5.73 to 4.94 cm and facade from 1.67
     to 1.77 cm. That is why small models are left out. At the default

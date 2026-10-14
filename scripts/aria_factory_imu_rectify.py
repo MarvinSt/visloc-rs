@@ -72,9 +72,25 @@ def sensor_model(sensor):
     return bias, rect_inv
 
 
-def rectify_csv(calib: dict, inp, out, label="imu-right", part="both", shift_ns=0):
+def delay_compensate(ts, values, delay_ns):
+    """Resample `values` so that row `t` holds the sample stamped `t + delay_ns`.
+
+    A sensor that stamps its samples `delay_ns` after it measured them is
+    re-aligned this way (linear interpolation, clamped at the ends).
+    """
+    if not delay_ns:
+        return values
+    t = ts.astype(np.float64)
+    return np.column_stack([np.interp(t + delay_ns, t, values[:, c])
+                            for c in range(values.shape[1])])
+
+
+def rectify_csv(calib: dict, inp, out, label="imu-right", part="both", shift_ns=0,
+                gyro_delay_ns=0, accel_delay_ns=0):
     """Write `real = R^-1 (raw - b)` for every sample of an ASL IMU CSV.
 
+    `gyro_delay_ns` / `accel_delay_ns` re-align each sensor in time (see
+    `delay_compensate`); row timestamps are kept.
     Returns (samples, gyro bias, accel bias).
     """
     imus = [x for x in calib["ImuCalibrations"] if x["Label"] == label]
@@ -92,6 +108,8 @@ def rectify_csv(calib: dict, inp, out, label="imu-right", part="both", shift_ns=
         gyro = (rg_inv @ (gyro - bg).T).T
     if part in ("both", "accel"):
         acc = (ra_inv @ (acc - ba).T).T
+    gyro = delay_compensate(ts, gyro, gyro_delay_ns)
+    acc = delay_compensate(ts, acc, accel_delay_ns)
 
     with open(out, "w") as f:
         f.write(header if header.startswith("#") else ASL_IMU_HEADER)

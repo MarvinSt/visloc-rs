@@ -71,6 +71,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aria_factory_imu_rectify import VRS_HEAD_BYTES, extract_record, rectify_csv  # noqa: E402
+from aria_device_refinement import lookup as device_refinement, rotate_rig  # noqa: E402
 
 LOOP_MATCH_MAX_ROT_ERROR_DEG = 5
 TRACK_COUNTS = {1: 18, 2: 10, 3: 16, 4: 9, 5: 10}
@@ -124,18 +125,31 @@ def download_head(url: str, dest: Path, nbytes: int) -> None:
         dest.write_bytes(response.read(nbytes))
 
 
-def rectify_imu(seq: str, inner: Path, work: Path, calib_dir: Path) -> None:
-    """Replace inner/mav0/imu0/data.csv with the factory-rectified IMU."""
+def rectify_imu(seq: str, inner: Path, work: Path, calib_dir: Path,
+                refine: bool = False):
+    """Replace inner/mav0/imu0/data.csv with the factory-rectified IMU.
+
+    With `refine`, a known device's IMU is also re-aligned in time, and its
+    refinement (see aria_device_refinement.py) is returned for the camera rig.
+    """
     head = work / "vrs_head.bin"
     download_head(f"{BASE_URL}/raw_data/test/{seq}.vrs", head, VRS_HEAD_BYTES)
     factory = extract_record(head.read_bytes())
     (calib_dir / f"{seq}_factory_calib.json").write_text(json.dumps(factory, indent=1))
+    refinement = device_refinement(factory) if refine else None
+    if refine and refinement is None:
+        log(f"{seq}: WARN no device refinement for serial {factory.get('Serial')}")
+    delays = ({"gyro_delay_ns": refinement["gyro_delay_ns"],
+               "accel_delay_ns": refinement["accel_delay_ns"]} if refinement else {})
     imu_csv = inner / "mav0" / "imu0" / "data.csv"
     rectified = imu_csv.with_name("data_rectified.csv")
-    samples, gyro_bias, accel_bias = rectify_csv(factory, imu_csv, rectified)
+    samples, gyro_bias, accel_bias = rectify_csv(factory, imu_csv, rectified, **delays)
     rectified.replace(imu_csv)
     log(f"{seq}: rectified {samples} IMU samples (serial {factory.get('Serial')}, "
-        f"gyro bias {gyro_bias.round(5).tolist()}, accel bias {accel_bias.round(4).tolist()})")
+        f"gyro bias {gyro_bias.round(5).tolist()}, accel bias {accel_bias.round(4).tolist()}"
+        + (f", delays gyro {delays['gyro_delay_ns']} ns accel {delays['accel_delay_ns']} ns"
+           if refinement else "") + ")")
+    return refinement
 
 
 def estimator_command(args, inner: Path, calibration: Path, out_dir: Path):
@@ -207,6 +221,12 @@ def main() -> int:
     parser.add_argument("--imu-rectify", action=argparse.BooleanOptionalAction, default=True,
                         help="apply Aria's factory IMU calibration from the .vrs header "
                              "(default on; docs/lamaria_imu_rectification.md)")
+    parser.add_argument("--device-refinement", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="re-align the IMU in time and rotate the camera rig by the "
+                             "per-device refinement learned on training data (default off "
+                             "until validated on held-out sequences; needs --imu-rectify; "
+                             "docs/lamaria_drift_analysis.md)")
     parser.add_argument("--threads", type=int, default=12)
     parser.add_argument("--work-dir", type=Path, default=Path("lamaria_submission/work"))
     parser.add_argument("--slam-dir", type=Path, default=Path("lamaria_submission/slam"))
@@ -249,10 +269,12 @@ def main() -> int:
                 download(f"{BASE_URL}/asl_folder/test/{seq}.zip", zip_path)
                 inner = verify_and_extract(zip_path, extract_dir)
 
+            refinement = None
             if args.imu_rectify:
                 log(f"{seq}: IMU rectification")
                 try:
-                    rectify_imu(seq, inner, work, calib_dir)
+                    refinement = rectify_imu(seq, inner, work, calib_dir,
+                                             refine=args.device_refinement)
                 except Exception as error:
                     log(f"{seq}: WARN IMU rectification failed ({error!r}); using raw IMU")
 
@@ -262,6 +284,11 @@ def main() -> int:
                 check=True)
             variant_a = calib_dir / f"{seq}_calib_variantA_default_noise.json"
             write_variant_a_calib(base_calib, variant_a, args.gyro_bias_std)
+            if refinement:
+                variant_a.write_text(json.dumps(
+                    rotate_rig(json.loads(variant_a.read_text()),
+                               refinement["rig_rotation_deg"]), indent=4))
+                log(f"{seq}: camera rig rotated by {refinement['rig_rotation_deg']} deg")
 
             log(f"{seq}: {'VIO + online mapper' if args.slam_exe else 'VIO'}")
             vio_out = work / "vio"

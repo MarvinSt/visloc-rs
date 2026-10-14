@@ -132,6 +132,25 @@ camera-centre RMSE, and beats official COLMAP on the 38-image courtyard control
 
 <p align="center"><sub>Same-input CPU8 Electro 1,200: visloc-rs <b>3.46× faster</b> and <b>25.2% lower</b> camera-centre RMSE than COLMAP. Unordered SfM, sequential SfM vs COLMAP, and EuRoC reconstruction evidence are in the <a href="docs/unordered_sfm_benchmark.md">SfM benchmark docs</a>.</sub></p>
 
+### Against COLMAP 4.2 and GLOMAP on the same inputs
+
+On the 13 ETH3D DSLR training scenes, the visloc-rs mapper is on par with
+COLMAP 4.2's incremental mapper and its global mapper (GLOMAP), and maps
+about 7× faster. All three get the same COLMAP SIFT features and exhaustive
+matches, the GLOMAP paper's setup, and the scoring follows that paper:
+
+| Mapper (pycolmap 4.2.1, 4 threads) | Mean AUC@1° / 3° / 5° | Registered | Mapper time |
+| --- | ---: | ---: | ---: |
+| visloc-rs | 50.9 / 75.5 / 82.1 | 445 / 454 | **28.4 s** |
+| COLMAP incremental | 50.4 / 75.2 / 81.7 | 445 / 454 | 200.7 s |
+| COLMAP global (GLOMAP) | 51.6 / 75.5 / 81.7 | 454 / 454 | 184.4 s |
+
+On visloc-rs's own matches it leads both at every threshold: 53.1 / 78.9 /
+85.7, against COLMAP's three-run means of 50.2 / 75.1 / 82.0 (incremental)
+and 51.3 / 75.0 / 81.1 (global). The global mapper still registers more
+images. Per-scene tables, the run-to-run spread and the caveats are in the
+[ETH3D AUC benchmark](docs/eth3d_auc_benchmark.md).
+
 ### Large connected collections
 
 On the connected OpenLORIS 10k stress set, streamed VLAD + LSH cuts visloc-rs

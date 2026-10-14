@@ -123,6 +123,32 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **ETH3D benchmark against COLMAP 4.2 and GLOMAP.**
+  - **What it runs:** `scripts/benchmark_eth3d_auc.sh` runs the visloc-rs
+    mapper, COLMAP's incremental mapper and COLMAP's global mapper (GLOMAP,
+    via pycolmap 4.2.1) on the 13 ETH3D DSLR training scenes.
+  - **Inputs:** the same inputs for all three, either COLMAP's SIFT and
+    exhaustive matches (the GLOMAP paper's setup) or visloc-rs's own.
+  - **Scoring:** as in the GLOMAP paper, AUC at 1°, 3° and 5° of the pairwise
+    relative pose error.
+  - **Result on COLMAP's matches (mean AUC@1°/3°/5°):**
+
+    | Mapper | AUC | Mapper time |
+    |---|---|---|
+    | visloc-rs | 50.9 / 75.5 / 82.1 | 28.4 s |
+    | COLMAP incremental | 50.4 / 75.2 / 81.7 | 200.7 s |
+    | COLMAP global | 51.6 / 75.5 / 81.7 | 184.4 s |
+
+  - **On visloc-rs's own matches** it leads both at every threshold: 53.1 /
+    78.9 / 85.7, against COLMAP's three-run means of 50.2 / 75.1 / 82.0 and
+    51.3 / 75.0 / 81.1.
+  - **Mapper options:** visloc-rs runs as `gsplat_photos` configures it, with
+    COLMAP 4's structure-less fallback on. On the port's default, which
+    leaves it off, it registers 7 and 3 fewer images and scores 50.7 / 74.5
+    / 80.5 and 51.7 / 76.5 / 83.1.
+  - Tables and caveats: `docs/eth3d_auc_benchmark.md`. Raw results:
+    `benchmarks/eth3d_auc/`.
+
 - **COLMAP-port BA: two-level PCG preconditioner for converging
   solves.** Once a large global BA (1,000+ free frames) is past its first
   three LM steps, its iterative solve adds a coarse correction to the

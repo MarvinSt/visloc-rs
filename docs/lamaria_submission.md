@@ -13,7 +13,9 @@ download ASL zip + pinhole calibration
   -> verify + extract -> rename `aria/` to `mav0/`
   -> apply Aria's factory IMU calibration to `imu0/data.csv`
      (first 4 MiB of the raw `.vrs`; `--no-imu-rectify` skips it)
-  -> pinhole -> Basalt Double-Sphere calibration (variant-A IMU noise)
+     and the per-device IMU time alignment
+  -> pinhole -> Basalt Double-Sphere calibration (variant-A IMU noise,
+     camera rig rotated by the per-device refinement)
   -> run the Basalt VIO
   -> convert the trajectory to the submission estimate
   -> append `slam/<sequence>.txt`, then delete the sequence data
@@ -69,6 +71,15 @@ first 4 MiB of `raw_data/test/<sequence>.vrs` with an HTTP range request, never
 the multi-GB recording, and saves the parsed record as
 `<work-dir>/calibrations/<sequence>_factory_calib.json`. If that fails, the
 sequence runs on the raw IMU and the log shows a `WARN` line.
+
+The per-device IMU-camera refinement is on by default as well
+([`lamaria_drift_analysis.md`](lamaria_drift_analysis.md#imu-camera-calibration);
+`--no-device-refinement` turns it off). The test set was recorded with the two
+devices that also recorded the training set. For each, the refinement aligns
+the gyroscope and accelerometer in time (gyroscope 4.6 ms) and, on
+1WM093701G1276, corrects the IMU-to-camera rotation by 0.36 deg. Both values
+were fitted on training pseudo-GT only. A sequence from another device keeps
+the factory calibration, with a `WARN` line.
 
 On completion the driver writes `submission.zip` next to `--slam-dir` (i.e.
 `<work-dir>/../submission.zip`) containing `slam/<sequence>.txt` for every

@@ -8,9 +8,11 @@ whole per-sequence loop for a track:
     download ASL zip + pinhole calibration
       -> verify + extract -> rename `aria/` to `mav0/`
       -> apply Aria's factory IMU calibration to `imu0/data.csv` (read from
-         the first 4 MiB of the raw `.vrs`; `--no-imu-rectify` skips it)
+         the first 4 MiB of the raw `.vrs`; `--no-imu-rectify` skips it),
+         plus the per-device time alignment (`--no-device-refinement` skips it)
       -> pinhole -> Basalt Double-Sphere calibration (variant A noise,
-         gyro bias random walk tightened to --gyro-bias-std)
+         gyro bias random walk tightened to --gyro-bias-std; camera rig
+         rotated by the per-device refinement)
       -> run the Basalt VIO, or with `--slam-exe` the VIO plus the online
          mapper (`basalt_euroc_online_slam_demo`)
       -> convert the trajectory to the submission estimate
@@ -49,6 +51,15 @@ training sequence per non-Short track it raises the score by +4.35 on average
 (Medium 37.72 -> 39.47, Long 24.14 -> 28.89, Low light 20.42 -> 26.42, Moving
 27.64 -> 32.56). If the `.vrs` header cannot be fetched or parsed the sequence
 falls back to the raw IMU with a WARN line rather than being dropped.
+
+The per-device IMU-camera refinement (scripts/aria_device_refinement.py,
+docs/lamaria_drift_analysis.md) is on by default. LaMAria was recorded with two
+Aria devices; for each, training pseudo-GT shows the gyroscope lagging the
+images by ~4.6 ms and, on 1WM093701G1276, a 0.35 deg IMU-to-camera rotation
+error. Correcting them raises the VIO-only Score on sequence_2_11 38.36 ->
+49.68 and on the held-out sequence_5_11 32.27 -> 43.14 and sequence_1_20
+33.18 -> 38.10. An unknown device serial falls back to the factory calibration
+with a WARN line.
 
 `--slam-exe` (the online-mapper build, docs/lamaria_online_mapper.md) is the
 recommended estimator: on one training sequence per track it adds +5.44 Score
@@ -222,11 +233,10 @@ def main() -> int:
                         help="apply Aria's factory IMU calibration from the .vrs header "
                              "(default on; docs/lamaria_imu_rectification.md)")
     parser.add_argument("--device-refinement", action=argparse.BooleanOptionalAction,
-                        default=False,
+                        default=True,
                         help="re-align the IMU in time and rotate the camera rig by the "
-                             "per-device refinement learned on training data (default off "
-                             "until validated on held-out sequences; needs --imu-rectify; "
-                             "docs/lamaria_drift_analysis.md)")
+                             "per-device refinement learned on training data (default on; "
+                             "needs --imu-rectify; docs/lamaria_drift_analysis.md)")
     parser.add_argument("--threads", type=int, default=12)
     parser.add_argument("--work-dir", type=Path, default=Path("lamaria_submission/work"))
     parser.add_argument("--slam-dir", type=Path, default=Path("lamaria_submission/slam"))

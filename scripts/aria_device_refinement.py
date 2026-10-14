@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """Per-device refinement of the Aria IMU-camera calibration for LaMAria.
 
-LaMAria's whole dataset comes from two Aria devices. On both, the factory
-calibration in the `.vrs` header leaves two errors that partly cancel in the
-VIO:
+LaMAria's whole dataset, test set included, comes from two Aria devices. On
+both, the factory calibration in the `.vrs` header leaves two errors that
+partly cancel in the VIO:
 
 * **Time.** The gyroscope stamps its samples about 4.6 ms after the camera
   image they belong to. The factory `TimeOffsetSec_Device_Gyro` is 4.1 ms.
 * **Rotation.** The rotation between the IMU and the camera rig is off by
-  0.3-0.7 degrees.
+  0.3-0.4 degrees on 1WM093701G1276 and 0.7 degrees on 1WM09370081264.
 
 Both were fitted by integrating the rectified gyroscope between LaMAria
 training pseudo-GT keyframes and matching the pseudo-GT rotations, with a
 free time offset, constant bias and IMU-to-camera rotation
 (docs/lamaria_drift_analysis.md). The accelerometer delay is the factory
 gyroscope-accelerometer difference applied to the fitted gyroscope delay.
-
 Only training data was used: device 1WM093701G1276 from sequence_2_11,
 sequence_3_17 and sequence_4_10, device 1WM09370081264 from sequence_1_19.
+
+VIO-only Score with the refinement: sequence_2_11 38.36 -> 49.68,
+sequence_3_17 35.76 -> 49.23 (its own fit), and on held-out sequences
+sequence_5_11 32.27 -> 43.14 and sequence_1_20 33.18 -> 38.10.
+1WM09370081264 gets the time alignment only; see the table.
 """
 
 import numpy as np
@@ -27,8 +31,11 @@ import numpy as np
 DEVICE_REFINEMENT = {
     "1WM093701G1276": {"gyro_delay_ns": 4_600_000, "accel_delay_ns": 3_580_000,
                        "rig_rotation_deg": [0.276, 0.217, -0.077]},
+    # Fitted 0.74 deg rig rotation [0.566, -0.290, 0.369] not applied: on the held-out
+    # sequence_1_20 it overshoots (yaw drift -6.0 -> +10.5 deg, VIO Score 33.18 -> 27.32),
+    # while the time alignment alone scores 38.10.
     "1WM09370081264": {"gyro_delay_ns": 4_600_000, "accel_delay_ns": 3_140_000,
-                       "rig_rotation_deg": [0.566, -0.290, 0.369]},
+                       "rig_rotation_deg": [0.0, 0.0, 0.0]},
 }
 
 

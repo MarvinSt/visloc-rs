@@ -6,7 +6,9 @@ IMU, `gyro_bias_std` 1e-7, the multicam big-window config, the online mapper
 and the 5° loop gate ([`lamaria_online_mapper.md`](lamaria_online_mapper.md)).
 It started from the Moving-platform track, which had the largest gap to the
 leaderboard (36.19 on sequence_5_11), and ended at a cause shared by all
-tracks.
+tracks: the factory IMU-camera calibration, whose time and rotation errors
+drive the VIO's heading drift
+([IMU-camera calibration](#imu-camera-calibration)).
 
 The Score uses the horizontal (2D) error of each CP after the evaluator's
 robust Sim(3) alignment. Points fall from 20 below 5 cm to 0 at 10 m
@@ -125,8 +127,109 @@ sequence_5_11's VIO only slightly: Score 32.27 → 32.98, and the fitted yaw
 drift goes from −3.18° to −2.87° instead of the 2.6° reduction the
 hypothesis predicts. The body-frame projection of a vertical rate depends
 only on roll and pitch. With the wearer's head roughly upright, the gyro bias
-estimate absorbs most of it. The systematic heading drift therefore has
-another cause, which is still open.
+estimate absorbs most of it. The heading drift comes from the IMU-camera
+calibration instead (next section).
+
+## IMU-camera calibration
+
+The VIO's heading drift is very sensitive to the IMU-camera time offset and
+rotation. On sequence_2_11, shifting the whole IMU by −4.1, 0 and +4.1 ms
+gives a yaw drift of −8.1°, −2.6° and +1.8° after 20 minutes
+(`gyro_bias_std` 1e-6). The factory calibration in the `.vrs` header gets
+both slightly wrong.
+
+### Measuring both against the pseudo-GT
+
+The rectified gyroscope is integrated between consecutive pseudo-GT
+keyframes (about 150 ms apart), shifted by a trial time offset, and compared
+with the pseudo-GT relative rotation. A constant gyro bias and the gyro-to-
+camera rotation are fitted at each offset. The pseudo-GT poses are in the
+camera-slam-left frame, whose factory orientation relative to the IMU is
+exactly the one in the pinhole calibration.
+
+| Sequence | Device | Best gyro delay | Residual (median per pair) | Rig rotation correction | Angle |
+|---|---|---:|---:|---|---:|
+| sequence_2_11 | 1WM093701G1276 | 4.75 ms | 0.066° | [0.21, 0.20, −0.07]° | 0.30° |
+| sequence_3_17 | 1WM093701G1276 | 4.5 ms | 0.072° | [0.28, 0.24, −0.10]° | 0.38° |
+| sequence_4_10 | 1WM093701G1276 | 4.5 ms | 0.080° | [0.34, 0.21, −0.06]° | 0.41° |
+| sequence_1_19 | 1WM09370081264 | 4.5 ms | 0.069° | [0.57, −0.29, 0.37]° | 0.74° |
+| sequence_1_20 | 1WM09370081264 | 4.5 ms | 0.068° | [0.60, −0.26, 0.32]° | 0.73° |
+
+- **Time.** The gyroscope stamps its samples 4.5–4.75 ms after the image they
+  belong to; the factory `TimeOffsetSec_Device_Gyro` is 4.1 ms. Aligning
+  them divides the per-pair residual by three (0.228° → 0.066° on
+  sequence_2_11). The delay is the same on both devices and does not depend
+  on exposure: sequence_4_10 is exposed for 14 ms and sequence_2_11 for
+  0.08 ms (median).
+- **Rotation.** The fitted gyro-to-camera rotation differs from the factory
+  one by 0.3–0.4° on 1WM093701G1276 and 0.73° on 1WM09370081264. Within a
+  device the correction agrees to within 0.15°.
+- **Rectification.** The factory rectification `R^-1 (raw − b)` fits better
+  than dropping or flipping its rotation part (0.38°, 0.63° and 0.88° from the
+  factory rotation on sequence_3_17). A general 3×3 gyro correction improves
+  the residual by only 1–5 %: the gyro scale is right to 0.2–0.3 %.
+
+Every test sequence was recorded with one of these two devices
+(1WM093701G1276: 34 sequences, 1WM09370081264: 29).
+
+### Partial corrections make it worse
+
+The two errors partly cancel in the VIO, so correcting one of them alone
+is worse than correcting neither (VIO only, `gyro_bias_std` 1e-7):
+
+| Run | Score | Yaw drift at the end | Tilt error, max |
+|---|---:|---:|---:|
+| sequence_2_11 baseline | 38.36 | −3.05° | 1.30° |
+| sequence_2_11, time only | 35.61 | −10.18° | 0.68° |
+| sequence_3_17 baseline | 35.76 | −6.92° | 1.65° |
+| sequence_3_17, rotation only (own fit) | 34.09 | +4.55° | 1.62° |
+| sequence_3_17, time + rotation (own fit) | **49.23** | **+0.25°** | **0.82°** |
+
+With both corrected from sequence_3_17's own fit, its Pose recall rises from
+4.2 % to 27.1 % at 1 m and from 86.2 % to 100 % at 5 m.
+
+### Per-device refinement
+
+[`scripts/aria_device_refinement.py`](../scripts/aria_device_refinement.py)
+stores one refinement per device, fitted on training sequences only
+(1WM093701G1276: sequence_2_11, sequence_3_17 and sequence_4_10;
+1WM09370081264: sequence_1_19). The test-set ground truth is never used. The
+gyro delay is 4.6 ms on both devices. The accelerometer delay keeps the
+factory gyroscope-accelerometer difference: 3.58 ms and 3.14 ms. VIO only:
+
+| Sequence | Device | Refinement | Score | Pose R@5m | Yaw drift at the end |
+|---|---|---|---|---|---|
+| sequence_2_11 | G1276 | time + rotation | 38.36 → **49.68** | 89.8 → 100 % | −3.05° → +0.74° |
+| sequence_5_11 (held out) | G1276 | time + rotation | 32.27 → **43.14** | n/a | −3.18° → −0.69° (CP fit) |
+| sequence_1_20 (held out) | 81264 | time + rotation | 33.18 → 27.32 | 88.0 → 74.8 % | −6.00° → +10.45° |
+| sequence_1_20 (held out) | 81264 | time only | 33.18 → **38.10** | 88.0 → 94.2 % | −6.00° → −5.27° |
+
+On 1WM09370081264 the fitted 0.73° rotation overshoots, although it is
+reproduced to 0.07° by sequence_1_20's own fit. Rotating only the gyroscope
+(leaving the accelerometer-camera rotation at the factory value) gives the
+same overshoot over the first 8 minutes of sequence_1_20 (yaw +4.5° against
++4.4° for the rig rotation, −2.1° with the time alignment alone), so the
+accelerometer is not the cause. That device therefore gets the time
+alignment only. The time alignment alone also brings sequence_1_20's global
+Sim(3) scale from 0.983 to 1.001 and its first-8-minute ATE from 1.26 m to
+0.73 m.
+
+The submission driver applies the refinement by default
+(`--no-device-refinement` turns it off). It shifts the gyroscope and
+accelerometer samples while rectifying the IMU, and rotates the camera rig in
+the Basalt calibration, keeping the stereo extrinsics.
+
+### Calibration without ground truth (not usable yet)
+
+- **Camera-only rotations** (KLT + essential matrix on cam0, 150 ms pairs)
+  recover the 5 ms delay, but their rotation axes are biased: 0.66° per pair
+  against the pseudo-GT, and the fitted gyro-to-camera rotation is about 4°
+  off. The bias does not average out, which points to forward walking
+  coupling into the rotation estimate.
+- **Stereo pairs** (SIFT across the 75° camera divergence) give too few
+  matches: 4–6 usable frames and ±2–3° scatter.
+- **Gravity** (gyro-propagated, accelerometer-observed) estimates the
+  gyro-to-accelerometer rotation with ~1° scatter between sequences.
 
 ## Changes in the VIO (both opt-in, default off)
 
@@ -165,9 +268,10 @@ so it stays off.
 
 ## Open items
 
-1. **Heading drift.** Its systematic sign suggests a deterministic cause,
-   for example a temperature-driven gyro bias change that the tight bias
-   random walk cannot follow, or a small gyro–camera misalignment.
+1. **Calibration without the device table.** The refinement relies on
+   both devices having training pseudo-GT. Estimating the gyro delay and the
+   IMU-camera rotation online in the VIO would remove that dependency and
+   may explain why 1WM09370081264 rejects its fitted rotation.
 2. **Local scale drift.** On sequence_5_11 it is the largest error term.
    The online mapper's joint VI-BA (`--joint-vi-ba-weight 10`) leaves the
    local scale of sequence_3_17 unchanged, so the IMU factors carry too

@@ -923,3 +923,15 @@ gauge deviation is real.
 
 Neither candidate is to be run without a recorded gate (2.5k non-regression
 first) per §8.3.
+
+### 9.4 Converged final BA (a deliberate deviation)
+
+Models of 1,000 or more registered frames now end with one extra global
+refinement whose BA runs to convergence
+(`PipelineOptions::ba_global_final_converge_min_frames`). COLMAP's
+one-to-two-step global BAs leave smooth scale drift along long captures in
+place. On SmallCity this final BA takes the median centre error from 0.611 m
+to 0.178 m. Parity runs against COLMAP on the 2.5k/5k/10k tiers must turn it
+off by setting `ba_global_final_converge_min_frames=100000000` (or any number
+above the model size). Set it as a line in the replay's `mapper_options.txt`,
+or with `gsplat_euroc --mapper-opt`.

@@ -60,9 +60,12 @@ pub struct PipelineOptions {
     /// after one or two steps. Each of those starts from Ceres' initial
     /// trust radius, whose damping holds back the smooth, low-curvature
     /// modes of a long capture (scale drifting along a street), so no
-    /// global BA of the incremental loop ever corrects them. Off by
-    /// default (`ba_global_final_converge=1`).
-    pub ba_global_final_converge: bool,
+    /// global BA of the incremental loop ever corrects them. Runs on
+    /// models of at least this many registered frames
+    /// (`ba_global_final_converge_min_frames`, default
+    /// [`FINAL_CONVERGE_MIN_FRAMES`]); `0` runs it on every model, a number
+    /// above any model's size turns it off.
+    pub ba_global_final_converge_min_frames: usize,
     pub ba_global_frames_ratio: f64,
     pub ba_global_points_ratio: f64,
     pub ba_global_frames_freq: usize,
@@ -98,7 +101,7 @@ impl Default for PipelineOptions {
             ba_local_max_refinement_change: 0.001,
             ba_global_max_refinements: 5,
             ba_global_max_refinement_change: 0.0005,
-            ba_global_final_converge: false,
+            ba_global_final_converge_min_frames: FINAL_CONVERGE_MIN_FRAMES,
             ba_global_frames_ratio: 1.1,
             ba_global_points_ratio: 1.1,
             ba_global_frames_freq: 500,
@@ -116,7 +119,7 @@ impl PipelineOptions {
     /// Apply one `key=value` override: COLMAP's `ba_refine_focal_length` /
     /// `ba_refine_principal_point` / `ba_refine_sensor_from_rig` (`0`/`1`, on
     /// both the local and the global BA options), this port's
-    /// `ba_global_final_converge` (`0`/`1`), else
+    /// `ba_global_final_converge_min_frames` (a frame count), else
     /// [`MapperOptions::apply_override`].
     pub fn apply_override(&mut self, kv: &str) -> Result<(), String> {
         let flag = |value: &str, key: &str| {
@@ -144,8 +147,9 @@ impl PipelineOptions {
                 self.global_ba.refine_sensor_from_rig = on;
                 Ok(())
             }
-            Some((key @ "ba_global_final_converge", value)) => {
-                self.ba_global_final_converge = flag(value, key)?;
+            Some((key @ "ba_global_final_converge_min_frames", value)) => {
+                self.ba_global_final_converge_min_frames =
+                    value.trim().parse().map_err(|e| format!("{key}: {e}"))?;
                 Ok(())
             }
             _ => self.mapper.apply_override(kv),
@@ -250,7 +254,14 @@ fn check_run_global_refinement(
         || recon.num_points3d() >= options.ba_global_points_freq + prev_points
 }
 
-/// LM step cap of the [`PipelineOptions::ba_global_final_converge`] BA.
+/// Default [`PipelineOptions::ba_global_final_converge_min_frames`]: the
+/// size at which global BAs switch to the iterative solver, below which the
+/// incremental loop's direct solves leave little drift behind (ETH3D's
+/// scenes, at most 76 frames, change only within noise with it on), while
+/// SmallCity's 5,816 frames go from 0.611 m to 0.178 m median centre error.
+pub const FINAL_CONVERGE_MIN_FRAMES: usize = 1000;
+
+/// LM step cap of the [`PipelineOptions::ba_global_final_converge_min_frames`] BA.
 /// A smooth drift needs the trust radius to grow by about 1e4 (three
 /// accepted steps per decade) before it moves; the solve usually stops
 /// earlier, on the function tolerance.
@@ -457,7 +468,7 @@ fn reconstruct_sub_model(
         iterative_global_refinement(options, mapper_options, mapper, db, recon);
     }
 
-    if options.ba_global_final_converge && recon.num_reg_frames() >= 2 {
+    if recon.num_reg_frames() >= options.ba_global_final_converge_min_frames.max(2) {
         // Diagnostic: the model as the incremental loop left it, to compare
         // with the converged one from the same run.
         if let Some(dir) = std::env::var_os("VISLOC_SNAPSHOT_BEFORE_FINAL") {
@@ -595,6 +606,22 @@ mod tests {
     /// `mapper.rs`'s module doc), triangulation, local/global BA — against a
     /// from-scratch synthetic `DatabaseCache`, then Umeyama-aligns (with
     /// scale) the recovered frame-center trajectory against ground truth.
+    #[test]
+    fn final_converge_threshold_override() {
+        let mut options = PipelineOptions::default();
+        assert_eq!(
+            options.ba_global_final_converge_min_frames,
+            FINAL_CONVERGE_MIN_FRAMES
+        );
+        options
+            .apply_override("ba_global_final_converge_min_frames=0")
+            .unwrap();
+        assert_eq!(options.ba_global_final_converge_min_frames, 0);
+        assert!(options
+            .apply_override("ba_global_final_converge_min_frames=on")
+            .is_err());
+    }
+
     #[test]
     fn pipeline_recovers_all_frames_and_metric_scale() {
         let scene = build_synthetic_rig_scene(20, 4);

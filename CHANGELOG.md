@@ -83,11 +83,18 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
-- **COLMAP-port mapper: opt-in converged final BA
-  (`--mapper-opt ba_global_final_converge=1`).** This is not in COLMAP.
-  - **What it does:** each model ends with one more global refinement.
-    Its BA runs to convergence (absolute gradient stop, up to 50 LM
-    steps).
+- **COLMAP-port mapper: a converged final BA on large models.** This is
+  not in COLMAP.
+  - **What it does:** each model of 1,000 or more registered frames ends
+    with one more global refinement. Its BA runs to convergence (absolute
+    gradient stop, up to 50 LM steps).
+  - **When it runs:** 1,000 frames is where global BAs switch to the
+    iterative solver. Smaller models, such as the ETH3D scenes and
+    Courthouse, are unchanged.
+  - **Setting it:** `ba_global_final_converge_min_frames=N` sets the
+    threshold. Pass it as `gsplat_euroc --mapper-opt`, or as a line in a
+    replay's `mapper_options.txt`. `0` runs it on every model, and a
+    number above any model's size turns it off.
   - **Why it is needed:** COLMAP's global BAs stop on the relative
     `gradient_tolerance=1.0` after one or two steps. Each restarts from
     Ceres' initial trust radius, whose damping holds back smooth,
@@ -111,14 +118,15 @@ All notable changes to `visloc-rs` will be documented here.
     | Scale drift along the path | ±4% | about ±1% |
     | Per-pass fitted scales | 3.92 to 4.19 | 3.92 to 3.98 |
 
-    - The "before" model matches the earlier replay without the option
-      byte for byte.
+    - The "before" model matches the earlier replay without this BA byte
+      for byte.
     - The final BA ran 41 LM steps (20,102 PCG iterations) and stopped on
       the function tolerance. It took 11 minutes, so the mapper's wall
       time went from 21:00 to 30:26.
-  - **ETH3D, 13 scenes:** the change is within noise. Meadow goes from
-    5.73 to 4.94 cm and facade from 1.67 to 1.77 cm, so the option stays
-    off by default.
+  - **ETH3D, 13 scenes, forced on with a threshold of 0:** the change is
+    within noise. Meadow goes from 5.73 to 4.94 cm and facade from 1.67
+    to 1.77 cm. That is why small models are left out. At the default
+    threshold, all 15 ETH3D models are byte-identical to before.
   - `VISLOC_SNAPSHOT_BEFORE_FINAL=<dir>` writes the model as the
     incremental loop left it, so one run gives both models.
 

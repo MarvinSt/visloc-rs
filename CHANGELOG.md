@@ -173,6 +173,21 @@ All notable changes to `visloc-rs` will be documented here.
     - With the two-level PCG preconditioner (the entry above), the same
       final BA takes 14 steps and 204 s and reaches 0.146 m. The mapper
       then takes 23:20.
+    - **Follow-up: the gain depends on the reconstruction path.** Three
+      replays with the same matches and `--random-seed` 0, 1 and 2 give
+      these median centre errors:
+
+      | seed | before the final BA | after |
+      |---|---|---|
+      | 0 | 0.611 m | 0.146 m |
+      | 1 | 0.496 m | 0.366 m |
+      | 2 | 0.840 m | 0.711 m |
+
+      The final BA improves every path, but it removes the scale drift
+      (about ±4% along the path) only on seed 0. Seed 2's BA stops after
+      seven accepted steps on the function tolerance, while its trust
+      radius is still small. In seed 1's BA, 7 of 18 trials are
+      rejected.
   - **ETH3D, 13 scenes, forced on with a threshold of 0:** the change is
     within noise. Meadow goes from 5.73 to 4.94 cm and facade from 1.67
     to 1.77 cm. That is why small models are left out. At the default

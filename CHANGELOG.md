@@ -83,6 +83,31 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **COLMAP-port BA: two-level PCG preconditioner.** The iterative
+  solve of large global BAs (1,000+ free frames) adds a coarse correction
+  to its run-of-frames preconditioner.
+  - **What it does:** one shared 6-vector step per aggregate of 32
+    consecutive frames, solved densely (`P (PᵀAP)⁻¹ Pᵀ r`). A frame's step
+    is a world-frame motion, so a shared step moves the aggregate rigidly.
+  - **Why it helps:** smooth deformations of a long capture, such as scale
+    drifting along a street, are close to rigid at that scale. They are
+    the low-curvature modes conjugate gradients converge on slowest, and
+    the run-of-frames level cannot see them.
+  - **Cost:** at most 256 aggregates. SmallCity's coarse factor (1,092
+    rows) takes 55 ms a solve and 0.5 ms a PCG iteration, against about
+    26 ms for one PCG product. `VISLOC_PORT_PCG_COARSE=0` turns it off.
+  - **PCG iterations, 4-thread benches:**
+
+    | Bench | without | with |
+    |---|---|---|
+    | 1,500-frame drift test, converged solve | 3,620 (5.2 s) | 942 (1.7 s) |
+    | `large_global_ba`, 1,200 frames, one pass | 803 | 207 |
+    | `large_global_ba`, 1,200 frames, four passes | 149 | 80 |
+
+    The final costs match.
+  - **Smaller problems are unchanged:** all 15 ETH3D models are
+    byte-identical, since none reaches the iterative solve.
+
 - **COLMAP-port mapper: a converged final BA on large models.** This is
   not in COLMAP.
   - **What it does:** each model of 1,000 or more registered frames ends

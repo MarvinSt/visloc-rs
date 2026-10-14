@@ -747,6 +747,105 @@ fn cluster_preconditioner(
         .collect()
 }
 
+/// Free frames per aggregate of the PCG's coarse correction
+/// ([`coarse_correction`]); `VISLOC_PORT_PCG_COARSE=g` overrides it, `0`
+/// or `1` turns the correction off. Larger problems use larger aggregates,
+/// at most [`PCG_COARSE_MAX_AGGREGATES`] of them.
+const PCG_COARSE_FRAMES: usize = 32;
+/// Cap on the coarse level's aggregates: its dense factor (up to 1,536
+/// rows) then costs at most ~0.2 s a solve and its triangular solves ~1 ms
+/// a PCG iteration. SmallCity's 5,816 frames stay at 32 a group (1,092
+/// rows: 55 ms and 0.5 ms, against ~26 ms for one PCG product).
+const PCG_COARSE_MAX_AGGREGATES: usize = 256;
+fn pcg_coarse_size() -> Option<usize> {
+    static G: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        Some(
+            std::env::var("VISLOC_PORT_PCG_COARSE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(PCG_COARSE_FRAMES),
+        )
+        .filter(|&g| g > 1)
+    })
+}
+
+/// The coarse level of the PCG preconditioner: the reduced camera matrix
+/// restricted to one shared 6-vector step per aggregate of `group`
+/// consecutive frames (`Pᵀ A P`, `P` stacking identity blocks), factored.
+/// A frame's step `ξ` acts as `pose ∘ exp(ξ)`, a world-frame motion, so a
+/// shared step moves the aggregate rigidly. Smooth deformations of a long
+/// capture, such as scale drifting along a street, are close to rigid at
+/// that scale; they are the low-curvature modes the cluster level cannot
+/// see and conjugate gradients converge on slowest.
+struct CoarseCorrection {
+    group: usize,
+    /// Leading free frames covered; the extra nodes after them are not.
+    n_frames: usize,
+    chol: nalgebra::Cholesky<f64, nalgebra::Dyn>,
+}
+
+impl CoarseCorrection {
+    /// `z += P (Pᵀ A P)⁻¹ Pᵀ r`.
+    fn add_to(&self, r: &[Vector6<f64>], z: &mut [Vector6<f64>]) {
+        let m = self.chol.l_dirty().nrows();
+        let mut rc = DVector::<f64>::zeros(m);
+        for (i, ri) in r.iter().enumerate().take(self.n_frames) {
+            let g = i / self.group * 6;
+            for k in 0..6 {
+                rc[g + k] += ri[k];
+            }
+        }
+        let yc = self.chol.solve(&rc);
+        for (i, zi) in z.iter_mut().enumerate().take(self.n_frames) {
+            let g = i / self.group * 6;
+            for k in 0..6 {
+                zi[k] += yc[g + k];
+            }
+        }
+    }
+}
+
+/// [`CoarseCorrection`] over the first `n_frames` free frames, or `None`
+/// for fewer than two aggregates or a coarse matrix that is not positive
+/// definite.
+fn coarse_correction(
+    diag: &[Matrix6<f64>],
+    edges: &[(u32, u32)],
+    offdiag: &[Matrix6<f64>],
+    n_frames: usize,
+    group: usize,
+) -> Option<CoarseCorrection> {
+    let group = group.max(n_frames.div_ceil(PCG_COARSE_MAX_AGGREGATES));
+    let m = n_frames.div_ceil(group);
+    if m < 2 {
+        return None;
+    }
+    let mut a = DMatrix::<f64>::zeros(m * 6, m * 6);
+    for (i, d) in diag.iter().enumerate().take(n_frames) {
+        let g = i / group * 6;
+        let mut view = a.view_mut((g, g), (6, 6));
+        view += d;
+    }
+    for (&(ea, eb), blk) in edges.iter().zip(offdiag) {
+        let (ea, eb) = (ea as usize, eb as usize);
+        if ea >= n_frames || eb >= n_frames {
+            continue;
+        }
+        let (ga, gb) = (ea / group * 6, eb / group * 6);
+        // `blk` is the (row b, column a) block.
+        let mut view = a.view_mut((gb, ga), (6, 6));
+        view += blk;
+        let mut view = a.view_mut((ga, gb), (6, 6));
+        view += blk.transpose();
+    }
+    a.cholesky().map(|chol| CoarseCorrection {
+        group,
+        n_frames,
+        chol,
+    })
+}
+
 /// One off-diagonal block's share of the PCG product: `(Bᵀ x_b, B x_a)`
 /// for the column-major (row b, column a) block `B`, read once, in f64
 /// whatever the block's storage type.
@@ -838,7 +937,7 @@ fn pcg_csr6(
             })
             .collect()
     };
-    pcg_core(&diag, matvec, rhs, tol, None).map(|(x, _)| x)
+    pcg_core(&diag, matvec, rhs, tol, None, None).map(|(x, _)| x)
 }
 
 /// [`pcg_blocks6`] with the matrix given by its diagonal blocks and a
@@ -849,29 +948,37 @@ fn pcg_core(
     rhs: &DMatrix<f64>,
     tol: f64,
     clusters: Option<&[(usize, DMatrix<f64>)]>,
+    coarse: Option<&CoarseCorrection>,
 ) -> Option<(DMatrix<f64>, usize)> {
     let n = diag.len();
     let precond: Vec<Matrix6<f64>> = diag
         .par_iter()
         .map(|d| d.cholesky().map(|c| c.inverse()))
         .collect::<Option<Vec<_>>>()?;
-    // z = M⁻¹ r: block-Jacobi, or per-cluster dense inverses when given.
+    // z = M⁻¹ r: block-Jacobi, or per-cluster dense inverses when given,
+    // plus the coarse correction when given (additive two-level).
     let apply = |r: &[Vector6<f64>]| -> Vec<Vector6<f64>> {
-        let Some(clusters) = clusters else {
-            return r.iter().zip(&precond).map(|(r, m)| m * r).collect();
+        let mut z: Vec<Vector6<f64>> = match clusters {
+            None => r.iter().zip(&precond).map(|(r, m)| m * r).collect(),
+            Some(clusters) => {
+                let parts: Vec<Vec<Vector6<f64>>> = clusters
+                    .par_iter()
+                    .map(|(start, inv)| {
+                        let m = inv.nrows() / 6;
+                        let rc = DVector::<f64>::from_fn(m * 6, |k, _| r[start + k / 6][k % 6]);
+                        let zc = inv * rc;
+                        (0..m)
+                            .map(|i| Vector6::from_fn(|k, _| zc[i * 6 + k]))
+                            .collect()
+                    })
+                    .collect();
+                parts.into_iter().flatten().collect()
+            }
         };
-        let parts: Vec<Vec<Vector6<f64>>> = clusters
-            .par_iter()
-            .map(|(start, inv)| {
-                let m = inv.nrows() / 6;
-                let rc = DVector::<f64>::from_fn(m * 6, |k, _| r[start + k / 6][k % 6]);
-                let zc = inv * rc;
-                (0..m)
-                    .map(|i| Vector6::from_fn(|k, _| zc[i * 6 + k]))
-                    .collect()
-            })
-            .collect();
-        parts.into_iter().flatten().collect()
+        if let Some(coarse) = coarse {
+            coarse.add_to(r, &mut z);
+        }
+        z
     };
     let dot = |a: &[Vector6<f64>], b: &[Vector6<f64>]| -> f64 {
         let partial: Vec<f64> = a.par_iter().zip(b).map(|(x, y)| x.dot(y)).collect();
@@ -2178,12 +2285,15 @@ fn solve_step(
         let t = Instant::now();
         let clusters = pcg_cluster_size()
             .and_then(|k| cluster_preconditioner(&frame_diag, edges, &flat_offdiag, k));
+        let coarse = pcg_coarse_size()
+            .and_then(|g| coarse_correction(&frame_diag, edges, &flat_offdiag, first_extra, g));
         let (solved, iterations) = pcg_core(
             &frame_diag,
             matvec,
             &rhs,
             pcg_relative_tolerance(),
             clusters.as_deref(),
+            coarse.as_ref(),
         )?;
         timings.pcg_iterations += iterations;
         let mut dx_frames = vec![Vector6::<f64>::zeros(); n_free];
@@ -4092,16 +4202,88 @@ mod iterative_bench {
                 .map(|i| Vector6::from_fn(|k, _| y[i * 6 + k]))
                 .collect()
         };
-        let (jacobi, it_jacobi) = pcg_core(&diag, matvec, &rhs, 1e-10, None).expect("pcg");
+        let (jacobi, it_jacobi) = pcg_core(&diag, matvec, &rhs, 1e-10, None, None).expect("pcg");
         let clusters = cluster_preconditioner(&diag, &edges, &offdiag, 16).expect("SPD runs");
         let (clustered, it_clustered) =
-            pcg_core(&diag, matvec, &rhs, 1e-10, Some(&clusters)).expect("pcg");
+            pcg_core(&diag, matvec, &rhs, 1e-10, Some(&clusters), None).expect("pcg");
         let scale = exact.norm();
         assert!((&jacobi - &exact).norm() < 1e-6 * scale);
         assert!((&clustered - &exact).norm() < 1e-6 * scale);
         assert!(
             it_clustered < it_jacobi,
             "clustered {it_clustered} vs block-Jacobi {it_jacobi} iterations"
+        );
+    }
+
+    /// Diagonal blocks, edges and their off-diagonal blocks.
+    type EdgeSystem = (Vec<Matrix6<f64>>, Vec<(u32, u32)>, Vec<Matrix6<f64>>);
+
+    /// A reduced camera system shaped like a long open capture: each frame
+    /// couples to its 8 capture-order neighbours on each side, as a graph
+    /// Laplacian plus a little diagonal damping. Its smooth modes (one end
+    /// moving against the other) have tiny eigenvalues, the modes a drifting
+    /// street capture leaves to the solver.
+    fn chain_system(n: usize) -> EdgeSystem {
+        let k = 8;
+        let mut diag: Vec<Matrix6<f64>> = (0..n)
+            .map(|i| {
+                Matrix6::from_diagonal(&Vector6::from_fn(|r, _| 1e-4 * (1 + (i + r) % 3) as f64))
+            })
+            .collect();
+        let mut edges = Vec::new();
+        let mut offdiag = Vec::new();
+        for a in 0..n {
+            for b in a + 1..(a + k + 1).min(n) {
+                let w = 1.0 + ((a * 7 + b * 3) % 5) as f64 * 0.1;
+                let blk = Matrix6::identity() * -w;
+                diag[a] += Matrix6::identity() * w;
+                diag[b] += Matrix6::identity() * w;
+                edges.push((a as u32, b as u32));
+                offdiag.push(blk);
+            }
+        }
+        (diag, edges, offdiag)
+    }
+
+    /// The coarse correction keeps the solution and takes the PCG through
+    /// the chain's smooth modes in fewer iterations.
+    #[test]
+    fn coarse_corrected_pcg_matches_cholesky() {
+        let n = 600;
+        let (diag, edges, offdiag) = chain_system(n);
+        let mut dense = DMatrix::<f64>::zeros(n * 6, n * 6);
+        for (i, d) in diag.iter().enumerate() {
+            dense.view_mut((i * 6, i * 6), (6, 6)).copy_from(d);
+        }
+        for (&(a, b), blk) in edges.iter().zip(&offdiag) {
+            let (a, b) = (a as usize, b as usize);
+            dense.view_mut((b * 6, a * 6), (6, 6)).copy_from(blk);
+            dense
+                .view_mut((a * 6, b * 6), (6, 6))
+                .copy_from(&blk.transpose());
+        }
+        let rhs = DMatrix::<f64>::from_fn(n * 6, 1, |i, _| ((i * 13) % 17) as f64 - 8.0);
+        let exact = dense.clone().cholesky().expect("SPD").solve(&rhs);
+        let matvec = |x: &[Vector6<f64>]| -> Vec<Vector6<f64>> {
+            let xs = DVector::<f64>::from_fn(n * 6, |k, _| x[k / 6][k % 6]);
+            let y = &dense * xs;
+            (0..n)
+                .map(|i| Vector6::from_fn(|k, _| y[i * 6 + k]))
+                .collect()
+        };
+        let clusters = cluster_preconditioner(&diag, &edges, &offdiag, 32).expect("SPD runs");
+        let coarse = coarse_correction(&diag, &edges, &offdiag, n, 32).expect("SPD coarse");
+        let (one, it_one) =
+            pcg_core(&diag, matvec, &rhs, 1e-8, Some(&clusters), None).expect("pcg");
+        let (two, it_two) =
+            pcg_core(&diag, matvec, &rhs, 1e-8, Some(&clusters), Some(&coarse)).expect("pcg");
+        let scale = exact.norm();
+        assert!((&one - &exact).norm() < 1e-4 * scale);
+        assert!((&two - &exact).norm() < 1e-4 * scale);
+        // 33 against 58 when written.
+        assert!(
+            3 * it_two < 2 * it_one,
+            "two-level {it_two} vs cluster-only {it_one} iterations"
         );
     }
 

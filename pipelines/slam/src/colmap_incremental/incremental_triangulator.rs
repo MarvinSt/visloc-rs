@@ -29,7 +29,7 @@
 //! inlier set (`TriangulationEstimator::Estimate` on the inlier views) and
 //! keeps expanding while the inlier support strictly improves.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use nalgebra::{DMatrix, Point2, Point3};
 use visloc_vision::two_view::CorrespondenceGraph;
@@ -358,6 +358,58 @@ impl IncrementalTriangulator {
         obs: &mut ObservationManager,
         image_id: ImageT,
     ) -> usize {
+        self.complete_image_reusing(
+            options,
+            recon,
+            graph,
+            obs,
+            image_id,
+            ZeroAddSearches::default(),
+        )
+    }
+
+    /// [`Self::complete_tracks`] followed by [`Self::complete_image`], as
+    /// `AdjustLocalBundle` runs them (`incremental_mapper.cc:1082-1089`),
+    /// with the same result. Between the two passes nothing a completion
+    /// search reads changes except the 2D points the first pass claims, so
+    /// a search that added nothing there, none of whose examined 2D points
+    /// was claimed, would add nothing again: the image pass reuses it for
+    /// the new image's 3D points (most of which the first pass just
+    /// completed) instead of searching again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_tracks_and_image(
+        &mut self,
+        options: &Options,
+        recon: &mut Reconstruction,
+        graph: &CorrespondenceGraph,
+        obs: &mut ObservationManager,
+        point3d_ids: &[Point3DT],
+        image_id: ImageT,
+    ) -> (usize, usize) {
+        let mut searches = ZeroAddSearches::default();
+        let n_tracks = self.complete_tracks_recording(
+            options,
+            recon,
+            graph,
+            obs,
+            point3d_ids,
+            Some(&mut searches),
+        );
+        let n_image = self.complete_image_reusing(options, recon, graph, obs, image_id, searches);
+        (n_tracks, n_image)
+    }
+
+    /// [`Self::complete_image`], reusing `searches` (see
+    /// [`Self::complete_tracks_and_image`]).
+    fn complete_image_reusing(
+        &mut self,
+        options: &Options,
+        recon: &mut Reconstruction,
+        graph: &CorrespondenceGraph,
+        obs: &mut ObservationManager,
+        image_id: ImageT,
+        mut searches: ZeroAddSearches,
+    ) -> usize {
         let mut num_tris = 0;
         self.clear_caches();
 
@@ -382,9 +434,30 @@ impl IncrementalTriangulator {
         let indices: Vec<Point2DT> = (0..num_points2d).collect();
         for wave in indices.chunks(PLAN_WAVE) {
             let recon_ref: &Reconstruction = recon;
+            // A reused search keeps the track length it was made for, so a
+            // track that grew since fails the check below like a stale plan.
+            let image = recon_ref.image(image_id);
+            let reused: Vec<Option<(Point3DT, ZeroAddSearch)>> = wave
+                .iter()
+                .map(|&idx| {
+                    let point3d_id = image.points2d[idx].point3d_id?;
+                    Some((point3d_id, searches.remove(&point3d_id)?))
+                })
+                .collect();
             let plans: Vec<ImagePointPlan> = wave
                 .par_iter()
-                .map(|&idx| plan_complete_image_point(options, recon_ref, graph, image_id, idx))
+                .zip(reused)
+                .map(|(&idx, reused)| match reused {
+                    Some((point3d_id, (track_len, examined))) => ImagePointPlan::Complete {
+                        point3d_id,
+                        track_len,
+                        plan: CompletePlan {
+                            examined,
+                            adds: Vec::new(),
+                        },
+                    },
+                    None => plan_complete_image_point(options, recon_ref, graph, image_id, idx),
+                })
                 .collect();
             for (&point2d_idx, plan) in wave.iter().zip(plans) {
                 match plan {
@@ -501,10 +574,26 @@ impl IncrementalTriangulator {
         obs: &mut ObservationManager,
         point3d_ids: &[Point3DT],
     ) -> usize {
+        self.complete_tracks_recording(options, recon, graph, obs, point3d_ids, None)
+    }
+
+    /// [`Self::complete_tracks`]; with `record`, also returns there each
+    /// point whose search added nothing and examined no 2D point the pass
+    /// claimed, with its track length and examined 2D points.
+    fn complete_tracks_recording(
+        &mut self,
+        options: &Options,
+        recon: &mut Reconstruction,
+        graph: &CorrespondenceGraph,
+        obs: &mut ObservationManager,
+        point3d_ids: &[Point3DT],
+        record: Option<&mut ZeroAddSearches>,
+    ) -> usize {
         use rayon::prelude::*;
         self.clear_caches();
         let mut n = 0;
         let mut claimed = KeySet::default();
+        let mut zero_add: Vec<(Point3DT, Vec<(ImageT, Point2DT)>)> = Vec::new();
         for wave in point3d_ids.chunks(PLAN_WAVE) {
             let recon_ref: &Reconstruction = recon;
             let plans: Vec<Option<CompletePlan>> = wave
@@ -521,6 +610,12 @@ impl IncrementalTriangulator {
                     }
                     continue;
                 }
+                if plan.adds.is_empty() {
+                    if record.is_some() {
+                        zero_add.push((id, plan.examined));
+                    }
+                    continue;
+                }
                 for el in plan.adds {
                     obs.add_observation(recon, graph, id, el);
                     self.modified_point3d_ids.insert(id);
@@ -528,6 +623,29 @@ impl IncrementalTriangulator {
                     n += 1;
                 }
             }
+        }
+        if let Some(record) = record {
+            // Drop the searches a later claim made stale. Claims are few and
+            // in few images, so a per-image flag settles most keys.
+            let mut claimed_image: Vec<bool> = Vec::new();
+            for &(image_id, _) in &claimed {
+                let index = image_id as usize;
+                if index >= claimed_image.len() {
+                    claimed_image.resize(index + 1, false);
+                }
+                claimed_image[index] = true;
+            }
+            let recon_ref: &Reconstruction = recon;
+            let kept: Vec<(Point3DT, ZeroAddSearch)> = zero_add
+                .into_par_iter()
+                .filter(|(_, examined)| {
+                    !examined.iter().any(|key| {
+                        claimed_image.get(key.0 as usize) == Some(&true) && claimed.contains(key)
+                    })
+                })
+                .map(|(id, examined)| (id, (recon_ref.point3d(id).track.len(), examined)))
+                .collect();
+            record.extend(kept);
         }
         n
     }
@@ -1022,6 +1140,15 @@ const PLAN_WAVE: usize = 16_384;
 /// iterated, so its order does not matter).
 type KeySet = IdSet<(ImageT, Point2DT)>;
 
+/// A completion search of [`IncrementalTriangulator::complete_tracks_and_image`]'s
+/// first pass that added nothing: the point's track length then and the 2D
+/// points the search examined.
+type ZeroAddSearch = (usize, Vec<(ImageT, Point2DT)>);
+
+/// [`ZeroAddSearch`]es by point (looked up by point only).
+type ZeroAddSearches =
+    HashMap<Point3DT, ZeroAddSearch, std::hash::BuildHasherDefault<IdPairHasher>>;
+
 /// A membership-only set of small integer ids (never iterated, so the
 /// hasher cannot change any order); SipHash cost several milliseconds per
 /// image in the track completion's claim checks.
@@ -1029,7 +1156,10 @@ type IdSet<T> = HashSet<T, std::hash::BuildHasherDefault<IdPairHasher>>;
 
 /// Read-only replay of [`IncrementalTriangulator::complete`]'s BFS.
 struct CompletePlan {
-    /// Every 2D point the BFS looked at beyond the point's own track.
+    /// The 2D points the BFS looked at that a pass could still give a 3D
+    /// point: those of registered images without one. Passes only add
+    /// observations and registration is fixed during them, so only these
+    /// can be claimed and make the plan stale.
     examined: Vec<(ImageT, Point2DT)>,
     /// Observations it would add, in the serial order.
     adds: Vec<TrackElement>,
@@ -1046,7 +1176,8 @@ enum ImagePointPlan {
         plan: CompletePlan,
     },
     /// No 3D point: the new point it would triangulate (if any), valid
-    /// while none of `examined` (itself and its correspondences) changed.
+    /// while none of `examined` (itself, and the correspondences it would
+    /// triangulate from) got a 3D point.
     New {
         examined: Vec<(ImageT, Point2DT)>,
         point: Option<(Point3<f64>, Vec<TrackElement>)>,
@@ -1122,40 +1253,43 @@ fn plan_triangulate_image_point(
         join: None,
         created: Vec::new(),
     };
-    // `find`, without its bogus-camera cache (same answers).
+    // `find`, without its bogus-camera cache (same answers). Of the usable
+    // correspondences, `Continue` reads only the 3D point ids of those that
+    // have one, so `CorrData` (a camera copy and a pose each) is built only
+    // for the others, which `Create` triangulates.
     let mut corrs_data = Vec::with_capacity(found.len() + 1);
-    let mut num_triangulated = 0;
+    let mut corr_point3d_ids: Vec<Point3DT> = Vec::new();
     for (corr_image_id, corr_point2d_idx) in found {
         if !recon.is_image_registered(corr_image_id) {
             continue;
         }
-        let corr_camera = recon.camera(recon.image(corr_image_id).camera_id);
+        let corr_image = recon.image(corr_image_id);
         if camera_has_bogus_params(
-            corr_camera,
+            recon.camera(corr_image.camera_id),
             options.min_focal_length_ratio,
             options.max_focal_length_ratio,
             options.max_extra_param,
         ) {
             continue;
         }
-        let corr = IncrementalTriangulator::corr_data(recon, corr_image_id, corr_point2d_idx);
-        if corr.has_point3d {
-            num_triangulated += 1;
+        match corr_image.points2d[corr_point2d_idx].point3d_id {
+            Some(point3d_id) => corr_point3d_ids.push(point3d_id),
+            None => corrs_data.push(IncrementalTriangulator::corr_data(
+                recon,
+                corr_image_id,
+                corr_point2d_idx,
+            )),
         }
-        corrs_data.push(corr);
     }
-    if corrs_data.is_empty() {
+    if corrs_data.is_empty() && corr_point3d_ids.is_empty() {
         return plan;
     }
     let mut ref_corr = IncrementalTriangulator::corr_data(recon, image_id, point2d_idx);
-    if num_triangulated > 0 && !ref_corr.has_point3d {
+    if !corr_point3d_ids.is_empty() && !ref_corr.has_point3d {
         // `Continue`.
         let mut best_angle_error = f64::MAX;
         let mut best_point3d_id: Option<Point3DT> = None;
-        for corr in &corrs_data {
-            let Some(point3d_id) = corr.point3d_id else {
-                continue;
-            };
+        for &point3d_id in &corr_point3d_ids {
             let angle_error = angular_reprojection_error(
                 ref_corr.xy,
                 recon.point3d(point3d_id).xyz,
@@ -1272,34 +1406,47 @@ fn plan_complete_image_point(
             .map(|c| (c.image_id as ImageT, c.point2d_idx))
             .collect()
     };
-    examined.extend(found.iter().copied());
-    let mut corrs_data = Vec::with_capacity(found.len() + 1);
-    let mut num_triangulated = 0;
+    // The usable correspondences (registered image, sane camera). A plan
+    // ends here as soon as one of them already has a 3D point, which most
+    // do, so their `CorrData` (a camera copy and a pose each) is built only
+    // when the point is triangulated. Only the 2D point itself and usable
+    // ones without a 3D point can be claimed during the pass (it only adds
+    // observations), so only they go into `examined`.
+    let mut usable = Vec::with_capacity(found.len());
     for (corr_image_id, corr_point2d_idx) in found {
         if !recon.is_image_registered(corr_image_id) {
             continue;
         }
-        let corr_camera = recon.camera(recon.image(corr_image_id).camera_id);
+        let corr_image = recon.image(corr_image_id);
         if camera_has_bogus_params(
-            corr_camera,
+            recon.camera(corr_image.camera_id),
             options.min_focal_length_ratio,
             options.max_focal_length_ratio,
             options.max_extra_param,
         ) {
             continue;
         }
-        let corr = IncrementalTriangulator::corr_data(recon, corr_image_id, corr_point2d_idx);
-        if corr.has_point3d {
-            num_triangulated += 1;
+        if corr_image.points2d[corr_point2d_idx].has_point3d() {
+            return ImagePointPlan::New {
+                examined,
+                point: None,
+            };
         }
-        corrs_data.push(corr);
+        usable.push((corr_image_id, corr_point2d_idx));
     }
-    if num_triangulated > 0 || corrs_data.is_empty() {
+    if usable.is_empty() {
         return ImagePointPlan::New {
             examined,
             point: None,
         };
     }
+    examined.extend(usable.iter().copied());
+    let mut corrs_data: Vec<CorrData> = usable
+        .iter()
+        .map(|&(corr_image_id, corr_point2d_idx)| {
+            IncrementalTriangulator::corr_data(recon, corr_image_id, corr_point2d_idx)
+        })
+        .collect();
     corrs_data.push(IncrementalTriangulator::corr_data(
         recon,
         image_id,
@@ -1340,15 +1487,14 @@ fn plan_complete(
                 if !visited.insert(key) {
                     continue;
                 }
-                plan.examined.push(key);
                 let (corr_image_id, corr_point2d_idx) = key;
-                if !recon.is_image_registered(corr_image_id) {
-                    continue;
-                }
                 let image = recon.image(corr_image_id);
-                if image.points2d[corr_point2d_idx].has_point3d() {
+                if image.points2d[corr_point2d_idx].has_point3d()
+                    || !recon.is_image_registered(corr_image_id)
+                {
                     continue;
                 }
+                plan.examined.push(key);
                 let camera = recon.camera(image.camera_id);
                 if camera_has_bogus_params(
                     camera,

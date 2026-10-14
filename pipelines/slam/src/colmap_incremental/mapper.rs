@@ -1233,20 +1233,15 @@ impl IncrementalMapper {
                 &mut self.obs,
                 &variable_ids,
             );
-            report.num_completed_observations = self.triangulator.complete_tracks(
+            let (completed_tracks, completed_image) = self.triangulator.complete_tracks_and_image(
                 tri_options,
                 recon,
                 graph,
                 &mut self.obs,
                 &variable_ids,
-            );
-            report.num_completed_observations += self.triangulator.complete_image(
-                tri_options,
-                recon,
-                graph,
-                &mut self.obs,
                 image_id,
             );
+            report.num_completed_observations = completed_tracks + completed_image;
             eprintln!(
                 "TIMING local_parts find_ms={find_ms} ba_ms={lba_ms} merge_complete_ms={} points={}",
                 t_lmc.elapsed().as_millis(),
@@ -1255,14 +1250,25 @@ impl IncrementalMapper {
         }
         let t_lf = std::time::Instant::now();
 
-        report.num_filtered_observations = self.obs.filter_points3d_in_images(
+        let (num_filtered, unchanged) = self.obs.filter_points3d_in_images_unchanged(
             recon,
             graph,
             options.filter_max_reproj_error,
             options.filter_min_tri_angle_deg,
             &config_image_ids,
         );
-        let point3d_ids_vec: Vec<Point3DT> = point3d_ids.iter().copied().collect();
+        report.num_filtered_observations = num_filtered;
+        // The window filter's untouched points would be untouched again
+        // (see `filter_points3d_in_images_unchanged`); both lists ascend.
+        let mut unchanged = unchanged.into_iter().peekable();
+        let point3d_ids_vec: Vec<Point3DT> = point3d_ids
+            .iter()
+            .copied()
+            .filter(|&id| {
+                while unchanged.next_if(|&u| u < id).is_some() {}
+                unchanged.peek() != Some(&id)
+            })
+            .collect();
         report.num_filtered_observations += self.obs.filter_points3d(
             recon,
             graph,

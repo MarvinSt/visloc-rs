@@ -213,7 +213,7 @@ The logs are in `benchmarks/smallcity_glomap/`.
 
 ```bash
 cargo build --release --example colmap_incremental_mapper
-cargo build --release -p visloc-gsplat-train --example gsplat_photos
+cargo build --release -p visloc-gsplat-train --features gpu,euroc --example gsplat_photos
 pip install "pycolmap>=4.2" numpy pillow py7zr
 scripts/benchmark_eth3d_auc.sh /tmp/eth3d_auc   # optionally: scene names
 ```
@@ -228,11 +228,11 @@ option, so their visloc-rs rows were run with `mapper_options.txt` as the
 current `gsplat_photos` writes it. A fresh run of the script writes that
 file itself.
 
-SmallCity was measured at commit `bdbd274`, with the front end on the GPU
-build. The images are in the release's `small_city.zip`:
+SmallCity was measured at commit `bdbd274` with the same two builds, the
+front end matching on a GPU (no `--cpu`). The images are in the release's
+`small_city.zip`:
 
 ```bash
-cargo build --release -p visloc-gsplat-train --features gpu --example gsplat_photos
 target/release/examples/gsplat_photos --images small_city/camera_calibration/rectified/images \
   --out RUN --max-size 1024 --steps 0 --no-mesh --exhaustive-max 600 --window 20 \
   --retrieval 30 --focal 486.97 --no-refine-intrinsics

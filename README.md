@@ -148,8 +148,12 @@ matches, the GLOMAP paper's setup, and the scoring follows that paper:
 On visloc-rs's own matches it leads both at every threshold: 53.1 / 78.9 /
 85.7, against COLMAP's three-run means of 50.2 / 75.1 / 82.0 (incremental)
 and 51.3 / 75.0 / 81.1 (global). The global mapper still registers more
-images. Per-scene tables, the run-to-run spread and the caveats are in the
-[ETH3D AUC benchmark](docs/eth3d_auc_benchmark.md).
+images. On a large capture, the 5,822 SmallCity photos, both mappers get
+visloc-rs's matches and 32 CPU threads: visloc-rs maps it in 21.7 min, and
+COLMAP's global mapper had not finished after 94 min, when a 100-minute cap
+stopped it.
+Per-scene tables, the SmallCity stages, the run-to-run spread and the caveats
+are in the [ETH3D AUC benchmark](docs/eth3d_auc_benchmark.md).
 
 ### Large connected collections
 

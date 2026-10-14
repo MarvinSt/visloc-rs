@@ -20,6 +20,8 @@ The scoring follows the GLOMAP paper.
 - **Where it trails:** the global mapper registers more images (454 vs 445)
   and leads at 1° on COLMAP's matches. Single scenes swing more than these
   margins (see Caveats).
+- **On a large capture** (SmallCity, 5,822 photos, below): visloc-rs mapped
+  it in 22 minutes. COLMAP's global mapper had not finished after 94 minutes.
 
 ## Protocol
 
@@ -146,6 +148,50 @@ No other scene changes.
 - **kicker (visloc-rs's matches):** COLMAP's incremental mapper is ahead
   there.
 
+## A large capture: SmallCity
+
+The ETH3D scenes are small. SmallCity is the 5,822 photos of the
+Hierarchical 3DGS release: six GoPros on a bicycle, four passes around a
+city block. COLMAP's global mapper is set up as in `visloc-matches`:
+
+- **Inputs:** the keypoints and verified matches of one `gsplat_photos` run
+  (1,024 px, window and VLAD retrieval matching, 217,844 image pairs) and the
+  release's focal length, held fixed. COLMAP re-verifies the matches.
+- **Machine:** one RunPod machine. Both mappers use 32 threads and run on
+  the CPU.
+- **visloc-rs:** mapper seed 0, with the options `gsplat_photos` writes.
+- **Accuracy:** camera centres against the release's own COLMAP model, a
+  reference rather than ground truth, after a Sim(3) fit
+  (`scripts/score_smallcity_reference.py`).
+
+| | visloc-rs | COLMAP global (GLOMAP) |
+|---|---|---|
+| Mapper wall time | **21.7 min** | unfinished, stopped after 94.3 min |
+| Peak memory | **19.3 GiB** | 33.5 GiB up to the stop |
+| Registered | 5,816 / 5,822 | — |
+| Camera-centre error, median / p90 | 0.15 m / 0.28 m | — |
+
+A 100-minute cap on COLMAP's side stopped it. The cap also covered building
+its database (0.9 min) and re-verifying the matches (4.5 min), which come
+before the mapper. COLMAP's stages up to the stop:
+
+| Stage | Time |
+|---|---|
+| Loading, relative poses, connected components | 2.9 min |
+| Rotation averaging | 2.2 min |
+| Track establishment | 1.9 min |
+| Global positioning | 31.6 min |
+| Bundle adjustment, three rounds | 36.3 min |
+| Retriangulation and refinement | stopped after 19.3 min, merging tracks |
+
+- **CPU only.** The pycolmap wheel from PyPI is built without CUDA, so
+  COLMAP's global positioning and bundle adjustment fell back to CPU
+  solvers; it logs this. A CUDA build would run them on the GPU, which this
+  comparison does not measure.
+- **One run each.** COLMAP is not deterministic. visloc-rs is.
+
+The logs are in `benchmarks/smallcity_glomap/`.
+
 ## Caveats
 
 - **COLMAP is not deterministic.** COLMAP runs with its default random seed
@@ -160,8 +206,8 @@ No other scene changes.
     one run, because a pass needs about 6 GB of image downloads.
 - **What the times cover.** They are mapper wall times at 4 threads,
   including database or file loading. Front ends are not compared.
-- **Scope.** These are small scenes. Large captures (SmallCity) and learned
-  reconstruction methods are not part of this comparison.
+- **Scope.** Apart from the one SmallCity run, these are small scenes.
+  Learned reconstruction methods are not part of this comparison.
 
 ## Reproduce
 
@@ -181,3 +227,20 @@ The stored `gsplat_photos` runs predate the photo pipeline's fallback
 option, so their visloc-rs rows were run with `mapper_options.txt` as the
 current `gsplat_photos` writes it. A fresh run of the script writes that
 file itself.
+
+SmallCity was measured at commit `bdbd274`, with the front end on the GPU
+build. The images are in the release's `small_city.zip`:
+
+```bash
+cargo build --release -p visloc-gsplat-train --features gpu --example gsplat_photos
+target/release/examples/gsplat_photos --images small_city/camera_calibration/rectified/images \
+  --out RUN --max-size 1024 --steps 0 --no-mesh --exhaustive-max 600 --window 20 \
+  --retrieval 30 --focal 486.97 --no-refine-intrinsics
+RAYON_NUM_THREADS=32 target/release/examples/colmap_incremental_mapper \
+  --manifest RUN/port/manifest.txt --features-dir RUN/port/features \
+  --pairs-export RUN/port/pairs.bin --out-colmap OURS --random-seed 0
+timeout 6000 python3 scripts/benchmark_smallcity_glomap.py RUN/port GLOMAP 32
+python3 scripts/score_smallcity_reference.py fetch ref_images.txt
+python3 scripts/score_smallcity_reference.py score ref_images.txt OURS/model/0/images.txt
+python3 scripts/score_smallcity_reference.py score ref_images.txt GLOMAP/glomap_txt/images.txt
+```

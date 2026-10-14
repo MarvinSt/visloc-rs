@@ -223,6 +223,42 @@ def write_port(port, w, h, k, names, keypoints, pairs, mapper_options):
             f.write(np.ascontiguousarray(m, dtype="<u4").tobytes())
 
 
+def port_database(pycolmap, port, db, work, reader, frames, size):
+    """Write a replay directory's keypoints and matches into COLMAP's database,
+    under blank images of the run's ``size`` (COLMAP imports images, not
+    keypoints). Returns the image directory and the pair list for
+    ``verify_matches``."""
+    from PIL import Image
+
+    image_dir = os.path.join(work, "blank")
+    os.makedirs(image_dir, exist_ok=True)
+    blank = Image.new("L", size)
+    for fr in frames:
+        blank.save(os.path.join(image_dir, fr))
+    pycolmap.import_images(db, image_dir, camera_mode=pycolmap.CameraMode.SINGLE,
+                           options=reader)
+    d = pycolmap.Database.open(db)
+    ids = {im.name: im.image_id for im in d.read_all_images()}
+    for fr, i in ids.items():
+        kp = np.loadtxt(os.path.join(port, "features", os.path.splitext(fr)[0] + "_features.txt"),
+                        dtype=np.float32, ndmin=2)
+        d.write_keypoints(i, kp[:, :2])
+    names, pairs = read_pairs_export(os.path.join(port, "pairs.bin"))
+    pair_lines = []
+    for a, b, m in pairs:
+        na, nb = names[a], names[b]
+        m = m.astype(np.uint32)
+        if ids[na] > ids[nb]:
+            na, nb, m = nb, na, m[:, ::-1].copy()
+        d.write_matches(ids[na], ids[nb], m)
+        pair_lines.append(f"{na} {nb}\n")
+    d.close()
+    pairs_txt = os.path.join(work, "pairs.txt")
+    with open(pairs_txt, "w") as f:
+        f.writelines(pair_lines)
+    return image_dir, pairs_txt
+
+
 def bench(mode, scene, run, work, mapper):
     import pycolmap
     from PIL import Image
@@ -257,33 +293,7 @@ def bench(mode, scene, run, work, mapper):
         est, seconds = run_visloc(mapper, port, os.path.join(work, "visloc"), orig_of,
                                   os.path.join(work, "visloc.log"))
         emit(score(gt, est, seconds, "visloc-rs"))
-        # Blank images of the run's size, for COLMAP's image import.
-        image_dir = os.path.join(work, "blank")
-        os.makedirs(image_dir, exist_ok=True)
-        blank = Image.new("L", (w, h))
-        for fr in orig_of:
-            blank.save(os.path.join(image_dir, fr))
-        pycolmap.import_images(db, image_dir, camera_mode=pycolmap.CameraMode.SINGLE,
-                               options=reader)
-        d = pycolmap.Database.open(db)
-        ids = {im.name: im.image_id for im in d.read_all_images()}
-        for fr, i in ids.items():
-            kp = np.loadtxt(os.path.join(port, "features", os.path.splitext(fr)[0] + "_features.txt"),
-                            dtype=np.float32, ndmin=2)
-            d.write_keypoints(i, kp[:, :2])
-        names, pairs = read_pairs_export(os.path.join(port, "pairs.bin"))
-        pair_lines = []
-        for a, b, m in pairs:
-            na, nb = names[a], names[b]
-            m = m.astype(np.uint32)
-            if ids[na] > ids[nb]:
-                na, nb, m = nb, na, m[:, ::-1].copy()
-            d.write_matches(ids[na], ids[nb], m)
-            pair_lines.append(f"{na} {nb}\n")
-        d.close()
-        pairs_txt = os.path.join(work, "pairs.txt")
-        with open(pairs_txt, "w") as f:
-            f.writelines(pair_lines)
+        image_dir, pairs_txt = port_database(pycolmap, port, db, work, reader, orig_of, (w, h))
         tvg = pycolmap.TwoViewGeometryOptions()
         tvg.compute_relative_pose = True
         pycolmap.verify_matches(db, pairs_txt, options=tvg)

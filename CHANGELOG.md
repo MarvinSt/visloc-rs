@@ -146,8 +146,13 @@ All notable changes to `visloc-rs` will be documented here.
     COLMAP 4's structure-less fallback on. On the port's default, which
     leaves it off, it registers 7 and 3 fewer images and scores 50.7 / 74.5
     / 80.5 and 51.7 / 76.5 / 83.1.
+  - **SmallCity:** on the 5,822-photo capture, both mappers get visloc-rs's
+    matches and 32 CPU threads. visloc-rs maps it in 21.7 min. COLMAP's
+    global mapper had not finished when a 100-minute cap stopped it, 94 min
+    into mapping.
+    `scripts/benchmark_smallcity_glomap.py` runs COLMAP's side.
   - Tables and caveats: `docs/eth3d_auc_benchmark.md`. Raw results:
-    `benchmarks/eth3d_auc/`.
+    `benchmarks/eth3d_auc/` and `benchmarks/smallcity_glomap/`.
 
 - **COLMAP-port BA: two-level PCG preconditioner for converging
   solves.** Once a large global BA (1,000+ free frames) is past its first

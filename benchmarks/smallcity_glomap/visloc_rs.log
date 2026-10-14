@@ -1,0 +1,22 @@
+# SmallCity: the visloc-rs mapper (colmap_incremental_mapper at bdbd274, 32 threads,
+# --random-seed 0, mapper options abs_pose_min_num_inliers=30 and
+# structure_less_registration_fallback=1 as gsplat_photos writes them) on the same
+# gsplat_photos run. Excerpt of its stderr (the final BA, the closing lines and
+# GNU time -v), then scripts/score_smallcity_reference.py score on its images.txt.
+BA_MEMORY n_free_frames=5815 obs=15087834 points=1234375 edges=3399312 rig_obs_mb=0 problem_obs_mb=1612 point_free_frames_mb=56 point_pair_edge_idx_mb=1928 (pairs=505327165) contributions_mb=112 points_lin_mb=2144 elimination_mb=934 pcg_f32_mb=467
+BA global images=5816 points=1234375 ok=true
+mapper done; rss=15381 MB peak=19725 MB
+mapper finished in 1267.7s: 1 model(s) kept
+model 0: 5816 registered images, 1233947 points3D -> /content/runs/ours/model/0
+	Command being timed: "colmap_incremental_mapper --manifest /content/runs/m/manifest.txt --features-dir /content/runs/sc/port/features --pairs-export /content/runs/sc/port/pairs.bin --out-colmap /content/runs/ours --random-seed 0"
+	User time (seconds): 14447.65
+	System time (seconds): 1676.92
+	Percent of CPU this job got: 1237%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 21:42.81
+	Maximum resident set size (kbytes): 20198580
+	Exit status: 0
+images.txt: 5816 registered, 5816 of 5822 reference images; centre error median 0.147 m, p90 0.283 m, max 0.76 m
+  pass1: 1499 images; global fit median 0.154 m; own fit median 0.084 m, p90 0.148 m, scale 3.9262
+  pass2: 1500 images; global fit median 0.143 m; own fit median 0.023 m, p90 0.043 m, scale 3.9612
+  pass3: 1500 images; global fit median 0.160 m; own fit median 0.038 m, p90 0.075 m, scale 3.9388
+  pass4: 1317 images; global fit median 0.123 m; own fit median 0.057 m, p90 0.091 m, scale 3.9498

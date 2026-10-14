@@ -935,3 +935,17 @@ to 0.178 m. Parity runs against COLMAP on the 2.5k/5k/10k tiers must turn it
 off by setting `ba_global_final_converge_min_frames=100000000` (or any number
 above the model size). Set it as a line in the replay's `mapper_options.txt`,
 or with `gsplat_euroc --mapper-opt`.
+
+Two LM rules apply to this BA only, that is, to solves with the absolute
+gradient criterion (`gradient_tolerance_rel == None`):
+
+- A trial's cost leaves out the observations whose point is behind its
+  camera at the current state, as the linearization does. A point carried
+  behind a camera by one step otherwise returns with a residual the model
+  never saw and blocks every larger step (SmallCity mapper seed 1: 0.366 m
+  to 0.161 m).
+- The function tolerance stops the solve only when the model's predicted
+  decrease is below it too, not after a poorly predicted step (seed 2:
+  0.711 m to 0.648 m).
+
+The incremental BAs are unchanged by both.

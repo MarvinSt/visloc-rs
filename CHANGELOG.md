@@ -6,6 +6,46 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **COLMAP-port mapper: the converged final BA stalled on two of three
+  SmallCity paths.** Two LM rules now apply to solves with the absolute
+  gradient criterion. In production that means only the converged final BA
+  (under Added).
+  - **A trial is judged the way the model sees it.** The trial cost now
+    leaves out observations whose point is behind its camera at the
+    current state, as the linearization already does. Before, a point that
+    one step had carried behind a camera came back in front on a later
+    trial with a residual of hundreds of pixels. On mapper seed 1 a single
+    two-view point at a camera centre did this to 7 of the 18 trials.
+    Each one raised the cost by 14k to 869k and was rejected, so the trust
+    radius never grew past about 6e6 and the drift stayed.
+  - **A small decrease ends the solve only if the model predicted a small
+    one too.** On seed 2 the final BA stopped after a step that lowered the
+    cost by 4% of its predicted decrease (rho 0.04).
+  - **SmallCity** (RTX 3090 pod replays with the same matches; every model
+    before the final BA is byte-identical to the earlier replays). Median
+    centre error:
+
+    | seed | before the final BA | final BA before | now |
+    |---|---|---|---|
+    | 0 | 0.611 m | 0.146 m | 0.147 m |
+    | 1 | 0.496 m | 0.366 m | 0.161 m |
+    | 2 | 0.840 m | 0.711 m | 0.648 m |
+
+    - Seed 1's p90 goes from 1.29 m to 0.35 m. The fitted scales of its
+      four passes go from 3.29–3.43 to 3.31–3.33. Its final BA accepts all
+      16 steps (97 s), and the trust radius reaches 1.3e8.
+    - Seed 2's remaining drift (3.9% between passes) is in the BA optimum
+      itself. Run with no function tolerance, the same solve also ends at
+      0.650 m.
+    - Seed 0 is unchanged within 1 mm (p90 0.281 m to 0.283 m).
+  - **What did not help:** more refinement rounds (BA, merge, filter) after
+    the converged BA. Restarted at the initial trust radius, each round
+    stops after one or two steps. Started from the previous round's
+    radius, four more rounds took seed 0 from 0.147 m to 0.328 m and seed
+    1 from 0.161 m to 0.352 m, worse with every round.
+  - **Unchanged:** the one- or two-step incremental BAs keep the plain
+    evaluation. All 16 ETH3D models are byte-identical.
+
 - **`colmap_incremental_mapper` replays a `gsplat_photos`/`gsplat_euroc`
   export with the options it ran with.** Those pipelines use COLMAP's
   single-camera `abs_pose_min_num_inliers=30`, but a replay of their
@@ -187,7 +227,9 @@ All notable changes to `visloc-rs` will be documented here.
       (about ±4% along the path) only on seed 0. Seed 2's BA stops after
       seven accepted steps on the function tolerance, while its trust
       radius is still small. In seed 1's BA, 7 of 18 trials are
-      rejected.
+      rejected. Both causes are fixed (under Fixed: "the converged final
+      BA stalled"): seeds 0, 1 and 2 now reach 0.147 m, 0.161 m and
+      0.648 m.
   - **ETH3D, 13 scenes, forced on with a threshold of 0:** the change is
     within noise. Meadow goes from 5.73 to 4.94 cm and facade from 1.67
     to 1.77 cm. That is why small models are left out. At the default

@@ -623,6 +623,12 @@ fn iterative_min_free_frames() -> usize {
 /// 50-iteration cap at ~1e-6 relative decrease per step, about a third of
 /// the mapper's time, for no visible change. Overridable with
 /// `VISLOC_PORT_BA_FUNCTION_TOLERANCE` (`0` disables the stop).
+///
+/// A solve with the absolute gradient criterion (the mapper's final
+/// converged BA) stops only when the model's predicted decrease is that small
+/// as well. On SmallCity (mapper seed 2) the final BA otherwise stopped after
+/// a step that lowered the cost by 4% of its predicted decrease, at 0.711 m
+/// median centre error, while the solve run on reaches 0.650 m.
 const FUNCTION_TOLERANCE: f64 = 1e-5;
 fn function_tolerance() -> f64 {
     static TOL: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -2435,12 +2441,19 @@ fn back_substitute(
 /// `Σ ‖r_i‖²`, same convention as [`linearize`]'s `full_cost` /
 /// `BundleAdjustment::cost()`. Used for a rejected trial's cheap re-check
 /// (module doc: Jacobians are only re-evaluated after an accepted step).
+///
+/// `skip_behind_now` also leaves out the observations whose point is behind
+/// its sensor at `problem`'s current state, which the linearization (and so
+/// the LM model) left out. Otherwise a point that a step has carried behind a
+/// camera and the next trial brings back adds a residual the model never
+/// saw, hundreds of pixels near the camera centre.
 fn evaluate_cost(
     problem: &Problem,
     poses: &[SE3],
     points: &[Point3<f64>],
     extras: &ExtraBlocks,
     loss: LossFunction,
+    skip_behind_now: bool,
 ) -> f64 {
     let per_point: Vec<f64> = problem
         .points
@@ -2450,6 +2463,14 @@ fn evaluate_cost(
             let (start, end) = problem.point_obs_range[p];
             let mut c = 0.0;
             for o in &problem.obs[start as usize..end as usize] {
+                if skip_behind_now {
+                    let (_, sensor_now) = problem.extras.camera_of(o);
+                    let point_now =
+                        problem.poses[o.frame_idx as usize].transform_point(&problem.points[p]);
+                    if sensor_now.transform_point(&point_now).z <= 0.0 {
+                        continue;
+                    }
+                }
                 let pose = &poses[o.frame_idx as usize];
                 let ((fx, fy, cx, cy), sensor_from_rig) = extras.camera_of(o);
                 let point_rig = pose.transform_point(&points[p]);
@@ -2817,8 +2838,18 @@ fn optimize_problem(
         let (trial_poses, trial_points, trial_extras) = apply_step(problem, &dx_frames, &dx_points);
         apply_ms += t_apply.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();
-        let trial_half_cost =
-            0.5 * evaluate_cost(problem, &trial_poses, &trial_points, &trial_extras, loss);
+        // A solve meant to converge takes many steps at a large trust
+        // radius, where a point can cross a camera's plane and come back;
+        // the one- or two-step incremental BAs keep the plain evaluation.
+        let trial_half_cost = 0.5
+            * evaluate_cost(
+                problem,
+                &trial_poses,
+                &trial_points,
+                &trial_extras,
+                loss,
+                gradient_tolerance_rel.is_none(),
+            );
         timings.evaluate_cost += t.elapsed();
         let actual = half_cost - trial_half_cost;
         let rho = if predicted > 0.0 && predicted.is_finite() {
@@ -2853,7 +2884,16 @@ fn optimize_problem(
         ));
 
         if step_accepted {
-            let small_decrease = actual < function_tolerance() * half_cost;
+            // A solve meant to converge (the absolute gradient criterion,
+            // `gradient_tolerance_rel == None`) also needs the model to
+            // predict a small decrease: a step that barely passed the
+            // acceptance test lowers the cost little however far the
+            // optimum is (see `FUNCTION_TOLERANCE`).
+            let decrease = match gradient_tolerance_rel {
+                None => actual.max(predicted),
+                Some(_) => actual,
+            };
+            let small_decrease = decrease < function_tolerance() * half_cost;
             problem.poses = trial_poses;
             problem.points = trial_points;
             problem.extras = trial_extras;
@@ -3854,6 +3894,62 @@ mod tests {
         let by_output = eliminate_and_accumulate(&problem, &lin, problem.edges.len(), 1e-3);
         assert!(sharded.0.iter().any(|b| b.norm() > 0.0));
         assert_eq!(sharded, by_output);
+    }
+
+    /// A converging solve's trial cost leaves out an observation whose point
+    /// is behind the camera at the current state (the linearization skipped
+    /// it), even when the trial brings the point back in front.
+    #[test]
+    fn trial_cost_skips_observations_behind_the_camera_now() {
+        let k = (500.0, 500.0, 320.0, 240.0);
+        let project = |pose: &SE3, x: &Point3<f64>| {
+            let q = pose.transform_point(x);
+            Point2::new(k.0 * q.x / q.z + k.2, k.1 * q.y / q.z + k.3)
+        };
+        // Frame 1 sits at z = 1 looking back down the z axis.
+        let back = SE3::new(
+            UnitQuaternion::from_euler_angles(0.0, std::f64::consts::PI, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        let poses = vec![SE3::identity(), back];
+        let now = Point3::new(0.1, 0.2, 3.0);
+        let trial = Point3::new(0.1, 0.2, 0.5);
+        assert!(poses[1].transform_point(&now).z < 0.0);
+        assert!(poses[1].transform_point(&trial).z > 0.0);
+        let xy0 = project(&poses[0], &now);
+        let xy1 = Point2::new(300.0, 250.0);
+        let input = RigBaInput {
+            frame_ids: vec![0, 1],
+            frame_fixed: vec![true, false],
+            poses: poses.clone(),
+            point_ids: vec![0],
+            point_fixed: vec![false],
+            points: vec![now],
+        };
+        let point_major = PointMajorObs {
+            obs: vec![
+                Obs::new(0, xy0, k, SE3::identity()),
+                Obs::new(1, xy1, k, SE3::identity()),
+            ],
+            point_obs_range: vec![(0, 2)],
+        };
+        let problem =
+            assemble_problem(&input, point_major, 0.0, ExtraBlocks::default()).expect("problem");
+        let extras = ExtraBlocks::default();
+        let cost = |skip| {
+            evaluate_cost(
+                &problem,
+                &poses,
+                &[trial],
+                &extras,
+                LossFunction::Trivial,
+                skip,
+            )
+        };
+        let r0 = (project(&poses[0], &trial) - xy0).norm_squared();
+        let r1 = (project(&poses[1], &trial) - xy1).norm_squared();
+        assert!((cost(true) - r0).abs() < 1e-9 * r0);
+        assert!((cost(false) - (r0 + r1)).abs() < 1e-9 * (r0 + r1));
     }
 
     #[test]

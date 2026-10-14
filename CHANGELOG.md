@@ -111,12 +111,22 @@ All notable changes to `visloc-rs` will be documented here.
     | `large_global_ba`, 1,200 frames, four passes (3 steps) | 149 | 149 (identical) |
 
     The final costs match.
-  - **SmallCity, coarse level applied from the first step** (one pod
-    replay):
-    - The final BA took 12 steps and 135 s instead of 41 steps and 661 s.
-    - The mapper took 27:46 instead of 30:26.
-    - The path changed, and a 2% scale step between passes 2 and 3
-      remained: median error 0.645 m before the final BA, 0.524 m after.
+  - **SmallCity** (one RTX 3090 pod replay). The model before the final
+    BA is byte-identical to the replay without the coarse level:
+
+    | | without | with |
+    |---|---|---|
+    | Final BA LM steps | 41 | 14 |
+    | Final BA PCG iterations | 20,102 | 6,425 |
+    | Final BA time | 661 s | 204 s |
+    | Mapper wall time | 30:26 | 23:20 |
+    | Median centre error | 0.178 m | 0.146 m |
+    | p90 centre error | 0.354 m | 0.281 m |
+    | Max centre error | 1.12 m | 0.76 m |
+
+    Applying the coarse level from the first step instead changed the
+    path: the mapper took 27:46 and ended at 0.524 m, with a 2% scale step
+    between passes 2 and 3 left in place.
   - **Smaller problems are unchanged:** all 15 ETH3D models are
     byte-identical, since none reaches the iterative solve.
 
@@ -160,6 +170,9 @@ All notable changes to `visloc-rs` will be documented here.
     - The final BA ran 41 LM steps (20,102 PCG iterations) and stopped on
       the function tolerance. It took 11 minutes, so the mapper's wall
       time went from 21:00 to 30:26.
+    - With the two-level PCG preconditioner (the entry above), the same
+      final BA takes 14 steps and 204 s and reaches 0.146 m. The mapper
+      then takes 23:20.
   - **ETH3D, 13 scenes, forced on with a threshold of 0:** the change is
     within noise. Meadow goes from 5.73 to 4.94 cm and facade from 1.67
     to 1.77 cm. That is why small models are left out. At the default

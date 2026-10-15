@@ -214,6 +214,10 @@ pub struct MapperConfig {
     pub relative_pose_weight: f64,
     pub roll_pitch_weight: f64,
     pub ba_weight: f64,
+    /// Relative-pose factors per marginalized keyframe, to the keyframes
+    /// nearest in time; 0 keeps upstream's star to every keyframe in the
+    /// window.
+    pub relative_pose_max_neighbors: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3105,6 +3109,7 @@ impl Default for MapperConfig {
             relative_pose_weight: 1.,
             roll_pitch_weight: 1.,
             ba_weight: 1.,
+            relative_pose_max_neighbors: 0,
         }
     }
 }
@@ -3773,13 +3778,22 @@ pub fn extract_nonlinear_factors(
         Vec::new()
     };
 
-    let kfs = if !data.kfs_all.is_empty() {
+    let mut kfs = if !data.kfs_all.is_empty() {
         data.kfs_all.clone()
     } else {
         data.keyframes.clone()
     };
+    if config.relative_pose_max_neighbors > 0 {
+        // Frame ids advance with time, so this orders by time distance.
+        kfs.sort_by_key(|&other_id| (other_id.abs_diff(kf_id), other_id));
+    }
     let mut relative_pose = Vec::new();
     for other_id in kfs {
+        if config.relative_pose_max_neighbors > 0
+            && relative_pose.len() == config.relative_pose_max_neighbors
+        {
+            break;
+        }
         if let Some(factor) = relative_pose_factor(
             data, kf_id, kf_pose, kf_start, other_id, &cov_old, asize, &config,
         )? {
@@ -5026,6 +5040,29 @@ mod m8_fixture_tests {
                 "relative information max error {max_error}"
             );
         }
+    }
+
+    #[test]
+    fn m8b_neighbor_limit_keeps_the_factors_to_the_nearest_keyframes() {
+        let (mut data, _root) = fixture();
+        process_marg_data(&mut data).expect("M8a process");
+        let all = extract_nonlinear_factors(&data, MapperConfig::default()).expect("M8b");
+        let limited = extract_nonlinear_factors(
+            &data,
+            MapperConfig {
+                relative_pose_max_neighbors: 2,
+                ..Default::default()
+            },
+        )
+        .expect("M8b limited");
+        assert_eq!(limited.roll_pitch, all.roll_pitch);
+        assert_eq!(limited.relative_pose.len(), 2);
+        let mut nearest: Vec<&RelativePoseFactor> = all.relative_pose.iter().collect();
+        nearest.sort_by_key(|f| (f.to.abs_diff(f.from), f.to));
+        assert_eq!(
+            limited.relative_pose.iter().collect::<Vec<_>>(),
+            nearest[..2].to_vec()
+        );
     }
 
     #[test]

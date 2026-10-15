@@ -137,6 +137,9 @@ struct Args {
     /// metric-scale/drift constraint relative to its vision-only reprojection
     /// and loop-closure terms without adding any per-frame VIO cost.
     relative_pose_weight: Option<f64>,
+    /// Relative-pose factors per marginalized keyframe, to the keyframes
+    /// nearest in time; None keeps every keyframe in the window.
+    relative_pose_max_neighbors: Option<usize>,
     /// Weight for raw preintegrated-IMU mapper edges; None means disabled (0.0).
     imu_preintegration_weight: Option<f64>,
     /// Weight for the joint visual-inertial global BA (full 15-dof-per-
@@ -301,6 +304,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(weight) = args.roll_pitch_weight {
         mapper_config.roll_pitch_weight = weight;
+    }
+    if let Some(neighbors) = args.relative_pose_max_neighbors {
+        mapper_config.relative_pose_max_neighbors = neighbors;
     }
     let feature_config = dataset.config().offline_mapper_config()?;
     let optimize_config = dataset.config().mapper_global_ba_config()?;
@@ -1053,6 +1059,7 @@ impl Args {
         let mut imu_preintegration_weight = None;
         let mut joint_vi_ba_weight = None;
         let mut relative_pose_weight = None;
+        let mut relative_pose_max_neighbors = None;
         let mut roll_pitch_weight = None;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -1211,6 +1218,16 @@ impl Args {
                             .map_err(|error| format!("invalid --relative-pose-weight: {error}"))?,
                     );
                 }
+                "--relative-pose-max-neighbors" => {
+                    relative_pose_max_neighbors = Some(
+                        next(&mut arguments, &option)?
+                            .to_string_lossy()
+                            .parse::<usize>()
+                            .map_err(|error| {
+                                format!("invalid --relative-pose-max-neighbors: {error}")
+                            })?,
+                    );
+                }
                 "--roll-pitch-weight" => {
                     roll_pitch_weight = Some(
                         next(&mut arguments, &option)?
@@ -1287,6 +1304,7 @@ impl Args {
             imu_preintegration_weight,
             joint_vi_ba_weight,
             relative_pose_weight,
+            relative_pose_max_neighbors,
             roll_pitch_weight,
         })
     }
@@ -1303,8 +1321,8 @@ impl Args {
          [--loop-match-max-rot-error DEG] \
          [--loop-closure-factors] [--loop-closure-min-corr N] [--loop-closure-weight W] \
          [--loop-closure-max-rot-error DEG] [--local-ba-window N] [--local-ba-iterations N] \
-         [--relative-pose-weight W] [--roll-pitch-weight W] [--imu-preintegration-weight W] \
-         [--joint-vi-ba-weight W]"
+         [--relative-pose-weight W] [--relative-pose-max-neighbors N] [--roll-pitch-weight W] \
+         [--imu-preintegration-weight W] [--joint-vi-ba-weight W]"
             .into()
     }
 }
@@ -1394,12 +1412,15 @@ mod tests {
                 "4",
                 "--roll-pitch-weight",
                 "2.5",
+                "--relative-pose-max-neighbors",
+                "3",
             ]
             .map(Into::into),
         )
         .expect("parses");
         assert_eq!(args.relative_pose_weight, Some(4.0));
         assert_eq!(args.roll_pitch_weight, Some(2.5));
+        assert_eq!(args.relative_pose_max_neighbors, Some(3));
     }
 
     #[test]

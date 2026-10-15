@@ -1,8 +1,9 @@
 // VLFeat-compatible SIFT detection (f32 ports of visloc-vision's
 // `detect_sift_vlfeat_keypoints`: `refine_vlfeat_extremum` and
-// `vlfeat_orientation_peaks`). The scale space comes from `image.wgsl`; the
-// host orders and caps the candidates (`vlfeat.rs`), and
-// `vlfeat_describe.wgsl` describes the kept ones.
+// `vlfeat_orientation_peaks`). The Gaussian levels come from `image.wgsl`;
+// every level is its own buffer, so no binding exceeds one level. The host
+// orders and caps the candidates (`vlfeat.rs`), and `vlfeat_describe.wgsl`
+// describes the kept ones.
 
 struct VlParams {
     w: u32,
@@ -13,32 +14,63 @@ struct VlParams {
     // contrast_threshold / intervals
     peak_thresh: f32,
     edge_thresh: f32,
-    // Detection: the octave's base sigma (sigma_base).
+    // The octave's base sigma (sigma_base).
     base_sigma: f32,
     // 2^(1 / intervals)
     k: f32,
     // intervals + 1: the largest refined scale index kept.
     scale_max: f32,
     bilinear: u32,
-    // Extrema: DoG levels per octave. Gradients: Gaussian levels.
-    levels: u32,
+    // The DoG level (extrema) or Gaussian level (orientations) dispatched.
+    level: u32,
     pad: u32,
 };
 
 @group(0) @binding(0) var<uniform> P: VlParams;
-@group(0) @binding(1) var<storage, read> src: array<f32>;
-@group(0) @binding(2) var<storage, read_write> cand: array<u32>;
-@group(0) @binding(3) var<storage, read_write> counters: array<atomic<u32>>;
+// vl_dog: out = hi - lo.
+@group(0) @binding(1) var<storage, read> lo: array<f32>;
+@group(0) @binding(2) var<storage, read> hi: array<f32>;
+@group(0) @binding(3) var<storage, read_write> dog_out: array<f32>;
+// vl_extrema: three consecutive DoG levels.
+@group(0) @binding(4) var<storage, read> below: array<f32>;
+@group(0) @binding(5) var<storage, read> middle: array<f32>;
+@group(0) @binding(6) var<storage, read> above: array<f32>;
+// Candidates of this octave and the per-octave counters.
+@group(0) @binding(7) var<storage, read_write> cand: array<u32>;
+@group(0) @binding(8) var<storage, read_write> counters: array<atomic<u32>>;
+// vl_orient: the Gaussian level of the candidates it serves.
+@group(0) @binding(9) var<storage, read> gauss: array<f32>;
 
 const TAU: f32 = 6.2831855;
 // Words per candidate: ox, oy, dog level, orientations, x, y, scale, value,
 // edge score, four angles, three spare.
 const CW: u32 = 16u;
 
-fn dog_at(level: u32, x: i32, y: i32) -> f32 {
+@compute @workgroup_size(16, 16)
+fn vl_dog(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= P.w || gid.y >= P.h) {
+        return;
+    }
+    let i = gid.y * P.w + gid.x;
+    dog_out[i] = hi[i] - lo[i];
+}
+
+fn idx(x: i32, y: i32) -> u32 {
     let xi = u32(clamp(x, 0, i32(P.w) - 1));
     let yi = u32(clamp(y, 0, i32(P.h) - 1));
-    return src[level * P.w * P.h + yi * P.w + xi];
+    return yi * P.w + xi;
+}
+
+// DoG sample at scale offset ds in {-1, 0, 1} around the middle level.
+fn dog_at(ds: i32, x: i32, y: i32) -> f32 {
+    let i = idx(x, y);
+    if (ds < 0) {
+        return below[i];
+    }
+    if (ds > 0) {
+        return above[i];
+    }
+    return middle[i];
 }
 
 // `solve_vlfeat_3x3`: Gaussian elimination with partial pivoting; a zero
@@ -99,7 +131,7 @@ fn solve3(m_in: mat3x3<f32>, r_in: vec3<f32>) -> vec3<f32> {
     return out;
 }
 
-// One thread per interior pixel of the middle DoG level `gid.z + 1`:
+// One thread per interior pixel of the middle DoG level `P.level`:
 // VLFeat's neighbour test, five-step quadratic refinement and gates
 // (`refine_vlfeat_extremum`); survivors are appended to this octave's list.
 @compute @workgroup_size(16, 16)
@@ -111,8 +143,8 @@ fn vl_extrema(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) {
         return;
     }
-    let di = gid.z + 1u;
-    let value = dog_at(di, x, y);
+    let di = P.level;
+    let value = middle[idx(x, y)];
     let thr = max(P.peak_thresh, 0.0);
     var is_max = value >= 0.8 * thr;
     var is_min = value <= -0.8 * thr;
@@ -125,7 +157,7 @@ fn vl_extrema(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (ds == 0 && dx == 0 && dy == 0) {
                     continue;
                 }
-                let n = dog_at(u32(i32(di) + ds), x + dx, y + dy);
+                let n = dog_at(ds, x + dx, y + dy);
                 if (n >= value) {
                     is_max = false;
                 }
@@ -149,23 +181,20 @@ fn vl_extrema(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var it = 0; it < 5; it = it + 1) {
         ix = ix + move_x;
         iy = iy + move_y;
-        let b = di - 1u;
-        let m = di;
-        let a = di + 1u;
-        let centre = dog_at(m, ix, iy);
-        let dxx = dog_at(m, ix + 1, iy) + dog_at(m, ix - 1, iy) - 2.0 * centre;
-        let dyy = dog_at(m, ix, iy + 1) + dog_at(m, ix, iy - 1) - 2.0 * centre;
-        let dss = dog_at(a, ix, iy) + dog_at(b, ix, iy) - 2.0 * centre;
-        let dxy = 0.25 * (dog_at(m, ix + 1, iy + 1) + dog_at(m, ix - 1, iy - 1)
-            - dog_at(m, ix - 1, iy + 1) - dog_at(m, ix + 1, iy - 1));
-        let dxs = 0.25 * (dog_at(a, ix + 1, iy) + dog_at(b, ix - 1, iy)
-            - dog_at(a, ix - 1, iy) - dog_at(b, ix + 1, iy));
-        let dys = 0.25 * (dog_at(a, ix, iy + 1) + dog_at(b, ix, iy - 1)
-            - dog_at(a, ix, iy - 1) - dog_at(b, ix, iy + 1));
+        let centre = dog_at(0, ix, iy);
+        let dxx = dog_at(0, ix + 1, iy) + dog_at(0, ix - 1, iy) - 2.0 * centre;
+        let dyy = dog_at(0, ix, iy + 1) + dog_at(0, ix, iy - 1) - 2.0 * centre;
+        let dss = dog_at(1, ix, iy) + dog_at(-1, ix, iy) - 2.0 * centre;
+        let dxy = 0.25 * (dog_at(0, ix + 1, iy + 1) + dog_at(0, ix - 1, iy - 1)
+            - dog_at(0, ix - 1, iy + 1) - dog_at(0, ix + 1, iy - 1));
+        let dxs = 0.25 * (dog_at(1, ix + 1, iy) + dog_at(-1, ix - 1, iy)
+            - dog_at(1, ix - 1, iy) - dog_at(-1, ix + 1, iy));
+        let dys = 0.25 * (dog_at(1, ix, iy + 1) + dog_at(-1, ix, iy - 1)
+            - dog_at(1, ix, iy - 1) - dog_at(-1, ix, iy + 1));
         der = vec3<f32>(
-            0.5 * (dog_at(m, ix + 1, iy) - dog_at(m, ix - 1, iy)),
-            0.5 * (dog_at(m, ix, iy + 1) - dog_at(m, ix, iy - 1)),
-            0.5 * (dog_at(a, ix, iy) - dog_at(b, ix, iy)));
+            0.5 * (dog_at(0, ix + 1, iy) - dog_at(0, ix - 1, iy)),
+            0.5 * (dog_at(0, ix, iy + 1) - dog_at(0, ix, iy - 1)),
+            0.5 * (dog_at(1, ix, iy) - dog_at(-1, ix, iy)));
         // Columns of the symmetric Hessian.
         hes = mat3x3<f32>(
             vec3<f32>(dxx, dxy, dxs),
@@ -191,7 +220,7 @@ fn vl_extrema(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    let centre = dog_at(di, ix, iy);
+    let centre = dog_at(0, ix, iy);
     let refined = centre + 0.5 * (der.x * disp.x + der.y * disp.y + der.z * disp.z);
     let h00 = hes[0][0];
     let h11 = hes[1][1];
@@ -214,7 +243,7 @@ fn vl_extrema(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (slot >= P.cap) {
         return;
     }
-    let o = (P.octave * P.cap + slot) * CW;
+    let o = slot * CW;
     cand[o] = u32(x);
     cand[o + 1u] = u32(y);
     cand[o + 2u] = di;
@@ -226,31 +255,29 @@ fn vl_extrema(@builtin(global_invocation_id) gid: vec3<u32>) {
     cand[o + 8u] = bitcast<u32>(edge);
 }
 
-fn gauss_at(level: u32, x: i32, y: i32) -> f32 {
-    let xi = u32(clamp(x, 0, i32(P.w) - 1));
-    let yi = u32(clamp(y, 0, i32(P.h) - 1));
-    return src[level * P.w * P.h + yi * P.w + xi];
+fn gauss_at(x: i32, y: i32) -> f32 {
+    return gauss[idx(x, y)];
 }
 
 // `vlfeat_gradient_at`: central differences, one-sided on the border.
-fn grad_at(level: u32, x: i32, y: i32) -> vec2<f32> {
+fn grad_at(x: i32, y: i32) -> vec2<f32> {
     let w = i32(P.w);
     let h = i32(P.h);
     var gx: f32;
     if (x == 0) {
-        gx = gauss_at(level, 1, y) - gauss_at(level, 0, y);
+        gx = gauss_at(1, y) - gauss_at(0, y);
     } else if (x == w - 1) {
-        gx = gauss_at(level, x, y) - gauss_at(level, x - 1, y);
+        gx = gauss_at(x, y) - gauss_at(x - 1, y);
     } else {
-        gx = 0.5 * (gauss_at(level, x + 1, y) - gauss_at(level, x - 1, y));
+        gx = 0.5 * (gauss_at(x + 1, y) - gauss_at(x - 1, y));
     }
     var gy: f32;
     if (y == 0) {
-        gy = gauss_at(level, x, 1) - gauss_at(level, x, 0);
+        gy = gauss_at(x, 1) - gauss_at(x, 0);
     } else if (y == h - 1) {
-        gy = gauss_at(level, x, y) - gauss_at(level, x, y - 1);
+        gy = gauss_at(x, y) - gauss_at(x, y - 1);
     } else {
-        gy = 0.5 * (gauss_at(level, x, y + 1) - gauss_at(level, x, y - 1));
+        gy = 0.5 * (gauss_at(x, y + 1) - gauss_at(x, y - 1));
     }
     return vec2<f32>(gx, gy);
 }
@@ -263,9 +290,10 @@ fn rem_tau(a: f32) -> f32 {
     return r;
 }
 
-// One thread per candidate of this octave: VLFeat's orientation histogram
-// on the candidate's Gaussian level (`vlfeat_orientation_peaks`), six
-// circular box smoothings and up to four peaks.
+// One thread per candidate of this octave whose DoG level is `P.level`
+// (the Gaussian level bound): VLFeat's orientation histogram
+// (`vlfeat_orientation_peaks`), six circular box smoothings and up to four
+// peaks.
 @compute @workgroup_size(64)
 fn vl_orient(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x + gid.y * 65535u * 64u;
@@ -273,8 +301,10 @@ fn vl_orient(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= n) {
         return;
     }
-    let o = (P.octave * P.cap + i) * CW;
-    let level = cand[o + 2u];
+    let o = i * CW;
+    if (cand[o + 2u] != P.level) {
+        return;
+    }
     let x = bitcast<f32>(cand[o + 4u]);
     let y = bitcast<f32>(cand[o + 5u]);
     let sn = bitcast<f32>(cand[o + 6u]);
@@ -301,7 +331,7 @@ fn vl_orient(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (r2 >= r2max) {
                 continue;
             }
-            let g = grad_at(level, xi + xs, yi + ys);
+            let g = grad_at(xi + xs, yi + ys);
             let mag = sqrt(g.x * g.x + g.y * g.y);
             if (!(mag > 0.0) || mag > 3.0e38) {
                 continue;

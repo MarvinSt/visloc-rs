@@ -1,70 +1,69 @@
 // VLFeat-compatible SIFT descriptors (f32 ports of visloc-vision's
 // `gradient_layer`, `describe_raw_vlfeat` with `accumulate_vlfeat_sample`,
 // `normalize_vlfeat_descriptor` and `transform_vlfeat_to_ubc`). The host
-// selects each keypoint's level and window in f64 (`VlfeatPyramid::select`)
-// and hands them over in `DescKp`.
+// selects each keypoint's level and window in f64 (`VlfeatPyramid::select`),
+// hands them over in `DescKp`, and describes one (octave, level) group of
+// keypoints per dispatch with that level's gradients bound.
 
 struct GradParams {
     w: u32,
     h: u32,
-    // Gaussian levels of the octave (gradients are written for each).
-    levels: u32,
-    // Element offset of the octave's first gradient.
-    dst_off: u32,
+    pad0: u32,
+    pad1: u32,
 };
 
 @group(0) @binding(0) var<uniform> G: GradParams;
 @group(0) @binding(1) var<storage, read> gauss: array<f32>;
 @group(0) @binding(2) var<storage, read_write> grad_out: array<vec2<f32>>;
 
-fn g_at(level: u32, x: i32, y: i32) -> f32 {
+fn g_at(x: i32, y: i32) -> f32 {
     let xi = u32(clamp(x, 0, i32(G.w) - 1));
     let yi = u32(clamp(y, 0, i32(G.h) - 1));
-    return gauss[level * G.w * G.h + yi * G.w + xi];
+    return gauss[yi * G.w + xi];
 }
 
 // `gradient_layer`: VLFeat's stencil, central inside and one-sided on the
-// border, for every pixel of every level of one octave.
+// border, for every pixel of one Gaussian level.
 @compute @workgroup_size(16, 16)
 fn vl_gradient(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= G.w || gid.y >= G.h || gid.z >= G.levels) {
+    if (gid.x >= G.w || gid.y >= G.h) {
         return;
     }
     let x = i32(gid.x);
     let y = i32(gid.y);
-    let l = gid.z;
     let w = i32(G.w);
     let h = i32(G.h);
     var gx: f32;
     if (x == 0) {
-        gx = g_at(l, 1, y) - g_at(l, 0, y);
+        gx = g_at(1, y) - g_at(0, y);
     } else if (x == w - 1) {
-        gx = g_at(l, x, y) - g_at(l, x - 1, y);
+        gx = g_at(x, y) - g_at(x - 1, y);
     } else {
-        gx = 0.5 * (g_at(l, x + 1, y) - g_at(l, x - 1, y));
+        gx = 0.5 * (g_at(x + 1, y) - g_at(x - 1, y));
     }
     var gy: f32;
     if (y == 0) {
-        gy = g_at(l, x, 1) - g_at(l, x, 0);
+        gy = g_at(x, 1) - g_at(x, 0);
     } else if (y == h - 1) {
-        gy = g_at(l, x, y) - g_at(l, x, y - 1);
+        gy = g_at(x, y) - g_at(x, y - 1);
     } else {
-        gy = 0.5 * (g_at(l, x, y + 1) - g_at(l, x, y - 1));
+        gy = 0.5 * (g_at(x, y + 1) - g_at(x, y - 1));
     }
-    grad_out[G.dst_off + (l * G.h + gid.y) * G.w + gid.x] = vec2<f32>(gx, gy);
+    grad_out[gid.y * G.w + gid.x] = vec2<f32>(gx, gy);
 }
 
 struct DescParams {
+    // This dispatch's keypoints: kps[first .. first + num].
+    first: u32,
     num: u32,
     // 0 = L2 (clip at 0.2, renormalize), 1 = L1-root.
     normalization: u32,
-    pad0: u32,
-    pad1: u32,
+    pad: u32,
 };
 
 // One keypoint, prepared on the host.
 struct DescKp {
-    // Element offset of the selected gradient level, and its width.
+    // The selected gradient level's width; `off` is unused.
     off: u32,
     lw: u32,
     xi: i32,
@@ -110,10 +109,11 @@ fn round_half_up(v: f32) -> f32 {
 // byte quantization and the UBC bin order, packed four bytes a word.
 @compute @workgroup_size(64)
 fn vl_describe(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x + gid.y * 65535u * 64u;
-    if (i >= D.num) {
+    let local = gid.x + gid.y * 65535u * 64u;
+    if (local >= D.num) {
         return;
     }
+    let i = D.first + local;
     let kp = kps[i];
     var d: array<f32, 128>;
     for (var j = 0u; j < 128u; j = j + 1u) {
@@ -123,7 +123,7 @@ fn vl_describe(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var dxi = kp.min_dx; dxi <= kp.max_dx; dxi = dxi + 1) {
             let sx = kp.xi + dxi;
             let sy = kp.yi + dyi;
-            let g = grad[kp.off + u32(sy) * kp.lw + u32(sx)];
+            let g = grad[u32(sy) * kp.lw + u32(sx)];
             let mag = sqrt(g.x * g.x + g.y * g.y);
             if (!(mag > EPS) || mag > 3.0e38) {
                 continue;

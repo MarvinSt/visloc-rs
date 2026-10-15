@@ -4,6 +4,7 @@
 
     benchmark_eth3d_auc.py colmap-matches SCENE_DIR RUN_DIR WORK_DIR MAPPER
     benchmark_eth3d_auc.py visloc-matches SCENE_DIR RUN_DIR WORK_DIR MAPPER
+    benchmark_eth3d_auc.py visloc-only SCENE_DIR RUN_DIR WORK_DIR MAPPER
     benchmark_eth3d_auc.py table RESULTS.jsonl [--markdown]
 
 SCENE_DIR is an extracted ETH3D ``<scene>_dslr_undistorted`` scene (its
@@ -20,6 +21,8 @@ keypoints and two-view inliers written in its replay format.
 ``visloc-matches``: the run's own keypoints and verified matches feed all
 three. COLMAP re-verifies them (``verify_matches``) to build the two-view
 geometries its mappers need, so its inliers are a subset of the run's.
+``visloc-only`` scores just the visloc-rs mapper on them (no pycolmap
+needed), e.g. to compare front-end settings.
 
 Every method uses the run's single PINHOLE camera, held fixed. Each mode
 prints one JSON line per mapper: registered images, AUC at 1/3/5 degrees of the
@@ -284,6 +287,22 @@ def port_database(pycolmap, port, db, work, reader, frames, size):
     return image_dir, pairs_txt
 
 
+def visloc_only(scene, run, work, mapper):
+    """The visloc-rs mapper alone on the run's own matches."""
+    os.makedirs(work, exist_ok=True)
+    name = os.path.basename(os.path.normpath(scene))
+    gt = read_images_txt(os.path.join(scene, "dslr_calibration_undistorted", "images.txt"))
+    orig_of = {}
+    with open(os.path.join(run, "image_names.txt")) as f:
+        for line in f:
+            if line.strip():
+                fr, path = line.split()
+                orig_of[fr] = os.path.basename(path)
+    est, seconds = run_visloc(mapper, os.path.join(run, "port"), os.path.join(work, "visloc"),
+                              orig_of, os.path.join(work, "visloc.log"))
+    print(json.dumps({"scene": name, **score(gt, est, seconds, "visloc-rs")}), flush=True)
+
+
 def bench(mode, scene, run, work, mapper):
     import pycolmap
     from PIL import Image
@@ -419,6 +438,8 @@ def main():
         table(sys.argv[2], "--markdown" in sys.argv[3:])
     elif len(sys.argv) == 6 and sys.argv[1] in ("colmap-matches", "visloc-matches"):
         bench(*sys.argv[1:6])
+    elif len(sys.argv) == 6 and sys.argv[1] == "visloc-only":
+        visloc_only(*sys.argv[2:6])
     else:
         sys.exit(__doc__)
 

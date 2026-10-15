@@ -558,9 +558,14 @@ pub fn build_photo_dataset(
                 for g in &grays {
                     let gray = GrayImage::new(width as usize, height as usize, g)
                         .map_err(|e| EurocError::Sift(format!("{e}")))?;
-                    let (kps, desc) = vl
-                        .extract(&gray, &sift_cfg)
-                        .map_err(|e| EurocError::Sift(format!("{e}")))?;
+                    // An image past the device's binding limit: the CPU.
+                    let (kps, desc) = match vl.extract(&gray, &sift_cfg) {
+                        Err(visloc_sift_gpu::SiftGpuError::Unsupported) => {
+                            extract_sift(&gray, &sift_cfg)
+                                .map_err(|e| EurocError::Sift(format!("{e}")))?
+                        }
+                        other => other.map_err(|e| EurocError::Sift(format!("{e}")))?,
+                    };
                     features.push(to_features(kps, desc));
                 }
             }

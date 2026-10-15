@@ -73,7 +73,7 @@ use super::bundle_adjustment::{
 };
 pub use super::incremental_triangulator::Options as TriangulatorOptions;
 use super::incremental_triangulator::{estimate_triangulation_of_views, IncrementalTriangulator};
-use super::mapper_impl::{self, InitGateOptions};
+use super::mapper_impl::{self, CandidateRound, InitGateOptions};
 use super::observation_manager::{
     camera_has_bogus_params, image_cam_from_world, ObservationManager,
 };
@@ -125,6 +125,14 @@ pub struct Options {
     /// ([`IncrementalMapper::register_next_structure_less_image`]). Off by
     /// default here (the port's controls predate it); COLMAP 4 enables it.
     pub structure_less_registration_fallback: bool,
+    /// Not in COLMAP: the structure-less round's candidates are the images
+    /// with at least `2 * abs_pose_min_num_inliers` 2D-2D correspondences
+    /// to registered images, the count
+    /// [`IncrementalMapper::register_next_structure_less_image`] itself
+    /// requires, instead of COLMAP's `abs_pose_min_num_inliers` visible 3D
+    /// points. COLMAP's filter keeps out exactly the images the fallback
+    /// exists for: those that see too few 3D points. Off by default.
+    pub structure_less_candidates_from_correspondences: bool,
 }
 
 impl Default for Options {
@@ -149,6 +157,7 @@ impl Default for Options {
             max_extra_param: 1.0,
             random_seed: 0, // control override (§0.1)
             structure_less_registration_fallback: false,
+            structure_less_candidates_from_correspondences: false,
         }
     }
 }
@@ -182,6 +191,9 @@ impl Options {
             "max_reg_trials" => self.max_reg_trials = num()? as usize,
             "structure_less_registration_fallback" => {
                 self.structure_less_registration_fallback = num()? != 0.0;
+            }
+            "structure_less_candidates_from_correspondences" => {
+                self.structure_less_candidates_from_correspondences = num()? != 0.0;
             }
             _ => return Err(format!("unknown key {key}")),
         }
@@ -1509,7 +1521,14 @@ impl IncrementalMapper {
             } else {
                 &self.num_reg_trials
             },
-            structure_less,
+            match (
+                structure_less,
+                options.structure_less_candidates_from_correspondences,
+            ) {
+                (false, _) => CandidateRound::Structure,
+                (true, false) => CandidateRound::StructureLess,
+                (true, true) => CandidateRound::StructureLessByCorrespondences,
+            },
         );
 
         // Env-gated boundary diagnostic for the 10k model-splitting
@@ -1646,6 +1665,25 @@ mod tests {
             Vec::<ImageT>::new(),
             "no 3D point is visible, so structure-based registration has no candidate"
         );
+        assert_eq!(
+            mapper.find_next_images(&options, &recon, true),
+            Vec::<ImageT>::new(),
+            "COLMAP's structure-less round also asks for visible 3D points"
+        );
+        let by_correspondences = Options {
+            structure_less_candidates_from_correspondences: true,
+            ..options.clone()
+        };
+        assert_eq!(
+            mapper.find_next_images(&by_correspondences, &recon, true),
+            vec![2],
+            "120 correspondences to registered images make image 2 a candidate"
+        );
+        assert_eq!(
+            mapper.find_next_images(&by_correspondences, &recon, false),
+            Vec::<ImageT>::new(),
+            "the structure-based round keeps COLMAP's filter"
+        );
         assert!(mapper.register_next_structure_less_image(
             &options,
             &mut recon,
@@ -1672,8 +1710,12 @@ mod tests {
         options
             .apply_override("filter_max_reproj_error = 2.5")
             .unwrap();
+        options
+            .apply_override("structure_less_candidates_from_correspondences=1")
+            .unwrap();
         assert_eq!(options.abs_pose_min_num_inliers, 30);
         assert_eq!(options.filter_max_reproj_error, 2.5);
+        assert!(options.structure_less_candidates_from_correspondences);
         assert!(options.apply_override("no_such_key=1").is_err());
         assert!(options.apply_override("max_reg_trials").is_err());
         assert!(options.apply_override("max_reg_trials=x").is_err());

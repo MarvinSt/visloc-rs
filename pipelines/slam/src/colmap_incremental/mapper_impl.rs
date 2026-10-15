@@ -378,6 +378,22 @@ fn unit_camera() -> super::reconstruction::Camera {
     super::reconstruction::Camera::pinhole(0, 1, 1, 1.0, 1.0, 0.0, 0.0)
 }
 
+/// The registration round [`find_next_images`] picks candidates for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateRound {
+    /// From 2D-3D correspondences.
+    Structure,
+    /// COLMAP 4's structure-less fallback: the same candidates, ranked by
+    /// their 2D-2D correspondences to registered images.
+    StructureLess,
+    /// Not in COLMAP: the structure-less fallback's candidates are the
+    /// images with at least `2 * abs_pose_min_num_inliers` 2D-2D
+    /// correspondences to registered images, the structure-less
+    /// registration's own minimum (`Options::
+    /// structure_less_candidates_from_correspondences`).
+    StructureLessByCorrespondences,
+}
+
 /// Port of `FindNextImages` (`.cc:294-364`), `MIN_UNCERTAINTY` selection
 /// method only (control default, `mapper.h:169-170`) — visibility-pyramid
 /// score via `ObservationManager::point3d_visibility_score`.
@@ -388,7 +404,7 @@ pub fn find_next_images(
     obs: &super::observation_manager::ObservationManager,
     filtered_frames: &std::collections::BTreeSet<super::types::FrameT>,
     num_reg_trials: &BTreeMap<ImageT, usize>,
-    structure_less: bool,
+    round: CandidateRound,
 ) -> Vec<ImageT> {
     let mut primary: Vec<(ImageT, u64)> = Vec::new();
     let mut secondary: Vec<(ImageT, u64)> = Vec::new();
@@ -397,7 +413,12 @@ pub fn find_next_images(
         if recon.is_image_registered(image_id) {
             continue;
         }
-        if obs.num_visible_points3d(image_id) < abs_pose_min_num_inliers {
+        let visible = if round == CandidateRound::StructureLessByCorrespondences {
+            obs.num_visible_correspondences(image_id) / 2
+        } else {
+            obs.num_visible_points3d(image_id)
+        };
+        if visible < abs_pose_min_num_inliers {
             continue;
         }
         let trials = *num_reg_trials.get(&image_id).unwrap_or(&0);
@@ -406,10 +427,10 @@ pub fn find_next_images(
         }
         // Structure-less registration ranks by 2D-2D correspondences to
         // registered images (`.cc:276-281`).
-        let rank = if structure_less {
-            obs.num_visible_correspondences(image_id) as u64
-        } else {
+        let rank = if round == CandidateRound::Structure {
             obs.point3d_visibility_score(image_id)
+        } else {
+            obs.num_visible_correspondences(image_id) as u64
         };
         if filtered_frames.contains(&image.frame_id) || trials != 0 {
             secondary.push((image_id, rank));

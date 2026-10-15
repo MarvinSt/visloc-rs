@@ -37,7 +37,7 @@
 use super::bundle_adjustment::BundleAdjustmentOptions;
 use super::database_cache::DatabaseCache;
 use super::incremental_triangulator::Options as TriangulatorOptions;
-use super::mapper::{IncrementalMapper, Options as MapperOptions};
+use super::mapper::{CandidateRound, IncrementalMapper, Options as MapperOptions};
 use super::reconstruction::Reconstruction;
 use super::types::{FrameT, ImageT};
 
@@ -66,6 +66,18 @@ pub struct PipelineOptions {
     /// [`FINAL_CONVERGE_MIN_FRAMES`]); `0` runs it on every model, a number
     /// above any model's size turns it off.
     pub ba_global_final_converge_min_frames: usize,
+    /// Not in COLMAP: once every model is built, extend the largest one
+    /// with the images it left out ([`complete_model`]). The structure-less
+    /// candidates there are the images with at least
+    /// `2 * abs_pose_min_num_inliers` 2D-2D correspondences to registered
+    /// images ([`CandidateRound::StructureLessByCorrespondences`]), the
+    /// count the structure-less registration itself needs. COLMAP's filter
+    /// (`abs_pose_min_num_inliers` visible 3D points) keeps out exactly the
+    /// images that see too few 3D points. Running after the models are
+    /// final, it does not change which models are built; a model it does
+    /// not extend is left as it was. Off by default
+    /// (`complete_largest_model`).
+    pub complete_largest_model: bool,
     pub ba_global_frames_ratio: f64,
     pub ba_global_points_ratio: f64,
     pub ba_global_frames_freq: usize,
@@ -102,6 +114,7 @@ impl Default for PipelineOptions {
             ba_global_max_refinements: 5,
             ba_global_max_refinement_change: 0.0005,
             ba_global_final_converge_min_frames: FINAL_CONVERGE_MIN_FRAMES,
+            complete_largest_model: false,
             ba_global_frames_ratio: 1.1,
             ba_global_points_ratio: 1.1,
             ba_global_frames_freq: 500,
@@ -119,7 +132,8 @@ impl PipelineOptions {
     /// Apply one `key=value` override: COLMAP's `ba_refine_focal_length` /
     /// `ba_refine_principal_point` / `ba_refine_sensor_from_rig` (`0`/`1`, on
     /// both the local and the global BA options), this port's
-    /// `ba_global_final_converge_min_frames` (a frame count), else
+    /// `ba_global_final_converge_min_frames` (a frame count) and
+    /// `complete_largest_model` (`0`/`1`), else
     /// [`MapperOptions::apply_override`].
     pub fn apply_override(&mut self, kv: &str) -> Result<(), String> {
         let flag = |value: &str, key: &str| {
@@ -150,6 +164,10 @@ impl PipelineOptions {
             Some((key @ "ba_global_final_converge_min_frames", value)) => {
                 self.ba_global_final_converge_min_frames =
                     value.trim().parse().map_err(|e| format!("{key}: {e}"))?;
+                Ok(())
+            }
+            Some((key @ "complete_largest_model", value)) => {
+                self.complete_largest_model = flag(value, key)?;
                 Ok(())
             }
             _ => self.mapper.apply_override(kv),
@@ -326,23 +344,23 @@ fn reconstruct_sub_model(
 
         // Structure-based registration first; when every candidate fails,
         // the structure-less fallback (COLMAP 4) if enabled.
-        let structure_less_flags: &[bool] = if mapper_options.structure_less_registration_fallback {
-            &[false, true]
+        let rounds: &[CandidateRound] = if mapper_options.structure_less_registration_fallback {
+            &[CandidateRound::Structure, CandidateRound::StructureLess]
         } else {
-            &[false]
+            &[CandidateRound::Structure]
         };
         let t_reg = std::time::Instant::now();
         let mut attempts = 0usize;
         let mut find_ms = 0;
         let mut num_candidates = 0;
-        for &structure_less in structure_less_flags {
+        for &round in rounds {
             let t_find = std::time::Instant::now();
-            let next_images = mapper.find_next_images(mapper_options, recon, structure_less);
+            let next_images = mapper.find_next_images(mapper_options, recon, round);
             find_ms += t_find.elapsed().as_millis();
             num_candidates += next_images.len();
             for &candidate in &next_images {
                 attempts += 1;
-                let registered = if structure_less {
+                let registered = if round != CandidateRound::Structure {
                     mapper.register_next_structure_less_image(
                         mapper_options,
                         recon,
@@ -486,6 +504,85 @@ fn reconstruct_sub_model(
     Status::Success
 }
 
+/// [`PipelineOptions::complete_largest_model`]: registers what it can of
+/// the images `recon` left out, each round structure-based first and then
+/// structure-less over every image with enough 2D-2D correspondences. Each
+/// registration is followed by triangulation and the local refinement as
+/// in [`reconstruct_sub_model`]; once no candidate registers, a global
+/// refinement and one more round. Returns the number of frames registered;
+/// with none, `recon` is unchanged.
+fn complete_model(
+    options: &PipelineOptions,
+    mapper_options: &MapperOptions,
+    mapper: &mut IncrementalMapper,
+    db: &DatabaseCache,
+    recon: &mut Reconstruction,
+) -> usize {
+    let graph = db.correspondence_graph();
+    mapper.begin_reconstruction(recon, graph);
+    let mut added = 0;
+    let mut refined = false;
+    loop {
+        let mut registered = None;
+        'rounds: for round in [
+            CandidateRound::Structure,
+            CandidateRound::StructureLessByCorrespondences,
+        ] {
+            for candidate in mapper.find_next_images(mapper_options, recon, round) {
+                let ok = if round == CandidateRound::Structure {
+                    mapper.register_next_image(mapper_options, recon, graph, candidate)
+                } else {
+                    mapper.register_next_structure_less_image(
+                        mapper_options,
+                        recon,
+                        graph,
+                        candidate,
+                    )
+                };
+                if ok {
+                    registered = Some(candidate);
+                    break 'rounds;
+                }
+            }
+        }
+        match registered {
+            Some(image_id) => {
+                let frame_id = recon.image(image_id).frame_id;
+                let frame_images: Vec<ImageT> = recon.frame(frame_id).image_ids().collect();
+                for iid in frame_images {
+                    mapper.triangulate_image(&options.triangulation, recon, graph, iid);
+                }
+                mapper.iterative_local_refinement(
+                    options.ba_local_max_refinements,
+                    options.ba_local_max_refinement_change,
+                    mapper_options,
+                    &options.local_ba,
+                    &options.triangulation,
+                    recon,
+                    graph,
+                    image_id,
+                );
+                added += 1;
+                refined = false;
+            }
+            None if added > 0 && !refined => {
+                iterative_global_refinement(options, mapper_options, mapper, db, recon);
+                refined = true;
+            }
+            None => break,
+        }
+    }
+    if added > 0 && recon.num_reg_frames() >= options.ba_global_final_converge_min_frames.max(2) {
+        let mut converge = options.clone();
+        converge.ba_global_max_refinements = 1;
+        converge.global_ba.gradient_tolerance_rel = None;
+        converge.global_ba.max_num_iterations = FINAL_CONVERGE_MAX_ITERATIONS;
+        iterative_global_refinement(&converge, mapper_options, mapper, db, recon);
+    }
+    mapper.end_reconstruction(recon, graph, false);
+    added
+}
+
 /// Result of one kept sub-model.
 pub struct ModelResult {
     pub reconstruction: Reconstruction,
@@ -575,6 +672,26 @@ pub fn run(options: &PipelineOptions, db: &DatabaseCache) -> RunResult {
         }
     }
 
+    if options.complete_largest_model {
+        // The first of the largest models, the one a caller keeping the
+        // largest would pick.
+        let largest = (0..kept.len())
+            .rev()
+            .max_by_key(|&k| kept[k].reconstruction.num_reg_images());
+        if let Some(k) = largest {
+            let added = complete_model(
+                options,
+                &options.mapper,
+                &mut mapper,
+                db,
+                &mut kept[k].reconstruction,
+            );
+            mapper
+                .log
+                .push(format!("COMPLETE model={k} registered_frames={added}"));
+        }
+    }
+
     let summary = format!(
         "SUMMARY path_a_attempts={} path_a_registered={} path_b_attempts={} path_b_registered={} path_b_rejected_lt6_corrs={}",
         mapper.path_a_attempts,
@@ -594,9 +711,48 @@ pub fn run(options: &PipelineOptions, db: &DatabaseCache) -> RunResult {
 mod tests {
     use super::*;
     use nalgebra::Point3;
+    use visloc_core::geometry::SE3;
     use visloc_tracking::umeyama_similarity_transform;
 
-    use crate::colmap_incremental::test_support::build_synthetic_rig_scene;
+    use crate::colmap_incremental::test_support::{
+        build_synthetic_rig_scene, build_three_view_scene,
+    };
+
+    /// `complete_model` registers an image its model left out from 2D-2D
+    /// correspondences alone (it sees no 3D point, so neither COLMAP's
+    /// structure-based nor its structure-less round would try it), and
+    /// leaves a model with nothing to add as it was.
+    #[test]
+    fn complete_model_registers_a_left_out_image() {
+        let (db, poses, _) = build_three_view_scene();
+        let mut recon = reconstruction_from_cache(&db);
+        for (k, pose) in poses.iter().take(2).enumerate() {
+            recon.frame_mut(k as u64).set_rig_from_world(pose.clone());
+            recon.register_frame(k as u64);
+        }
+        let mut options = PipelineOptions::default();
+        options.mapper.abs_pose_min_num_inliers = 20;
+        let mut mapper = IncrementalMapper::new();
+
+        let added = complete_model(&options, &options.mapper, &mut mapper, &db, &mut recon);
+        assert_eq!(added, 1);
+        assert!(recon.is_image_registered(2));
+        let got = recon.frame(2).rig_from_world();
+        let centre_error = (got.inverse().translation - poses[2].inverse().translation).norm();
+        assert!(centre_error < 1e-3, "centre off by {centre_error}");
+
+        let before: Vec<SE3> = (0..3)
+            .map(|k| recon.frame(k).rig_from_world().clone())
+            .collect();
+        let points_before = recon.num_points3d();
+        let added = complete_model(&options, &options.mapper, &mut mapper, &db, &mut recon);
+        assert_eq!(added, 0);
+        let after: Vec<SE3> = (0..3)
+            .map(|k| recon.frame(k).rig_from_world().clone())
+            .collect();
+        assert_eq!(after, before);
+        assert_eq!(recon.num_points3d(), points_before);
+    }
 
     /// C2 task item 7: "mapper end-to-end on a small synthetic rig sequence
     /// (e.g. 20 frames, 2 cameras, known points) recovers metric scale

@@ -2130,7 +2130,6 @@ mod tests {
             recon.register_frame(frame_id);
         }
         let mut obs = ObservationManager::new(&recon, graph);
-        obs.size_pyramids(&recon);
         let mut tri = IncrementalTriangulator::new();
         let options = Options::default();
 
@@ -2256,7 +2255,6 @@ mod tests {
         graph.finalize();
 
         let mut obs = ObservationManager::new(&recon, &graph);
-        obs.size_pyramids(&recon);
         let mut tri = IncrementalTriangulator::new();
         let options = Options::default();
 
@@ -2370,7 +2368,6 @@ mod tests {
         graph.finalize();
 
         let mut obs = ObservationManager::new(&recon, &graph);
-        obs.size_pyramids(&recon);
         let mut tri = IncrementalTriangulator::new();
         let options = Options::default();
 
@@ -2502,7 +2499,6 @@ mod tests {
         graph.finalize();
 
         let mut obs = ObservationManager::new(&recon, &graph);
-        obs.size_pyramids(&recon);
         // Seed B's point3D (p_near) as already-triangulated before A runs.
         obs.add_point3d(
             &mut recon,

@@ -257,6 +257,45 @@ built from source with CUDA and Caspar, its GPU bundle adjuster:
   - COLMAP's extraction time includes decoding its images, resized to
     1,600 px beforehand. visloc-rs's starts after decoding.
 
+### SmallCity
+
+The same machine and settings as the CPU run above: visloc-rs's matches of
+the 5,822 photos, 21 threads.
+
+| | visloc-rs | visloc-rs, `--gpu-ba 1` | COLMAP global, Caspar |
+|---|---|---|---|
+| Mapper wall time | **19.5 min** | 19.9 min | unfinished, stopped at 90 min |
+| Peak memory | 18.8 GiB | **16.9 GiB** | 31.4 GiB up to the stop |
+| Registered | 5,816 / 5,822 | 5,816 / 5,822 | — |
+| Camera-centre error, median / p90 | 0.281 m / 0.731 m | 0.577 m / 1.946 m | — |
+
+COLMAP's stages up to the stop, against the CPU-only run above (32
+threads). The cap also covered its database (1.4 min) and re-verifying the
+matches (6.6 min):
+
+| Stage | GPU machine | CPU run |
+|---|---|---|
+| Rotation averaging | 2.8 min | 2.2 min |
+| Track establishment | 1.8 min | 1.9 min |
+| Global positioning (Ceres, CPU) | 54.3 min | 31.6 min |
+| Bundle adjustment, three rounds | 13.9 min (Caspar) | 36.3 min |
+| Retriangulation and refinement | stopped after 7 min | stopped after 19.3 min |
+
+- **Caspar** ran COLMAP's bundle adjustment 2.6 times faster than Ceres did
+  on 32 threads. Global positioning stays on Ceres, which Ubuntu builds
+  without CUDA, so it ran on the CPU: 54 minutes on 21 threads.
+- **visloc-rs's accuracy differs from the CPU run's** (0.15 m there). The
+  two runs register the same images in the same order up to the 1,187th
+  image; the 1,188th gets one inlier more (2,475 against 2,474) and from
+  there the reconstructions part. The mapper gives byte-identical models
+  at any thread count, so the likely cause is the platform's floating
+  point (Ubuntu 24.04 here, 22.04 before). On this capture the incremental
+  mapper's result spreads like that across mapper seeds too (0.15 m to
+  0.65 m).
+- **The GPU bundle adjustment** is not faster on this GPU, and its run parts
+  from the CPU run after its first solve
+  ([GPU bundle adjustment](gpu_bundle_adjustment.md)).
+
 ## Caveats
 
 - **COLMAP is not deterministic.** COLMAP runs with its default random seed

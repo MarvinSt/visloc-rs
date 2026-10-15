@@ -421,6 +421,7 @@ struct ContributionIndex {
 }
 
 impl ContributionIndex {
+    #[cfg(test)]
     fn new(
         point_free_frames: &[Vec<u32>],
         free_frame_slot: &[Option<u32>],
@@ -428,28 +429,26 @@ impl ContributionIndex {
         n_free: usize,
         shard_boundaries: &[usize],
     ) -> Self {
-        let mut slot_off = vec![0usize; n_free + 1];
-        for frames in point_free_frames {
-            for &f in frames {
-                slot_off[free_frame_slot[f as usize].expect("free") as usize + 1] += 1;
-            }
-        }
-        for i in 1..slot_off.len() {
-            slot_off[i] += slot_off[i - 1];
-        }
-        let mut slot = vec![[0u32; 2]; slot_off[n_free]];
-        let mut slot_fill = slot_off.clone();
-        for (p, frames) in point_free_frames.iter().enumerate() {
-            for (k, &f) in frames.iter().enumerate() {
-                let s = free_frame_slot[f as usize].expect("free") as usize;
-                slot[slot_fill[s]] = [p as u32, k as u32];
-                slot_fill[s] += 1;
-            }
-        }
+        Self::from_slots(
+            slot_index(point_free_frames, free_frame_slot, n_free),
+            point_free_frames.len(),
+            edges,
+            shard_boundaries,
+        )
+    }
+
+    /// The index over the [`slot_index`] the pattern was built from.
+    fn from_slots(
+        (slot_off, slot): SlotIndex,
+        n_points: usize,
+        edges: &[(u32, u32)],
+        shard_boundaries: &[usize],
+    ) -> Self {
+        let n_free = slot_off.len() - 1;
         let row_off = (0..=n_free)
             .map(|s| edges.partition_point(|&(a, _)| (a as usize) < s))
             .collect();
-        let mut point_shard = vec![0u32; point_free_frames.len()];
+        let mut point_shard = vec![0u32; n_points];
         for s in 0..shard_boundaries.len().saturating_sub(1) {
             for v in &mut point_shard[shard_boundaries[s]..shard_boundaries[s + 1]] {
                 *v = s as u32;
@@ -569,7 +568,7 @@ fn build_reduced_system_pattern(
     frame_fixed: &[bool],
     free_frame_slot: &[Option<u32>],
     (n_frames, has_camera): (u32, bool),
-) -> (Vec<Vec<u32>>, Vec<(u32, u32)>, PairIndex) {
+) -> (Vec<Vec<u32>>, Vec<(u32, u32)>, PairIndex, SlotIndex) {
     // Per-point work runs on rayon; the outputs (sorted unique edge list,
     // per-point free frames and pair -> edge indices) are pure functions of
     // the input, so they match the serial construction exactly.
@@ -596,24 +595,8 @@ fn build_reduced_system_pattern(
     // point with `a`, sorted and deduplicated — the sorted unique pair list
     // without materializing every pair. Each row gathers from the points
     // observing its frame (`(point, position)` per slot).
-    let mut slot_off = vec![0usize; n_slots + 1];
-    for frames in &point_free_frames {
-        for &f in frames {
-            slot_off[free_frame_slot[f as usize].expect("free") as usize + 1] += 1;
-        }
-    }
-    for i in 1..slot_off.len() {
-        slot_off[i] += slot_off[i - 1];
-    }
-    let mut slot_points = vec![[0u32; 2]; slot_off[n_slots]];
-    let mut fill = slot_off.clone();
-    for (p, frames) in point_free_frames.iter().enumerate() {
-        for (k, &f) in frames.iter().enumerate() {
-            let s = free_frame_slot[f as usize].expect("free") as usize;
-            slot_points[fill[s]] = [p as u32, k as u32];
-            fill[s] += 1;
-        }
-    }
+    let slots = slot_index(&point_free_frames, free_frame_slot, n_slots);
+    let (slot_off, slot_points) = (&slots.0, &slots.1);
     // Up to `EDGE_RANK_MAX_SLOTS` frames the rows are bitmaps over the
     // slots ([`EdgeRank`]): marking every pair's bit leaves each row sorted
     // and unique without a sort, and a pair's edge index below is its row's
@@ -666,7 +649,78 @@ fn build_reduced_system_pattern(
             rank,
             idx: std::sync::OnceLock::new(),
         },
+        slots,
     )
+}
+
+/// Per free slot `s`, `(point, k)` for every point observing its frame,
+/// ascending in point (`k` the frame's position in
+/// `point_free_frames[point]`): `slot[slot_off[s]..slot_off[s + 1]]`, as
+/// `(slot_off, slot)`.
+type SlotIndex = (Vec<usize>, Vec<[u32; 2]>);
+
+/// [`SlotIndex`] of `point_free_frames` over `n_slots` free slots. Large
+/// inputs are grouped by slot in contiguous point chunks in parallel, then
+/// each slot's runs are concatenated in chunk order: the layout of a serial
+/// scatter in point order, at any thread count.
+fn slot_index(
+    point_free_frames: &[Vec<u32>],
+    free_frame_slot: &[Option<u32>],
+    n_slots: usize,
+) -> SlotIndex {
+    let scatter = |points: std::ops::Range<usize>| -> SlotIndex {
+        let slot_of = |f: u32| free_frame_slot[f as usize].expect("free") as usize;
+        let mut off = vec![0usize; n_slots + 1];
+        for frames in &point_free_frames[points.clone()] {
+            for &f in frames {
+                off[slot_of(f) + 1] += 1;
+            }
+        }
+        for i in 1..off.len() {
+            off[i] += off[i - 1];
+        }
+        let mut out = vec![[0u32; 2]; off[n_slots]];
+        let mut fill = off.clone();
+        for p in points {
+            for (k, &f) in point_free_frames[p].iter().enumerate() {
+                let s = slot_of(f);
+                out[fill[s]] = [p as u32, k as u32];
+                fill[s] += 1;
+            }
+        }
+        (off, out)
+    };
+    let n_points = point_free_frames.len();
+    if n_points < 1 << 15 {
+        return scatter(0..n_points);
+    }
+    const CHUNKS: usize = 64;
+    let local: Vec<SlotIndex> = (0..CHUNKS)
+        .into_par_iter()
+        .map(|c| scatter(c * n_points / CHUNKS..(c + 1) * n_points / CHUNKS))
+        .collect();
+    let mut slot_off = vec![0usize; n_slots + 1];
+    for s in 0..n_slots {
+        let len: usize = local.iter().map(|(off, _)| off[s + 1] - off[s]).sum();
+        slot_off[s + 1] = slot_off[s] + len;
+    }
+    let mut slot = vec![[0u32; 2]; slot_off[n_slots]];
+    let mut rows: Vec<&mut [[u32; 2]]> = Vec::with_capacity(n_slots);
+    let mut rest = slot.as_mut_slice();
+    for s in 0..n_slots {
+        let (row, tail) = rest.split_at_mut(slot_off[s + 1] - slot_off[s]);
+        rows.push(row);
+        rest = tail;
+    }
+    rows.into_par_iter().enumerate().for_each(|(s, row)| {
+        let mut at = 0;
+        for (off, out) in &local {
+            let run = &out[off[s]..off[s + 1]];
+            row[at..at + run.len()].copy_from_slice(run);
+            at += run.len();
+        }
+    });
+    (slot_off, slot)
 }
 
 /// Frame slots up to which [`EdgeRank`] indexes the edge rows: its bitmaps
@@ -1478,7 +1532,7 @@ fn assemble_problem(
     let points: Vec<Point3<f64>> = input.points.clone();
 
     let setup_ms = t_start.elapsed().as_secs_f64() * 1e3;
-    let (point_free_frames, edges, pairs) = build_reduced_system_pattern(
+    let (point_free_frames, edges, pairs, slots) = build_reduced_system_pattern(
         &point_obs_range,
         &obs,
         &frame_fixed,
@@ -1503,13 +1557,7 @@ fn assemble_problem(
     let n_shards = elimination_shard_count(edges.len());
     let shard_boundaries = balanced_shard_boundaries(&point_free_frames, n_shards);
     let contributions = (n_shards < 8 || n_free_frames >= ITERATIVE_MIN_FREE_FRAMES).then(|| {
-        ContributionIndex::new(
-            &point_free_frames,
-            &free_frame_slot,
-            &edges,
-            n_free_frames,
-            &shard_boundaries,
-        )
+        ContributionIndex::from_slots(slots, point_free_frames.len(), &edges, &shard_boundaries)
     });
 
     if n_free_frames >= 1000 {
@@ -2003,9 +2051,21 @@ fn linearize(
         }
     }
     // `hcp` (the previous linearization's array, reused) split by shard;
-    // a gradient-only pass leaves it alone.
+    // a gradient-only pass leaves it alone. A solve's first linearization
+    // starts from an empty array: it is zeroed in parallel, which spreads
+    // the first touch of its pages over the threads (a serial `resize` of
+    // a global BA's 2 GB was most of that linearization).
     if full {
-        hcp.resize(problem.hcp_off[n_points], SMatrix::<f64, 6, 3>::zeros());
+        let len = problem.hcp_off[n_points];
+        if hcp.len() < len {
+            let missing = len - hcp.len();
+            hcp.par_extend(rayon::iter::repeat_n(
+                SMatrix::<f64, 6, 3>::zeros(),
+                missing,
+            ));
+        } else {
+            hcp.truncate(len);
+        }
     }
     let mut hcp_shards = Vec::with_capacity(n_shards);
     let mut rest = hcp.as_mut_slice();
@@ -4396,6 +4456,56 @@ mod tests {
         let (to_a, to_b) = edge_product(blk32.as_slice(), &xa, &xb);
         assert!((to_a - blk.tr_mul(&xb)).amax() < 1e-12);
         assert!((to_b - blk * xa).amax() < 1e-12);
+    }
+
+    /// The chunked, parallel slot index lays its entries out like one serial
+    /// scatter in point order.
+    #[test]
+    fn slot_index_matches_the_serial_scatter() {
+        let n_frames = 300usize;
+        // Every seventh frame fixed; the others numbered in order.
+        let mut free_frame_slot = vec![None; n_frames];
+        let mut n_slots = 0u32;
+        for (f, slot) in free_frame_slot.iter_mut().enumerate() {
+            if f % 7 != 3 {
+                *slot = Some(n_slots);
+                n_slots += 1;
+            }
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |m: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize % m
+        };
+        let point_free_frames: Vec<Vec<u32>> = (0..40_000)
+            .map(|_| {
+                let first = next(n_frames - 8);
+                let mut frames: Vec<u32> = (0..1 + next(6))
+                    .map(|_| (first + next(8)) as u32)
+                    .filter(|&f| free_frame_slot[f as usize].is_some())
+                    .collect();
+                frames.sort_unstable();
+                frames.dedup();
+                frames
+            })
+            .collect();
+        let n_slots = n_slots as usize;
+        let mut slot_off = vec![0usize; n_slots + 1];
+        let mut slot = vec![Vec::new(); n_slots];
+        for (p, frames) in point_free_frames.iter().enumerate() {
+            for (k, &f) in frames.iter().enumerate() {
+                slot[free_frame_slot[f as usize].unwrap() as usize].push([p as u32, k as u32]);
+            }
+        }
+        for s in 0..n_slots {
+            slot_off[s + 1] = slot_off[s] + slot[s].len();
+        }
+        let (off, entries) = slot_index(&point_free_frames, &free_frame_slot, n_slots);
+        assert!(point_free_frames.len() >= 1 << 15, "takes the chunked path");
+        assert_eq!(off, slot_off);
+        assert_eq!(entries, slot.concat());
     }
 
     /// The per-output elimination (iterative path, tight memory) and the

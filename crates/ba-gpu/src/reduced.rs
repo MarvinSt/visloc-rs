@@ -473,14 +473,13 @@ impl GpuReducedSolver {
             }
             let to_u32 = |v: &[usize]| v.iter().map(|&x| x as u32).collect::<Vec<u32>>();
             let edge_b: Vec<u32> = e.edges.iter().map(|&(_, b)| b).collect();
-            let slots: Vec<u32> = e.slots.iter().flat_map(|s| s.iter().copied()).collect();
             let (slot_off, point_off, row_off) =
                 (to_u32(e.slot_off), to_u32(e.point_off), to_u32(e.row_off));
             let uploads: [(usize, &[u8]); 7] = [
                 (E_TASKS, bytemuck::cast_slice(&tasks)),
                 (E_EDGE_B, bytemuck::cast_slice(&edge_b)),
                 (E_SLOT_OFF, bytemuck::cast_slice(&slot_off)),
-                (E_SLOTS, bytemuck::cast_slice(&slots)),
+                (E_SLOTS, bytemuck::cast_slice(e.slots)),
                 (E_POINT_OFF, bytemuck::cast_slice(&point_off)),
                 (E_POINT_NODES, bytemuck::cast_slice(e.point_nodes)),
                 (E_ROW_OFF, bytemuck::cast_slice(&row_off)),
@@ -506,18 +505,18 @@ impl GpuReducedSolver {
             queue.write_buffer(st.elim.get(E_HCP), 0, bytemuck::cast_slice(&hcp));
             st.hcp_of = Some((e.structure_id, e.linearization_id));
         }
-        // Per call: the damped point inverses, the bounds, the couplings.
-        let vinv: Vec<f32> = e
-            .point_inverse
-            .iter()
-            .flat_map(|m| {
-                let v: [f32; 9] = match m {
-                    Some(m) => std::array::from_fn(|i| m.as_slice()[i] as f32),
-                    None => [0.0; 9],
-                };
-                v
-            })
-            .collect();
+        // Per call: the damped point inverses (zero for a skipped point), the
+        // bounds, the couplings.
+        let mut vinv = vec![0.0f32; 9 * n_points];
+        vinv.par_chunks_mut(9)
+            .zip(e.point_inverse.par_iter())
+            .for_each(|(out, m)| {
+                if let Some(m) = m {
+                    for (o, &v) in out.iter_mut().zip(m.as_slice()) {
+                        *o = v as f32;
+                    }
+                }
+            });
         // A zero bound has no terms to bound; keep the division finite.
         let scale: Vec<f32> = e
             .scale

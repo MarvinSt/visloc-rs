@@ -358,11 +358,8 @@ struct Problem {
     /// across every point's `point_free_frames` — the reduced camera
     /// system's off-diagonal sparsity pattern.
     edges: Vec<(u32, u32)>,
-    /// Per point, the `edges`-index of each of its
-    /// `point_free_frames[p].len() * (len-1) / 2` distinct frame pairs, in
-    /// the order `for i in 0..n { for j in i + 1..n }` over
-    /// `point_free_frames[p]` ([`pair_slot`]).
-    point_pair_edge_idx: Vec<Vec<u32>>,
+    /// Source of [`Problem::point_pair_edge_idx`].
+    pairs: PairIndex,
     /// Performance fix #3 (see [`eliminate_and_accumulate`]'s doc): point
     /// index range `[shard_boundaries[s], shard_boundaries[s+1])` for shard
     /// `s`, balanced by *cumulative pair count* (`Σ n·(n-1)/2`), not point
@@ -467,6 +464,85 @@ impl ContributionIndex {
     }
 }
 
+/// What [`Problem::point_pair_edge_idx`] is built from, and the index once
+/// built. The CPU elimination needs it; a reduced-solve accelerator that
+/// eliminates the points itself does not, so with one registered the index
+/// (O(pairs): 1.9 GB on SmallCity's last bundle adjustment) is built only
+/// if a CPU path asks for it.
+struct PairIndex {
+    /// `edges[row_off[a]..row_off[a + 1]]` are the edges `(a, _)`.
+    row_off: Vec<usize>,
+    rank: Option<EdgeRank>,
+    idx: std::sync::OnceLock<Vec<Vec<u32>>>,
+}
+
+impl Problem {
+    /// Per point, the `edges`-index of each of its
+    /// `point_free_frames[p].len() * (len-1) / 2` distinct frame pairs, in
+    /// the order `for i in 0..n { for j in i + 1..n }` over
+    /// `point_free_frames[p]` ([`pair_slot`]).
+    fn point_pair_edge_idx(&self) -> &[Vec<u32>] {
+        self.pairs.idx.get_or_init(|| {
+            pair_edge_index(
+                &self.point_free_frames,
+                &self.free_frame_slot,
+                &self.edges,
+                &self.pairs.row_off,
+                self.pairs.rank.as_ref(),
+            )
+        })
+    }
+}
+
+/// [`Problem::point_pair_edge_idx`] from the pattern
+/// [`build_reduced_system_pattern`] returns.
+fn pair_edge_index(
+    point_free_frames: &[Vec<u32>],
+    free_frame_slot: &[Option<u32>],
+    edges: &[(u32, u32)],
+    row_off: &[usize],
+    rank: Option<&EdgeRank>,
+) -> Vec<Vec<u32>> {
+    let slots_of = |frames: &[u32]| -> Vec<u32> {
+        frames
+            .iter()
+            .map(|&f| free_frame_slot[f as usize].expect("free"))
+            .collect()
+    };
+    point_free_frames
+        .par_iter()
+        .map(|frames| {
+            if frames.len() < 2 {
+                return Vec::new();
+            }
+            // Slots ascend with frames, so the pairs `(i, j > i)` walk
+            // edge row `slots[i]` forwards.
+            let slots = slots_of(frames);
+            let n = slots.len();
+            let mut idxs = vec![0u32; n * (n - 1) / 2];
+            for i in 0..n {
+                let a = slots[i] as usize;
+                if let Some(rank) = rank {
+                    for j in i + 1..n {
+                        let e = row_off[a] + rank.position(a, slots[j]);
+                        debug_assert_eq!(edges[e], (slots[i], slots[j]), "pair is an edge");
+                        idxs[pair_slot(n, i, j)] = e as u32;
+                    }
+                    continue;
+                }
+                let row = &edges[row_off[a]..row_off[a + 1]];
+                let mut pos = 0usize;
+                for j in i + 1..n {
+                    pos += row[pos..].partition_point(|&(_, b)| b < slots[j]);
+                    debug_assert_eq!(row[pos], (slots[i], slots[j]), "pair is an edge");
+                    idxs[pair_slot(n, i, j)] = (row_off[a] + pos) as u32;
+                }
+            }
+            idxs
+        })
+        .collect()
+}
+
 /// Performance fix (profiled on a 300-frame/2500-point/289k-observation
 /// synthetic problem sized like the tier-1000 global BA call that measured
 /// 2.9s/iteration): the reduced camera system's off-diagonal blocks come
@@ -493,7 +569,7 @@ fn build_reduced_system_pattern(
     frame_fixed: &[bool],
     free_frame_slot: &[Option<u32>],
     (n_frames, has_camera): (u32, bool),
-) -> (Vec<Vec<u32>>, Vec<(u32, u32)>, Vec<Vec<u32>>) {
+) -> (Vec<Vec<u32>>, Vec<(u32, u32)>, PairIndex) {
     // Per-point work runs on rayon; the outputs (sorted unique edge list,
     // per-point free frames and pair -> edge indices) are pure functions of
     // the input, so they match the serial construction exactly.
@@ -510,13 +586,6 @@ fn build_reduced_system_pattern(
             frames
         })
         .collect();
-    let slots_of = |frames: &[u32]| -> Vec<u32> {
-        frames
-            .iter()
-            .map(|&f| free_frame_slot[f as usize].expect("free"))
-            .collect()
-    };
-
     let n_slots = free_frame_slot
         .iter()
         .flatten()
@@ -589,40 +658,15 @@ fn build_reduced_system_pattern(
         (row_off, edges, None)
     };
 
-    let point_pair_edge_idx: Vec<Vec<u32>> = point_free_frames
-        .par_iter()
-        .map(|frames| {
-            if frames.len() < 2 {
-                return Vec::new();
-            }
-            // Slots ascend with frames, so the pairs `(i, j > i)` walk
-            // edge row `slots[i]` forwards.
-            let slots = slots_of(frames);
-            let n = slots.len();
-            let mut idxs = vec![0u32; n * (n - 1) / 2];
-            for i in 0..n {
-                let a = slots[i] as usize;
-                if let Some(rank) = &rank {
-                    for j in i + 1..n {
-                        let e = row_off[a] + rank.position(a, slots[j]);
-                        debug_assert_eq!(edges[e], (slots[i], slots[j]), "pair is an edge");
-                        idxs[pair_slot(n, i, j)] = e as u32;
-                    }
-                    continue;
-                }
-                let row = &edges[row_off[a]..row_off[a + 1]];
-                let mut pos = 0usize;
-                for j in i + 1..n {
-                    pos += row[pos..].partition_point(|&(_, b)| b < slots[j]);
-                    debug_assert_eq!(row[pos], (slots[i], slots[j]), "pair is an edge");
-                    idxs[pair_slot(n, i, j)] = (row_off[a] + pos) as u32;
-                }
-            }
-            idxs
-        })
-        .collect();
-
-    (point_free_frames, edges, point_pair_edge_idx)
+    (
+        point_free_frames,
+        edges,
+        PairIndex {
+            row_off,
+            rank,
+            idx: std::sync::OnceLock::new(),
+        },
+    )
 }
 
 /// Frame slots up to which [`EdgeRank`] indexes the edge rows: its bitmaps
@@ -1434,13 +1478,27 @@ fn assemble_problem(
     let points: Vec<Point3<f64>> = input.points.clone();
 
     let setup_ms = t_start.elapsed().as_secs_f64() * 1e3;
-    let (point_free_frames, edges, point_pair_edge_idx) = build_reduced_system_pattern(
+    let (point_free_frames, edges, pairs) = build_reduced_system_pattern(
         &point_obs_range,
         &obs,
         &frame_fixed,
         &free_frame_slot,
         (n_frames as u32, extras.camera.is_some()),
     );
+    // The CPU elimination's pair index, unless an accelerator will
+    // eliminate (then it is built only if a CPU path asks for it).
+    let lazy_pairs = n_free_frames >= iterative_min_free_frames()
+        && crate::ba_accel::reduced_solve_accelerator().is_some();
+    if !lazy_pairs {
+        let idx = pair_edge_index(
+            &point_free_frames,
+            &free_frame_slot,
+            &edges,
+            &pairs.row_off,
+            pairs.rank.as_ref(),
+        );
+        pairs.idx.set(idx).expect("fresh index");
+    }
     let pattern_ms = t_start.elapsed().as_secs_f64() * 1e3 - setup_ms;
     let n_shards = elimination_shard_count(edges.len());
     let shard_boundaries = balanced_shard_boundaries(&point_free_frames, n_shards);
@@ -1489,7 +1547,7 @@ fn assemble_problem(
         point_free_frames,
         hcp_off,
         edges,
-        point_pair_edge_idx,
+        pairs,
         shard_boundaries,
         contributions,
         n_frames,
@@ -2034,9 +2092,10 @@ fn linearize(
             *total += b;
         }
         if let Some(offdiag) = offdiag_raw.as_mut() {
+            let pair_edge_idx = problem.point_pair_edge_idx();
             for (p, direct) in direct_terms {
                 for (key, term) in direct {
-                    offdiag[problem.point_pair_edge_idx[p][key as usize] as usize] += term;
+                    offdiag[pair_edge_idx[p][key as usize] as usize] += term;
                 }
             }
         }
@@ -2174,7 +2233,7 @@ fn eliminate_and_accumulate(
                     local_diag[slot] -= hcp_scaled[k] * hcp[k].transpose();
                     local_bc[slot] -= hcp_scaled[k] * pl.bp;
                 }
-                let pair_edge_idx = &problem.point_pair_edge_idx[p];
+                let pair_edge_idx = &problem.point_pair_edge_idx()[p];
                 let mut local_pair = 0usize;
                 for i in 0..n {
                     for j in i + 1..n {
@@ -2246,7 +2305,7 @@ fn eliminate_by_output(
     mu: f64,
 ) -> (Vec<Matrix6<f64>>, Vec<Matrix6<f64>>, Vec<Vector6<f64>>) {
     let n_free = problem.n_free_frames;
-    let point_pair_edge_idx = &problem.point_pair_edge_idx;
+    let point_pair_edge_idx = problem.point_pair_edge_idx();
     let hpp_inv = point_inverses(problem, lin, mu);
     // Row `s` (edges `(s, _)`), the diagonal block and the right-hand side
     // of free frame `s` all come from the points observing `s`, in
@@ -3091,7 +3150,12 @@ fn optimize_rig_obs(
 /// f32 copy on the PCG path.
 fn log_memory(problem: &Problem, rig_obs_bytes: usize, lin: &Linearization) {
     const MB: f64 = 1024.0 * 1024.0;
-    let pair_idx: usize = problem.point_pair_edge_idx.iter().map(Vec::len).sum();
+    // Zero while the index has not been built (an accelerator eliminates).
+    let pair_idx: usize = problem
+        .pairs
+        .idx
+        .get()
+        .map_or(0, |idx| idx.iter().map(Vec::len).sum());
     let free_frames: usize = problem.point_free_frames.iter().map(Vec::len).sum();
     let lin_hcp = lin.hcp.len();
     let contributions = problem

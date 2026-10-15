@@ -73,6 +73,7 @@ use super::bundle_adjustment::{
 };
 pub use super::incremental_triangulator::Options as TriangulatorOptions;
 use super::incremental_triangulator::{estimate_triangulation_of_views, IncrementalTriangulator};
+pub use super::mapper_impl::CandidateRound;
 use super::mapper_impl::{self, InitGateOptions};
 use super::observation_manager::{
     camera_has_bogus_params, image_cam_from_world, ObservationManager,
@@ -279,7 +280,6 @@ impl IncrementalMapper {
     /// Port of `BeginReconstruction` (`.cc:109-133`).
     pub fn begin_reconstruction(&mut self, recon: &Reconstruction, graph: &CorrespondenceGraph) {
         self.obs = ObservationManager::new(recon, graph);
-        self.obs.size_pyramids(recon);
         self.triangulator = IncrementalTriangulator::new();
 
         self.num_shared_reg_images = 0;
@@ -1490,13 +1490,14 @@ impl IncrementalMapper {
     }
 
     /// Port of `FindNextImages` (`.cc:182-192`, delegating to
-    /// `mapper_impl.rs`). `structure_less` ranks by 2D-2D correspondences
-    /// to registered images and counts structure-less trials separately.
+    /// `mapper_impl.rs`). The structure-less rounds rank by 2D-2D
+    /// correspondences to registered images and count structure-less
+    /// trials separately.
     pub fn find_next_images(
         &self,
         options: &Options,
         recon: &Reconstruction,
-        structure_less: bool,
+        round: CandidateRound,
     ) -> Vec<ImageT> {
         let ranked = mapper_impl::find_next_images(
             options.abs_pose_min_num_inliers,
@@ -1504,12 +1505,12 @@ impl IncrementalMapper {
             recon,
             &self.obs,
             &self.filtered_frames,
-            if structure_less {
-                &self.num_structure_less_reg_trials
-            } else {
+            if round == CandidateRound::Structure {
                 &self.num_reg_trials
+            } else {
+                &self.num_structure_less_reg_trials
             },
-            structure_less,
+            round,
         );
 
         // Env-gated boundary diagnostic for the 10k model-splitting
@@ -1558,77 +1559,18 @@ impl IncrementalMapper {
 
 #[cfg(test)]
 mod tests {
-    use super::{IncrementalMapper, Options};
-    use std::collections::BTreeMap;
+    use super::{CandidateRound, IncrementalMapper, Options};
 
-    use nalgebra::{Point3, UnitQuaternion, Vector3};
-    use visloc_core::geometry::SE3;
-    use visloc_vision::two_view::{ConfigurationType, CorrespondenceGraph};
-
-    use crate::colmap_incremental::database_cache::DatabaseCache;
     use crate::colmap_incremental::pipeline::reconstruction_from_cache;
-    use crate::colmap_incremental::reconstruction::{Camera, Image, Point2D};
-    use crate::colmap_incremental::types::{DataT, Frame, ImageT, Rig, SensorT};
+    use crate::colmap_incremental::test_support::build_three_view_scene;
+    use crate::colmap_incremental::types::ImageT;
 
     /// Structure-less registration places an image that sees no 3D point
     /// (two registered images, no structure) at its true pose from its
     /// 2D-2D matches alone, with metric scale, and triangulates its matches.
     #[test]
     fn structure_less_registration_recovers_the_pose_without_structure() {
-        let mut rig = Rig::new();
-        rig.set_rig_id(0);
-        rig.add_ref_sensor(SensorT::camera(1));
-        let camera = Camera::pinhole(1, 640, 480, 500.0, 500.0, 320.0, 240.0);
-        let points: Vec<Point3<f64>> = (0..60)
-            .map(|i| {
-                let i = i as f64;
-                Point3::new(
-                    (i * 0.37).sin() * 1.2,
-                    (i * 0.71).cos() * 0.8,
-                    4.0 + (i * 0.53).sin(),
-                )
-            })
-            .collect();
-        let poses = [
-            SE3::new(UnitQuaternion::identity(), Vector3::zeros()),
-            SE3::new(
-                UnitQuaternion::from_euler_angles(0.0, 0.05, 0.0),
-                Vector3::new(-0.6, 0.0, 0.1),
-            ),
-            SE3::new(
-                UnitQuaternion::from_euler_angles(0.02, -0.06, 0.01),
-                Vector3::new(0.5, 0.15, -0.05),
-            ),
-        ];
-        let mut frames = BTreeMap::new();
-        let mut images = BTreeMap::new();
-        for (k, pose) in poses.iter().enumerate() {
-            let id = k as ImageT;
-            let mut frame = Frame::new(id, 0);
-            frame.add_data_id(DataT::camera(1, id));
-            frames.insert(id, frame);
-            let mut image = Image::new(id, 1, id, format!("{k}.png"));
-            image.points2d = points
-                .iter()
-                .map(|p| Point2D::new(camera.project(&pose.transform_point(p)).unwrap()))
-                .collect();
-            images.insert(id, image);
-        }
-        let mut graph = CorrespondenceGraph::new();
-        for id in 0..3 {
-            graph.add_image(id, points.len());
-        }
-        let matches: Vec<(usize, usize)> = (0..points.len()).map(|j| (j, j)).collect();
-        for (a, b) in [(0, 1), (0, 2), (1, 2)] {
-            graph
-                .add_two_view_geometry(a, b, &matches, ConfigurationType::Calibrated)
-                .unwrap();
-        }
-        graph.finalize();
-        let mut cameras = BTreeMap::new();
-        cameras.insert(1, camera);
-        let db =
-            DatabaseCache::from_parts(BTreeMap::from([(0, rig)]), cameras, frames, images, graph);
+        let (db, poses, num_points) = build_three_view_scene();
         let mut recon = reconstruction_from_cache(&db);
         for (k, pose) in poses.iter().take(2).enumerate() {
             recon.frame_mut(k as u64).set_rig_from_world(pose.clone());
@@ -1642,9 +1584,23 @@ mod tests {
             ..Options::default()
         };
         assert_eq!(
-            mapper.find_next_images(&options, &recon, false),
+            mapper.find_next_images(&options, &recon, CandidateRound::Structure),
             Vec::<ImageT>::new(),
             "no 3D point is visible, so structure-based registration has no candidate"
+        );
+        assert_eq!(
+            mapper.find_next_images(&options, &recon, CandidateRound::StructureLess),
+            Vec::<ImageT>::new(),
+            "COLMAP's structure-less round also asks for visible 3D points"
+        );
+        assert_eq!(
+            mapper.find_next_images(
+                &options,
+                &recon,
+                CandidateRound::StructureLessByCorrespondences
+            ),
+            vec![2],
+            "120 correspondences to registered images make image 2 a candidate"
         );
         assert!(mapper.register_next_structure_less_image(
             &options,
@@ -1660,7 +1616,7 @@ mod tests {
             "rotation off by {rotation_error} rad"
         );
         assert!(centre_error < 1e-6, "centre off by {centre_error}");
-        assert_eq!(recon.num_points3d(), points.len());
+        assert_eq!(recon.num_points3d(), num_points);
     }
 
     #[test]

@@ -360,13 +360,15 @@ impl ObservationManager {
         }
 
         for (&image_id, image) in recon.images() {
-            mgr.image_stats
-                .insert(image_id, Self::init_image_stat(image_id, image, graph));
+            let camera = recon.camera(image.camera_id);
+            mgr.image_stats.insert(
+                image_id,
+                Self::init_image_stat(image_id, image, camera, graph),
+            );
         }
 
-        // Continuing from an existing (partially registered) reconstruction:
-        // not exercised by this port's callers (always starts empty), ported
-        // for completeness.
+        // Continuing from an existing (partially registered) reconstruction,
+        // as `pipeline::complete_model` does with a finished model.
         let reg_frame_ids: Vec<FrameT> = recon.reg_frame_ids().to_vec();
         for frame_id in reg_frame_ids {
             let frame = recon.frame(frame_id);
@@ -396,38 +398,25 @@ impl ObservationManager {
         mgr
     }
 
+    /// Port of `InitImageStat` (`.cc:163-179`), the visibility pyramid sized
+    /// from the image's camera.
     fn init_image_stat(
         image_id: ImageT,
         image: &super::reconstruction::Image,
+        camera: &super::reconstruction::Camera,
         graph: &CorrespondenceGraph,
     ) -> ImageStat {
-        let camera_dims = (image.num_points2d(), image.num_points2d());
-        let _ = camera_dims;
         ImageStat {
             num_observations: graph.num_observations_for_image(image_id as usize),
             num_correspondences: graph.num_correspondences_for_image(image_id as usize),
             num_visible_correspondences: 0,
             num_visible_points3d: 0,
             num_correspondences_have_point3d: vec![0; image.num_points2d()],
-            // Width/height are filled in by the caller (needs the Camera);
-            // see `image_stat_with_camera`.
-            point3d_visibility_pyramid: VisibilityPyramid::empty(),
-        }
-    }
-
-    /// Split out of the constructor because `init_image_stat` above doesn't
-    /// have the `Camera` (only `Reconstruction` does); called right after
-    /// `new` populates `image_stats` to size the pyramid from the image's
-    /// camera (`InitImageStat`, `.cc:163-179`).
-    pub fn size_pyramids(&mut self, recon: &Reconstruction) {
-        for (&image_id, stat) in self.image_stats.iter_mut() {
-            let image = recon.image(image_id);
-            let camera = recon.camera(image.camera_id);
-            stat.point3d_visibility_pyramid = VisibilityPyramid::new(
+            point3d_visibility_pyramid: VisibilityPyramid::new(
                 NUM_POINT3D_VISIBILITY_PYRAMID_LEVELS,
                 camera.width as usize,
                 camera.height as usize,
-            );
+            ),
         }
     }
 

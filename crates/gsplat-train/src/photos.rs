@@ -82,8 +82,13 @@ pub struct PhotoSfmConfig {
     pub gpu_ba: bool,
     /// Extract the VLFeat-compatible SIFT on the GPU
     /// (`visloc_sift_gpu::VlfeatSiftGpu`), an f32 port of the CPU extractor:
-    /// about 99.9% of its keypoints, descriptor bytes within one.
+    /// 99.97% of its keypoints, descriptor bytes 0.0007 apart on average.
     pub gpu_sift: bool,
+    /// Once the mapper has built every model, extend the largest one with
+    /// the images it left out, from 2D-2D correspondences where they see
+    /// too few 3D points (the mapper's `complete_largest_model`). It can
+    /// only add images to that model, then refines it.
+    pub complete_model: bool,
 }
 
 impl Default for PhotoSfmConfig {
@@ -109,6 +114,7 @@ impl Default for PhotoSfmConfig {
             mask_black: None,
             gpu_ba: false,
             gpu_sift: false,
+            complete_model: false,
         }
     }
 }
@@ -829,7 +835,7 @@ pub fn build_photo_dataset(
     // principal point of the centred prior is ~4 px off, which fixed
     // intrinsics turned into 2-5x larger camera-centre errors.
     let t0 = std::time::Instant::now();
-    let port_overrides: Vec<String> = if cfg.refine_intrinsics {
+    let mut port_overrides: Vec<String> = if cfg.refine_intrinsics {
         vec![
             "ba_refine_focal_length=1".into(),
             "ba_refine_principal_point=1".into(),
@@ -837,6 +843,9 @@ pub fn build_photo_dataset(
     } else {
         Vec::new()
     };
+    if cfg.complete_model {
+        port_overrides.push("complete_largest_model=1".into());
+    }
     let models = run_colmap_port(
         out_dir,
         &camera,

@@ -20,6 +20,9 @@ The scoring follows the GLOMAP paper.
 - **Where it trails:** the global mapper registers more images (454 vs 445)
   and leads at 1° on COLMAP's matches. Single scenes swing more than these
   margins (see Caveats).
+- **With `--complete-model`:** visloc-rs registers 452 of 454 and leads
+  both COLMAP mappers at every threshold in a later run, on COLMAP's
+  matches and on its own (below).
 - **On a large capture** (SmallCity, 5,822 photos, below): visloc-rs mapped
   it in 22 minutes. COLMAP's global mapper had not finished after 94 minutes.
 
@@ -140,10 +143,78 @@ The fallback registers the images that 2D–3D correspondences cannot:
 
 No other scene changes.
 
+## Completing the largest model
+
+The images visloc-rs still leaves out see fewer than
+`abs_pose_min_num_inliers` (30) 3D points: electro's four see 1 to 7 once
+its model is done, meadow's one 20, kicker's one 2. The structure-less
+fallback never tries them. COLMAP's candidate filter asks the fallback's candidates for those 30
+points too, although the fallback registers from 2D–2D correspondences.
+
+`gsplat_photos --complete-model` (the mapper's `complete_largest_model=1`)
+runs once every model is built and extends the largest one:
+
+- **Candidates:** the images with at least 60 2D–2D correspondences to
+  registered images, the count the structure-less registration itself
+  needs. Structure-based candidates go first, as in the incremental loop.
+- **Each registration** is followed by triangulation and the local
+  refinement. It is undone if the image then sees fewer than 30 3D points.
+  On electro this caught the one image the pass placed 3.3 m off: it kept
+  21 points, while the images placed within centimetres kept 49 or more.
+- **No other effect:** the pass cannot change which models the mapper
+  builds, and a model it does not extend stays as it was, bit for bit.
+
+The same scenes, a later run on the same kind of machine (4 threads,
+pycolmap 4.2.1). COLMAP's features and matches were recomputed, and they
+change from run to run:
+
+| Input | Mapper | Mean AUC@1° / 3° / 5° | Registered | Mapper time |
+|---|---|---|---|---|
+| COLMAP's matches | visloc-rs | 51.97 / 76.75 / 83.21 | 445 / 454 | 25.4 s |
+| | visloc-rs, `--complete-model` | **53.69** / **79.94** / **86.90** | **452 / 454** | 25.5 s |
+| | COLMAP incremental | 51.34 / 76.25 / 82.88 | 445 / 454 | 173.5 s |
+| | COLMAP global (GLOMAP) | 48.65 / 70.41 / 76.36 | 440 / 454 | 173.2 s |
+| visloc-rs's matches | visloc-rs | 53.09 / 78.85 / 85.69 | 448 / 454 | 29.1 s |
+| | visloc-rs, `--complete-model` | **53.25** / **79.66** / **86.90** | **452 / 454** | 31.6 s |
+
+- **COLMAP's global mapper failed on pipes in this run** (no model; it
+  registered all 14 in the first). Without pipes, the means over the other
+  12 scenes are:
+  - visloc-rs with `--complete-model`: **53.66 / 79.68 / 86.69**, 438 / 440;
+  - visloc-rs: 53.47 / 78.89 / 85.58, 434 / 440;
+  - COLMAP incremental: 52.71 / 78.32 / 85.20, 434 / 440;
+  - COLMAP global: 52.70 / 76.27 / 82.73, **440 / 440**.
+- **Scenes that change.** Every other scene stays as it was, bit for bit.
+  - COLMAP's matches:
+    - pipes, 11 → 14 of 14: AUC@1° 34.0 → 54.0.
+    - meadow, 14 → 15: AUC@1° 45.7 → 48.8.
+    - electro, 41 → 44: AUC@1° 43.8 → 43.0, AUC@5° 70.9 → 74.2.
+  - visloc-rs's matches:
+    - electro, 41 → 44 of 45: AUC@1° 43.5 → 44.2, AUC@5° 70.8 → 77.5.
+    - meadow, 14 → 15: AUC@1° 39.0 → 40.5, AUC@5° 72.8 → 81.8.
+- **Accuracy of the added images.** Camera centres against ground truth,
+  after a Sim(3) fit on the images both models share:
+  - pipes: 0.7 to 1.6 cm (the scene's median 0.3 cm).
+  - meadow: 10 cm on COLMAP's matches and 38 cm on visloc-rs's (medians
+    4.5 and 5.2 cm).
+  - electro: 5 to 6 cm on visloc-rs's matches (median 2.8 cm). On
+    COLMAP's matches 16 to 87 cm: those images see a corner of the scene
+    the rest of the model sees weakly. COLMAP's global model of electro has
+    a centre RMSE of 2.3 m.
+  - The images both models share keep their accuracy: electro's 41 have a
+    median of 2.72 cm against 2.80 cm before.
+- **Still missing:**
+  - kicker's DSC_6487: its matches all go to one registered image, so 2D–2D
+    correspondences cannot fix its scale.
+  - electro's undone image.
+- The rows are in `benchmarks/eth3d_auc_complete/`.
+
 ## Where visloc-rs trails
 
 - **Registrations:** the global mapper registers every image. On electro,
   meadow and pipes, with COLMAP's matches, it also scores highest.
+  `--complete-model` brings visloc-rs to 452 of 454 and ahead on pipes and
+  meadow ([above](#completing-the-largest-model)).
 - **office (COLMAP's matches):** both COLMAP mappers score higher there.
 - **kicker (visloc-rs's matches):** COLMAP's incremental mapper is ahead
   there.

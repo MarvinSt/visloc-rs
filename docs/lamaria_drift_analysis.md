@@ -267,6 +267,18 @@ Locally the mapper is still better. Aligning each 60 s segment separately
 sequence_4_10. So the loss is in the long-range shape, which the refined VIO
 now gets better than the mapper.
 
+Weighting the VIO relative-pose factors ten times higher
+(`--relative-pose-weight 10`) changes almost nothing: the mapper scores
+31.79 instead of 31.62 on sequence_4_10 and 68.32 instead of 68.54 on
+sequence_1_19. On sequence_4_10 it still moves the VIO by up to 3.5 m. In
+units of weight 1, the relative-pose residuals shrink only from 3.0e5 to
+2.3e5, while the roll-pitch residuals grow from 3.9e4 to 3.0e5 and the
+reprojection residuals from 1.0e5 to 3.0e5. The relative-pose factors
+therefore disagree with both the roll and pitch the VIO measures at each
+keyframe and the mapper's landmarks. The roll-pitch measurements come from
+the VIO's own keyframe poses, so it is the relative-pose factors, not the
+reprojection terms, that pull the mapper away from the VIO.
+
 ### Calibration without ground truth (not usable yet)
 
 - **Camera-only rotations** (KLT + essential matrix on cam0, 150 ms pairs)
@@ -317,11 +329,9 @@ so it stays off.
 ## Open items
 
 1. **Mapper on the refined VIO.** The mapper now loses to the VIO on three
-   of five tracks ([With the online mapper](#with-the-online-mapper)). Its
-   relative-pose factors carry the VIO marginalization information at
-   `--relative-pose-weight 1`; a higher weight would keep the VIO's
-   long-range shape and leave the loop closures to remove what drift
-   remains.
+   of five tracks ([With the online mapper](#with-the-online-mapper)), and
+   a higher relative-pose weight does not help. What is left to separate is
+   whether the loops or the relative-pose factors themselves bend the VIO.
 2. **Calibration without the device table.** The refinement relies on
    both devices having training pseudo-GT. Estimating the gyro delay and the
    IMU-camera rotation online in the VIO would remove that dependency and

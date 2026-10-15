@@ -291,11 +291,11 @@ matches (6.6 min):
 - **visloc-rs's accuracy differs from the CPU run's** (0.15 m there). The
   two runs register the same images in the same order up to the 1,187th
   image; the 1,188th gets one inlier more (2,475 against 2,474) and from
-  there the reconstructions part. The mapper gives byte-identical models
-  at any thread count, so the likely cause is the platform's floating
-  point (Ubuntu 24.04 here, 22.04 before). On this capture the incremental
-  mapper's result spreads like that across mapper seeds too (0.15 m to
-  0.65 m).
+  there the reconstructions part. The cause is the platform's floating
+  point (Ubuntu 24.04 here, 22.04 before): a later run of the same code on
+  Ubuntu 22.04 (an RTX 3090 machine) wrote camera poses byte-identical to
+  the CPU run's. On this capture the incremental mapper's result spreads
+  like that across mapper seeds too (0.15 m to 0.65 m).
 - **The GPU bundle adjustment** is not faster on this GPU, and its run parts
   from the CPU run after its first solve
   ([GPU bundle adjustment](gpu_bundle_adjustment.md)).

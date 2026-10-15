@@ -44,6 +44,7 @@ struct Pipes {
     halve: wgpu::ComputePipeline,
     dog: wgpu::ComputePipeline,
     extrema: wgpu::ComputePipeline,
+    orient_args: wgpu::ComputePipeline,
     orient: wgpu::ComputePipeline,
     gradient: wgpu::ComputePipeline,
     describe: wgpu::ComputePipeline,
@@ -51,7 +52,7 @@ struct Pipes {
 
 impl Pipes {
     /// In `Op::pipe` order.
-    fn list(&self) -> [&wgpu::ComputePipeline; 8] {
+    fn list(&self) -> [&wgpu::ComputePipeline; 9] {
         [
             &self.upsample,
             &self.blur_h,
@@ -61,6 +62,7 @@ impl Pipes {
             &self.extrema,
             &self.orient,
             &self.gradient,
+            &self.orient_args,
         ]
     }
 }
@@ -111,10 +113,20 @@ struct Plan {
     /// `grad[o][l - 1]`: gradients of descriptor level `l` (1..=intervals)
     /// of octave `o`, the levels a keypoint can select.
     grad: Vec<Vec<wgpu::Buffer>>,
+    /// `vl_orient`'s indirect dispatch sizes, three words per octave.
+    args: wgpu::Buffer,
     // Kept alive for the bind groups.
     _levels: Vec<wgpu::Buffer>,
     _params: wgpu::Buffer,
-    passes: Vec<(usize, wgpu::BindGroup, (u32, u32, u32))>,
+    passes: Vec<(usize, wgpu::BindGroup, Dispatch)>,
+}
+
+/// How an op is dispatched: a fixed grid, or the grid an earlier op wrote
+/// at this byte offset of `Plan::args`.
+#[derive(Clone, Copy)]
+enum Dispatch {
+    Grid(u32, u32, u32),
+    Indirect(u64),
 }
 
 /// Grown on demand: the keypoints `vl_describe` reads, the bytes it writes
@@ -196,12 +208,13 @@ impl DescKp {
 }
 
 /// One recorded dispatch: pipe 0 upsample, 1 blur_h, 2 blur_v, 3 halve,
-/// 4 DoG, 5 extrema, 6 orientations, 7 gradients; `(binding, buffer)`s.
+/// 4 DoG, 5 extrema, 6 orientations, 7 gradients, 8 orientation grid;
+/// `(binding, buffer)`s.
 struct Op<'a> {
     pipe: usize,
     slot: u64,
     bufs: Vec<(u32, &'a wgpu::Buffer)>,
-    groups: (u32, u32, u32),
+    groups: Dispatch,
 }
 
 /// Uniform slots, one per op.
@@ -220,8 +233,8 @@ impl Slots {
     }
 }
 
-fn groups2d(w: usize, h: usize) -> (u32, u32, u32) {
-    ((w as u32).div_ceil(16), (h as u32).div_ceil(16), 1)
+fn groups2d(w: usize, h: usize) -> Dispatch {
+    Dispatch::Grid((w as u32).div_ceil(16), (h as u32).div_ceil(16), 1)
 }
 
 /// A separable blur of `src` into `dst` through `tmp`, with the kernel at
@@ -364,6 +377,7 @@ impl VlfeatSiftGpu {
             halve: mk(&image, "halve"),
             dog: mk(&detect, "vl_dog"),
             extrema: mk(&detect, "vl_extrema"),
+            orient_args: mk(&detect, "vl_orient_args"),
             orient: mk(&detect, "vl_orient"),
             gradient: mk(&describe, "vl_gradient"),
             describe: mk(&describe, "vl_describe"),
@@ -395,9 +409,10 @@ impl VlfeatSiftGpu {
     }
 
     /// Whether `config` selects the VLFeat-compatible path this extractor
-    /// implements (without domain-size pooling).
+    /// implements (three scales per octave, without domain-size pooling).
     pub fn supports(config: &SiftConfig) -> bool {
         config.detector == SiftDetector::Dog
+            && config.intervals == 3
             && config.vlfeat_compatible_detector
             && config.vlfeat_compatible_descriptor
             && !config.domain_size_pooling
@@ -559,6 +574,12 @@ impl VlfeatSiftGpu {
             .map(|_| storage(dev, "vl-cand", (cap * CAND_WORDS * 4) as u64, none))
             .collect();
         let counters = storage(dev, "vl-counters", f32s(n_det.max(4)), none);
+        let args = storage(
+            dev,
+            "vl-args",
+            f32s(3 * n_det),
+            wgpu::BufferUsages::INDIRECT,
+        );
 
         let mut slots = Slots::default();
         let mut ops: Vec<Op> = Vec::new();
@@ -646,16 +667,27 @@ impl VlfeatSiftGpu {
                     groups: groups2d(w, h),
                 });
             }
-            // The candidates of DoG level di read Gaussian level di.
-            for (di, level) in gauss.iter().enumerate().take(s + 1).skip(1) {
-                let slot = slots.push(&vl(di));
-                ops.push(Op {
-                    pipe: 6,
-                    slot,
-                    bufs: vec![(7, &cand[o]), (8, &counters), (9, level)],
-                    groups: dispatch_linear(cap, 64),
-                });
-            }
+            // One workgroup per candidate; the candidates of DoG level d
+            // read Gaussian level d.
+            let slot = slots.push(&vl(0));
+            ops.push(Op {
+                pipe: 8,
+                slot,
+                bufs: vec![(8, &counters), (12, &args)],
+                groups: Dispatch::Grid(1, 1, 1),
+            });
+            ops.push(Op {
+                pipe: 6,
+                slot,
+                bufs: vec![
+                    (7, &cand[o]),
+                    (8, &counters),
+                    (9, &gauss[1]),
+                    (10, &gauss[2]),
+                    (11, &gauss[3]),
+                ],
+                groups: Dispatch::Indirect((o * 12) as u64),
+            });
         }
         // Descriptor pyramid at the input resolution, and the gradients of
         // the levels a keypoint can select.
@@ -757,6 +789,7 @@ impl VlfeatSiftGpu {
             img,
             cand,
             counters,
+            args,
             grad,
             _levels: levels_kept,
             _params: params,
@@ -787,7 +820,12 @@ impl VlfeatSiftGpu {
             for (pipe, bind, groups) in &plan.passes {
                 pass.set_pipeline(pipes[*pipe]);
                 pass.set_bind_group(0, bind, &[]);
-                pass.dispatch_workgroups(groups.0, groups.1, groups.2);
+                match *groups {
+                    Dispatch::Grid(x, y, z) => pass.dispatch_workgroups(x, y, z),
+                    Dispatch::Indirect(offset) => {
+                        pass.dispatch_workgroups_indirect(&plan.args, offset)
+                    }
+                }
             }
         }
         queue.submit(Some(encoder.finish()));
@@ -940,7 +978,8 @@ impl VlfeatSiftGpu {
                     continue;
                 }
                 pass.set_bind_group(0, &desc.binds[g], &[]);
-                let groups = dispatch_linear(num as usize, 64);
+                // One workgroup per keypoint.
+                let groups = dispatch_linear(num as usize, 1);
                 pass.dispatch_workgroups(groups.0, groups.1, groups.2);
             }
         }

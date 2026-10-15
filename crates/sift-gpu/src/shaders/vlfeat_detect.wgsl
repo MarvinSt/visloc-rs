@@ -38,8 +38,13 @@ struct VlParams {
 // Candidates of this octave and the per-octave counters.
 @group(0) @binding(7) var<storage, read_write> cand: array<u32>;
 @group(0) @binding(8) var<storage, read_write> counters: array<atomic<u32>>;
-// vl_orient: the Gaussian level of the candidates it serves.
-@group(0) @binding(9) var<storage, read> gauss: array<f32>;
+// vl_orient: Gaussian levels 1..=3 of the octave (a candidate's DoG level
+// d reads Gaussian level d; intervals = 3).
+@group(0) @binding(9) var<storage, read> gauss1: array<f32>;
+@group(0) @binding(10) var<storage, read> gauss2: array<f32>;
+@group(0) @binding(11) var<storage, read> gauss3: array<f32>;
+// vl_orient_args: indirect dispatch sizes, three words per octave.
+@group(0) @binding(12) var<storage, read_write> args: array<u32>;
 
 const TAU: f32 = 6.2831855;
 // Words per candidate: ox, oy, dog level, orientations, x, y, scale, value,
@@ -255,29 +260,36 @@ fn vl_extrema(@builtin(global_invocation_id) gid: vec3<u32>) {
     cand[o + 8u] = bitcast<u32>(edge);
 }
 
-fn gauss_at(x: i32, y: i32) -> f32 {
-    return gauss[idx(x, y)];
+fn gauss_at(level: u32, x: i32, y: i32) -> f32 {
+    let i = idx(x, y);
+    if (level == 1u) {
+        return gauss1[i];
+    }
+    if (level == 2u) {
+        return gauss2[i];
+    }
+    return gauss3[i];
 }
 
 // `vlfeat_gradient_at`: central differences, one-sided on the border.
-fn grad_at(x: i32, y: i32) -> vec2<f32> {
+fn grad_at(level: u32, x: i32, y: i32) -> vec2<f32> {
     let w = i32(P.w);
     let h = i32(P.h);
     var gx: f32;
     if (x == 0) {
-        gx = gauss_at(1, y) - gauss_at(0, y);
+        gx = gauss_at(level, 1, y) - gauss_at(level, 0, y);
     } else if (x == w - 1) {
-        gx = gauss_at(x, y) - gauss_at(x - 1, y);
+        gx = gauss_at(level, x, y) - gauss_at(level, x - 1, y);
     } else {
-        gx = 0.5 * (gauss_at(x + 1, y) - gauss_at(x - 1, y));
+        gx = 0.5 * (gauss_at(level, x + 1, y) - gauss_at(level, x - 1, y));
     }
     var gy: f32;
     if (y == 0) {
-        gy = gauss_at(x, 1) - gauss_at(x, 0);
+        gy = gauss_at(level, x, 1) - gauss_at(level, x, 0);
     } else if (y == h - 1) {
-        gy = gauss_at(x, y) - gauss_at(x, y - 1);
+        gy = gauss_at(level, x, y) - gauss_at(level, x, y - 1);
     } else {
-        gy = 0.5 * (gauss_at(x, y + 1) - gauss_at(x, y - 1));
+        gy = 0.5 * (gauss_at(level, x, y + 1) - gauss_at(level, x, y - 1));
     }
     return vec2<f32>(gx, gy);
 }
@@ -290,21 +302,45 @@ fn rem_tau(a: f32) -> f32 {
     return r;
 }
 
-// One thread per candidate of this octave whose DoG level is `P.level`
-// (the Gaussian level bound): VLFeat's orientation histogram
-// (`vlfeat_orientation_peaks`), six circular box smoothings and up to four
-// peaks.
-@compute @workgroup_size(64)
-fn vl_orient(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x + gid.y * 65535u * 64u;
+// One workgroup per candidate: `vl_orient`'s grid, from this octave's count.
+@compute @workgroup_size(1)
+fn vl_orient_args() {
     let n = min(atomicLoad(&counters[P.octave]), P.cap);
+    let x = min(n, 65535u);
+    args[3u * P.octave] = x;
+    args[3u * P.octave + 1u] = select(1u, (n + 65534u) / 65535u, n > 0u);
+    args[3u * P.octave + 2u] = 1u;
+}
+
+const OW: u32 = 64u;
+var<workgroup> wg_n: u32;
+var<workgroup> wg_total: u32;
+// One tile of samples: the lower bilinear bin (-1: no vote) and the votes
+// for it and the next bin.
+var<workgroup> o_bin: array<i32, 64>;
+var<workgroup> o_w0: array<f32, 64>;
+var<workgroup> o_w1: array<f32, 64>;
+var<workgroup> o_hist: array<f32, 36>;
+
+// One workgroup per candidate of this octave: VLFeat's orientation
+// histogram on the candidate's Gaussian level (`vlfeat_orientation_peaks`).
+// The window's samples are evaluated a tile at a time, one per thread;
+// thread b < 36 then adds the tile's votes for bin b in sample order, so
+// the sums are deterministic. Thread 0 smooths the histogram six times and
+// picks up to four peaks.
+@compute @workgroup_size(64)
+fn vl_orient(@builtin(local_invocation_index) t: u32,
+             @builtin(workgroup_id) wid: vec3<u32>) {
+    let i = wid.x + wid.y * 65535u;
+    if (t == 0u) {
+        wg_n = min(atomicLoad(&counters[P.octave]), P.cap);
+    }
+    let n = workgroupUniformLoad(&wg_n);
     if (i >= n) {
         return;
     }
     let o = i * CW;
-    if (cand[o + 2u] != P.level) {
-        return;
-    }
+    let level = cand[o + 2u];
     let x = bitcast<f32>(cand[o + 4u]);
     let y = bitcast<f32>(cand[o + 5u]);
     let sn = bitcast<f32>(cand[o + 6u]);
@@ -313,57 +349,86 @@ fn vl_orient(@builtin(global_invocation_id) gid: vec3<u32>) {
     let yi = i32(floor(y + 0.5));
     let sigmaw = 1.5 * max(sigma, 1e-6);
     let win = i32(max(floor(3.0 * sigmaw), 1.0));
-    var hist: array<f32, 36>;
-    for (var b = 0u; b < 36u; b = b + 1u) {
-        hist[b] = 0.0;
-    }
     let y0 = max(-win, -yi);
     let y1 = min(win, i32(P.h) - 1 - yi);
     let x0 = max(-win, -xi);
     let x1 = min(win, i32(P.w) - 1 - xi);
+    let nx = max(x1 - x0 + 1, 0);
+    let ny = max(y1 - y0 + 1, 0);
+    if (t == 0u) {
+        wg_total = u32(nx * ny);
+    }
+    let total = workgroupUniformLoad(&wg_total);
     let r2max = f32(win * win) + 0.6;
     let denom = 2.0 * sigmaw * sigmaw;
-    for (var ys = y0; ys <= y1; ys = ys + 1) {
-        for (var xs = x0; xs <= x1; xs = xs + 1) {
+    var acc = 0.0;
+    for (var base = 0u; base < total; base = base + OW) {
+        let si = base + t;
+        var bin = -1;
+        var w0 = 0.0;
+        var w1 = 0.0;
+        if (si < total) {
+            let xs = x0 + i32(si % u32(nx));
+            let ys = y0 + i32(si / u32(nx));
             let dx = f32(xi + xs) - x;
             let dy = f32(yi + ys) - y;
             let r2 = dx * dx + dy * dy;
-            if (r2 >= r2max) {
-                continue;
-            }
-            let g = grad_at(xi + xs, yi + ys);
-            let mag = sqrt(g.x * g.x + g.y * g.y);
-            if (!(mag > 0.0) || mag > 3.0e38) {
-                continue;
-            }
-            let wgt = exp(-r2 / denom);
-            let ang = rem_tau(atan2(g.y, g.x));
-            let fbin = rem_tau(ang) * 36.0 / TAU;
-            if (P.bilinear != 0u) {
-                let bin = i32(floor(fbin - 0.5));
-                let rbin = fbin - f32(bin) - 0.5;
-                let contrib = mag * wgt;
-                let b0 = u32((bin % 36 + 36) % 36);
-                let b1 = u32(((bin + 1) % 36 + 36) % 36);
-                hist[b0] = hist[b0] + (1.0 - rbin) * contrib;
-                hist[b1] = hist[b1] + rbin * contrib;
-            } else {
-                let b = u32(floor(fbin)) % 36u;
-                hist[b] = hist[b] + mag * wgt;
+            if (r2 < r2max) {
+                let g = grad_at(level, xi + xs, yi + ys);
+                let mag = sqrt(g.x * g.x + g.y * g.y);
+                if (mag > 0.0 && mag <= 3.0e38) {
+                    let contrib = mag * exp(-r2 / denom);
+                    let fbin = rem_tau(rem_tau(atan2(g.y, g.x))) * 36.0 / TAU;
+                    if (P.bilinear != 0u) {
+                        let b = i32(floor(fbin - 0.5));
+                        let rbin = fbin - f32(b) - 0.5;
+                        bin = (b % 36 + 36) % 36;
+                        w0 = (1.0 - rbin) * contrib;
+                        w1 = rbin * contrib;
+                    } else {
+                        bin = i32(u32(floor(fbin)) % 36u);
+                        w0 = contrib;
+                    }
+                }
             }
         }
+        o_bin[t] = bin;
+        o_w0[t] = w0;
+        o_w1[t] = w1;
+        workgroupBarrier();
+        if (t < 36u) {
+            let me = i32(t);
+            let prev = (me + 35) % 36;
+            for (var j = 0u; j < OW; j = j + 1u) {
+                let b = o_bin[j];
+                if (b == me) {
+                    acc = acc + o_w0[j];
+                } else if (b == prev) {
+                    acc = acc + o_w1[j];
+                }
+            }
+        }
+        workgroupBarrier();
     }
+    if (t < 36u) {
+        o_hist[t] = acc;
+    }
+    workgroupBarrier();
+    if (t != 0u) {
+        return;
+    }
+    var hist: array<f32, 36>;
     // `smooth_orientation_histogram`.
     for (var b = 0u; b < 36u; b = b + 1u) {
-        let v = hist[b];
+        let v = o_hist[b];
         hist[b] = select(0.0, v, v > 0.0 && v <= 3.0e38);
     }
     for (var smooth_i = 0u; smooth_i < 6u; smooth_i = smooth_i + 1u) {
         var next: array<f32, 36>;
         for (var b = 0u; b < 36u; b = b + 1u) {
             let prev = hist[(b + 35u) % 36u];
-            let nx = hist[(b + 1u) % 36u];
-            next[b] = (prev + hist[b] + nx) / 3.0;
+            let nx2 = hist[(b + 1u) % 36u];
+            next[b] = (prev + hist[b] + nx2) / 3.0;
         }
         hist = next;
     }
@@ -377,14 +442,14 @@ fn vl_orient(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var b = 0u; b < 36u; b = b + 1u) {
             let v = hist[b];
             let prev = hist[(b + 35u) % 36u];
-            let nx = hist[(b + 1u) % 36u];
-            if (!(v > 0.8 * max_hist && v > prev && v > nx)) {
+            let nx2 = hist[(b + 1u) % 36u];
+            if (!(v > 0.8 * max_hist && v > prev && v > nx2)) {
                 continue;
             }
-            let den = nx + prev - 2.0 * v;
+            let den = nx2 + prev - 2.0 * v;
             var delta = 0.0;
             if (abs(den) > 2.220446e-16 && abs(den) <= 3.0e38) {
-                delta = clamp(-0.5 * (nx - prev) / den, -0.5, 0.5);
+                delta = clamp(-0.5 * (nx2 - prev) / den, -0.5, 0.5);
             }
             let angle = rem_tau((f32(b) + delta + 0.5) * TAU / 36.0);
             cand[o + 9u + count] = bitcast<u32>(angle);

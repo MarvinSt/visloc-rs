@@ -90,6 +90,7 @@ struct DescKp {
 
 const TAU: f32 = 6.2831855;
 const EPS: f32 = 2.220446e-16;
+const WG: u32 = 256u;
 
 fn rem_tau(a: f32) -> f32 {
     var r = a % TAU;
@@ -105,127 +106,155 @@ fn round_half_up(v: f32) -> f32 {
     return select(f, f + 1.0, v - f >= 0.5);
 }
 
-// One thread per keypoint: the 4 x 4 x 8 histogram, its normalization, the
-// byte quantization and the UBC bin order, packed four bytes a word.
-@compute @workgroup_size(64)
-fn vl_describe(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let local = gid.x + gid.y * 65535u * 64u;
+// One tile of samples: magnitude times the Gaussian weight (0: no vote),
+// the position in cell units shifted so cell centres are 0..3, and the
+// orientation bin in [0, 8).
+var<workgroup> s_val: array<f32, 256>;
+var<workgroup> s_cx: array<f32, 256>;
+var<workgroup> s_cy: array<f32, 256>;
+var<workgroup> s_ob: array<f32, 256>;
+var<workgroup> red: array<f32, 2048>;
+var<workgroup> desc: array<f32, 128>;
+var<workgroup> bytes: array<u32, 128>;
+var<workgroup> norm: f32;
+
+// One workgroup per keypoint (`describe_raw_vlfeat`): the window's samples
+// are evaluated a tile at a time, one per thread, then gathered by 16 cells
+// x 16 lanes that keep their cell's eight orientation bins in registers.
+// The trilinear votes are tents around the cell and bin centres, as in
+// `accumulate_vlfeat_sample`. No atomics and a fixed summation order: the
+// output is deterministic. Then `normalize_vlfeat_descriptor` (bytes) and
+// COLMAP's UBC orientation order, packed four bytes a word.
+@compute @workgroup_size(256)
+fn vl_describe(@builtin(local_invocation_index) t: u32,
+               @builtin(workgroup_id) wid: vec3<u32>) {
+    let local = wid.x + wid.y * 65535u;
     if (local >= D.num) {
         return;
     }
     let i = D.first + local;
     let kp = kps[i];
-    var d: array<f32, 128>;
-    for (var j = 0u; j < 128u; j = j + 1u) {
-        d[j] = 0.0;
-    }
-    for (var dyi = kp.min_dy; dyi <= kp.max_dy; dyi = dyi + 1) {
-        for (var dxi = kp.min_dx; dxi <= kp.max_dx; dxi = dxi + 1) {
-            let sx = kp.xi + dxi;
-            let sy = kp.yi + dyi;
-            let g = grad[u32(sy) * kp.lw + u32(sx)];
+    let nx_side = max(kp.max_dx - kp.min_dx + 1, 0);
+    let ny_side = max(kp.max_dy - kp.min_dy + 1, 0);
+    let total = u32(nx_side * ny_side);
+    let my_cell = t / 16u;
+    let lane = t % 16u;
+    let ci = f32(my_cell % 4u);
+    let ri = f32(my_cell / 4u);
+    var acc0 = vec4<f32>(0.0);
+    var acc1 = vec4<f32>(0.0);
+    let b0 = vec4<f32>(0.0, 1.0, 2.0, 3.0);
+    let b1 = vec4<f32>(4.0, 5.0, 6.0, 7.0);
+    for (var base = 0u; base < total; base = base + WG) {
+        let si = base + t;
+        var val = 0.0;
+        var cx = -10.0;
+        var cy = -10.0;
+        var ob = 0.0;
+        if (si < total) {
+            let dxi = kp.min_dx + i32(si % u32(nx_side));
+            let dyi = kp.min_dy + i32(si / u32(nx_side));
+            let g = grad[u32(kp.yi + dyi) * kp.lw + u32(kp.xi + dxi)];
             let mag = sqrt(g.x * g.x + g.y * g.y);
-            if (!(mag > EPS) || mag > 3.0e38) {
-                continue;
-            }
-            let dx = f32(dxi) + kp.off_x;
-            let dy = f32(dyi) + kp.off_y;
-            let nx = (kp.cos_o * dx + kp.sin_o * dy) / kp.sbp;
-            let ny = (-kp.sin_o * dx + kp.cos_o * dy) / kp.sbp;
-            let theta = rem_tau(atan2(g.y, g.x) - kp.orientation);
-            let obin = theta * 8.0 / TAU;
-            let wgt = exp(-(nx * nx + ny * ny) / 8.0);
-            if (!(wgt > 0.0)) {
-                continue;
-            }
-            // `accumulate_vlfeat_sample`.
-            let binx = floor(nx - 0.5);
-            let biny = floor(ny - 0.5);
-            let bint = floor(obin);
-            let rx = nx - (binx + 0.5);
-            let ry = ny - (biny + 0.5);
-            let rt = obin - bint;
-            for (var dbx = 0; dbx <= 1; dbx = dbx + 1) {
-                let cx = i32(binx) + dbx;
-                if (cx < -2 || cx >= 2) {
-                    continue;
-                }
-                let wx = max(1.0 - abs(f32(dbx) - rx), 0.0);
-                if (wx <= 0.0) {
-                    continue;
-                }
-                for (var dby = 0; dby <= 1; dby = dby + 1) {
-                    let cy = i32(biny) + dby;
-                    if (cy < -2 || cy >= 2) {
-                        continue;
-                    }
-                    let wy = max(1.0 - abs(f32(dby) - ry), 0.0);
-                    if (wy <= 0.0) {
-                        continue;
-                    }
-                    for (var dbt = 0; dbt <= 1; dbt = dbt + 1) {
-                        let ori = u32(((i32(bint) + dbt) % 8 + 8) % 8);
-                        let wt = select(rt, 1.0 - rt, dbt == 0);
-                        if (wt <= 0.0) {
-                            continue;
-                        }
-                        let idx = (u32(cy + 2) * 4u + u32(cx + 2)) * 8u + ori;
-                        d[idx] = d[idx] + mag * wgt * wx * wy * wt;
-                    }
-                }
+            if (mag > EPS && mag <= 3.0e38) {
+                let dx = f32(dxi) + kp.off_x;
+                let dy = f32(dyi) + kp.off_y;
+                let nx = (kp.cos_o * dx + kp.sin_o * dy) / kp.sbp;
+                let ny = (-kp.sin_o * dx + kp.cos_o * dy) / kp.sbp;
+                ob = rem_tau(atan2(g.y, g.x) - kp.orientation) * 8.0 / TAU;
+                val = mag * exp(-(nx * nx + ny * ny) / 8.0);
+                cx = nx + 1.5;
+                cy = ny + 1.5;
             }
         }
+        s_val[t] = val;
+        s_cx[t] = cx;
+        s_cy[t] = cy;
+        s_ob[t] = ob;
+        workgroupBarrier();
+        for (var j = lane; j < WG; j = j + 16u) {
+            let wxy = max(0.0, 1.0 - abs(s_cx[j] - ci)) * max(0.0, 1.0 - abs(s_cy[j] - ri));
+            if (wxy > 0.0 && s_val[j] > 0.0) {
+                let v = s_val[j] * wxy;
+                let o = vec4<f32>(s_ob[j]);
+                var d0 = abs(o - b0);
+                var d1 = abs(o - b1);
+                d0 = min(d0, vec4<f32>(8.0) - d0);
+                d1 = min(d1, vec4<f32>(8.0) - d1);
+                acc0 = acc0 + v * max(vec4<f32>(0.0), vec4<f32>(1.0) - d0);
+                acc1 = acc1 + v * max(vec4<f32>(0.0), vec4<f32>(1.0) - d1);
+            }
+        }
+        workgroupBarrier();
     }
-    // `normalize_vlfeat_descriptor`.
-    if (D.normalization == 1u) {
-        var l1 = 0.0;
-        for (var j = 0u; j < 128u; j = j + 1u) {
-            l1 = l1 + abs(d[j]);
+    for (var b = 0u; b < 4u; b = b + 1u) {
+        red[t * 8u + b] = acc0[b];
+        red[t * 8u + 4u + b] = acc1[b];
+    }
+    workgroupBarrier();
+    if (t < 128u) {
+        // Bin t = cell * 8 + orientation, summed over the cell's lanes.
+        let cell_id = t / 8u;
+        let o = t % 8u;
+        var sum = 0.0;
+        for (var l = 0u; l < 16u; l = l + 1u) {
+            sum = sum + red[(cell_id * 16u + l) * 8u + o];
         }
+        desc[t] = sum;
+    }
+    workgroupBarrier();
+    // `normalize_vlfeat_descriptor`.
+    if (t == 0u) {
+        var n = 0.0;
+        for (var j = 0u; j < 128u; j = j + 1u) {
+            let v = desc[j];
+            n = select(n + v * v, n + abs(v), D.normalization == 1u);
+        }
+        norm = n;
+    }
+    workgroupBarrier();
+    var v = desc[min(t, 127u)];
+    if (D.normalization == 1u) {
+        let l1 = norm;
         if (l1 > EPS && l1 <= 3.0e38) {
-            for (var j = 0u; j < 128u; j = j + 1u) {
-                d[j] = sqrt(max(d[j] / l1, 0.0));
-            }
+            v = sqrt(max(v / l1, 0.0));
         }
     } else {
-        var n2 = 0.0;
-        for (var j = 0u; j < 128u; j = j + 1u) {
-            n2 = n2 + d[j] * d[j];
+        let l2 = sqrt(norm);
+        if (l2 > EPS && l2 <= 3.0e38) {
+            v = v / l2;
         }
-        let norm = sqrt(n2);
-        if (norm > EPS && norm <= 3.0e38) {
+        v = max(min(v, 0.2), 0.0);
+    }
+    workgroupBarrier();
+    if (t < 128u) {
+        desc[t] = v;
+    }
+    workgroupBarrier();
+    if (D.normalization != 1u) {
+        if (t == 0u) {
+            var c2 = 0.0;
             for (var j = 0u; j < 128u; j = j + 1u) {
-                d[j] = d[j] / norm;
+                c2 = c2 + desc[j] * desc[j];
             }
+            norm = sqrt(c2);
         }
-        for (var j = 0u; j < 128u; j = j + 1u) {
-            d[j] = max(min(d[j], 0.2), 0.0);
+        workgroupBarrier();
+        if (t < 128u && norm > EPS && norm <= 3.0e38) {
+            desc[t] = desc[t] / norm;
         }
-        var c2 = 0.0;
-        for (var j = 0u; j < 128u; j = j + 1u) {
-            c2 = c2 + d[j] * d[j];
-        }
-        let cnorm = sqrt(c2);
-        if (cnorm > EPS && cnorm <= 3.0e38) {
-            for (var j = 0u; j < 128u; j = j + 1u) {
-                d[j] = d[j] / cnorm;
-            }
-        }
+        workgroupBarrier();
     }
-    // Bytes, then COLMAP's VLFeat -> UBC orientation order within each cell
-    // (orientation t goes to (8 - t) % 8), four bytes a word.
-    var words: array<u32, 32>;
-    for (var j = 0u; j < 32u; j = j + 1u) {
-        words[j] = 0u;
+    // Bytes, then the VLFeat -> UBC orientation order within each cell
+    // (orientation k goes to (8 - k) % 8), four bytes a word.
+    if (t < 128u) {
+        let q = u32(clamp(round_half_up(desc[t] * 512.0), 0.0, 255.0));
+        bytes[(t & ~7u) + ((8u - (t & 7u)) & 7u)] = q;
     }
-    for (var j = 0u; j < 128u; j = j + 1u) {
-        let q = u32(clamp(round_half_up(d[j] * 512.0), 0.0, 255.0));
-        let base = j & ~7u;
-        let t = j & 7u;
-        let dst = base + ((8u - t) & 7u);
-        words[dst >> 2u] = words[dst >> 2u] | (q << (8u * (dst & 3u)));
-    }
-    for (var j = 0u; j < 32u; j = j + 1u) {
-        out[i * 32u + j] = words[j];
+    workgroupBarrier();
+    if (t < 32u) {
+        let w = bytes[4u * t] | (bytes[4u * t + 1u] << 8u) | (bytes[4u * t + 2u] << 16u)
+            | (bytes[4u * t + 3u] << 24u);
+        out[i * 32u + t] = w;
     }
 }

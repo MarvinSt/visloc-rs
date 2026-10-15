@@ -79,6 +79,10 @@ pub struct PhotoSfmConfig {
     /// GPU (`visloc_ba_gpu::GpuReducedSolver`; docs/gpu_bundle_adjustment.md):
     /// the result then differs from the CPU solve at the f32 level.
     pub gpu_ba: bool,
+    /// Extract the VLFeat-compatible SIFT on the GPU
+    /// (`visloc_sift_gpu::VlfeatSiftGpu`), an f32 port of the CPU extractor:
+    /// about 99.9% of its keypoints, descriptor bytes within one.
+    pub gpu_sift: bool,
 }
 
 impl Default for PhotoSfmConfig {
@@ -103,6 +107,7 @@ impl Default for PhotoSfmConfig {
             match_u8: true,
             mask_black: None,
             gpu_ba: false,
+            gpu_sift: false,
         }
     }
 }
@@ -519,7 +524,52 @@ pub fn build_photo_dataset(
     let on_gpu = gpu_sift.is_some() && visloc_sift_gpu::SiftGpu::supports(&sift_cfg);
     #[cfg(not(feature = "gpu"))]
     let on_gpu = false;
-    let features: Vec<FeatureSet> = if on_gpu {
+    #[cfg(not(feature = "gpu"))]
+    if cfg.gpu_sift {
+        return Err(EurocError::Sift("gpu_sift needs the `gpu` feature".into()));
+    }
+    // The VLFeat-compatible extractor on the GPU (opt-in): it borrows the
+    // matcher's context and hands it back.
+    #[cfg(feature = "gpu")]
+    let vlfeat_gpu = cfg.gpu_sift && visloc_sift_gpu::VlfeatSiftGpu::supports(&sift_cfg);
+    #[cfg(feature = "gpu")]
+    if cfg.gpu_sift && !vlfeat_gpu {
+        log("gpu sift: these SIFT settings are not VLFeat-compatible; extracting on the CPU");
+    }
+    #[cfg(not(feature = "gpu"))]
+    let vlfeat_gpu = false;
+    let features: Vec<FeatureSet> = if vlfeat_gpu {
+        #[allow(unused_mut)]
+        let mut features = Vec::with_capacity(n);
+        #[cfg(feature = "gpu")]
+        {
+            let ctx = match gpu_sift.take() {
+                Some(g) => g.into_context(),
+                None => visloc_sift_gpu::GpuContext::new()
+                    .map_err(|e| EurocError::Sift(format!("gpu: {e}")))?,
+            };
+            let mut vl = visloc_sift_gpu::VlfeatSiftGpu::new(ctx);
+            log(&format!(
+                "gpu sift: VLFeat-compatible extractor on {}",
+                vl.context().adapter_info.name
+            ));
+            for chunk in decoded.chunks(256) {
+                let grays: Vec<Vec<f32>> = chunk.par_iter().map(|(img, _)| gray_of(img)).collect();
+                for g in &grays {
+                    let gray = GrayImage::new(width as usize, height as usize, g)
+                        .map_err(|e| EurocError::Sift(format!("{e}")))?;
+                    let (kps, desc) = vl
+                        .extract(&gray, &sift_cfg)
+                        .map_err(|e| EurocError::Sift(format!("{e}")))?;
+                    features.push(to_features(kps, desc));
+                }
+            }
+            if cfg.gpu {
+                gpu_sift = Some(visloc_sift_gpu::SiftGpu::new(vl.into_context()));
+            }
+        }
+        features
+    } else if on_gpu {
         let mut features = Vec::with_capacity(n);
         #[cfg(feature = "gpu")]
         for chunk in decoded.chunks(256) {

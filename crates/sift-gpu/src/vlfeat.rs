@@ -1,0 +1,1227 @@
+//! VLFeat-compatible SIFT on the GPU: the extractor `gsplat_photos` runs
+//! (`SiftConfig::vlfeat_compatible_detector` and
+//! `vlfeat_compatible_descriptor`), in f32 WGSL.
+//!
+//! The scale spaces, the DoG extrema with VLFeat's five-step refinement, the
+//! orientation histograms, the descriptor pyramid's gradients and the
+//! descriptors run on the GPU. The host keeps what decides which keypoints
+//! survive and in what order, exactly as the CPU path does: the candidates'
+//! scan order, the per-locus orientation cap, the per-level feature cap
+//! (`max_keypoints`) and each keypoint's descriptor level (in f64).
+//!
+//! It is a port, not a bit-exact one: the CPU path computes in f64, so a
+//! handful of borderline extrema and orientation peaks differ and the
+//! descriptor bytes can differ by one. `examples/sift_vlfeat_gpu_bench.rs`
+//! compares the two on an image.
+//!
+//! Buffers, dispatches and bind groups are built once per image size and
+//! reused for every image of that size.
+
+use std::num::NonZeroU64;
+
+use visloc_gsplat_render::GpuContext;
+use visloc_vision::features::sift::{
+    GrayImage, SiftConfig, SiftDetector, SiftKeypoint, SiftNormalization,
+};
+
+use crate::extractor::{storage, SiftGpuError};
+
+/// Uniform parameter slot stride and binding size.
+const SLOT: u64 = 256;
+const SLOT_BIND: u64 = 64;
+/// Words per candidate (`vlfeat_detect.wgsl`).
+const CAND_WORDS: usize = 16;
+/// Words per keypoint handed to `vl_describe`.
+const KP_WORDS: usize = 16;
+/// Initial candidate capacity per octave (grown when an image overflows it).
+const INITIAL_CAP: usize = 1 << 16;
+
+struct Pipes {
+    upsample: wgpu::ComputePipeline,
+    blur_h: wgpu::ComputePipeline,
+    blur_v: wgpu::ComputePipeline,
+    halve: wgpu::ComputePipeline,
+    dog: wgpu::ComputePipeline,
+    extrema: wgpu::ComputePipeline,
+    orient: wgpu::ComputePipeline,
+    gradient: wgpu::ComputePipeline,
+    describe: wgpu::ComputePipeline,
+}
+
+/// The settings a [`Plan`] depends on (besides the image size).
+#[derive(Clone, Copy, PartialEq)]
+struct PlanKey {
+    width: usize,
+    height: usize,
+    cap: usize,
+    octaves: usize,
+    intervals: usize,
+    sigma_base: f64,
+    sigma_input: f64,
+    contrast_threshold: f64,
+    edge_threshold: f64,
+    bilinear: bool,
+}
+
+impl PlanKey {
+    fn new(width: usize, height: usize, cap: usize, config: &SiftConfig) -> Self {
+        Self {
+            width,
+            height,
+            cap,
+            octaves: config.octaves,
+            intervals: config.intervals.max(1),
+            sigma_base: config.sigma_base,
+            sigma_input: config.sigma_input,
+            contrast_threshold: config.contrast_threshold,
+            edge_threshold: config.edge_threshold,
+            bilinear: config.vlfeat_bilinear_orientations,
+        }
+    }
+}
+
+/// Everything one image size needs, built once: the buffers, the recorded
+/// dispatches of the detection and descriptor scale spaces, and their bind
+/// groups.
+struct Plan {
+    key: PlanKey,
+    det_dims: Vec<(usize, usize)>,
+    desc_dims: Vec<(usize, usize)>,
+    /// Element offset of each descriptor octave's first gradient.
+    grad_off: Vec<usize>,
+    img: wgpu::Buffer,
+    cand: wgpu::Buffer,
+    counters: wgpu::Buffer,
+    grad: wgpu::Buffer,
+    // Kept alive for the bind groups.
+    _scratch: Vec<wgpu::Buffer>,
+    _params: wgpu::Buffer,
+    passes: Vec<(usize, wgpu::BindGroup, (u32, u32, u32))>,
+}
+
+/// Grown on demand: the keypoints `vl_describe` reads and the bytes it
+/// writes.
+struct DescBuffers {
+    capacity: usize,
+    params: wgpu::Buffer,
+    kps: wgpu::Buffer,
+    out: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+}
+
+/// VLFeat-compatible GPU SIFT extractor (owns its [`GpuContext`]).
+pub struct VlfeatSiftGpu {
+    ctx: GpuContext,
+    pipes: Pipes,
+    cap: usize,
+    plan: Option<Plan>,
+    desc: Option<DescBuffers>,
+}
+
+/// One refined DoG extremum read back from the GPU.
+#[derive(Clone, Copy)]
+struct Candidate {
+    octave: usize,
+    ox: u32,
+    oy: u32,
+    level: u32,
+    x: f32,
+    y: f32,
+    scale: f32,
+    orientations: usize,
+    angles: [f32; 4],
+}
+
+/// The keypoint fields `vl_describe` reads (`DescKp` in
+/// `vlfeat_describe.wgsl`).
+#[derive(Clone, Copy)]
+struct DescKp {
+    off: u32,
+    lw: u32,
+    xi: i32,
+    yi: i32,
+    min_dx: i32,
+    max_dx: i32,
+    min_dy: i32,
+    max_dy: i32,
+    off_x: f32,
+    off_y: f32,
+    sbp: f32,
+    cos_o: f32,
+    sin_o: f32,
+    orientation: f32,
+}
+
+impl DescKp {
+    fn words(&self) -> [u32; KP_WORDS] {
+        [
+            self.off,
+            self.lw,
+            self.xi as u32,
+            self.yi as u32,
+            self.min_dx as u32,
+            self.max_dx as u32,
+            self.min_dy as u32,
+            self.max_dy as u32,
+            self.off_x.to_bits(),
+            self.off_y.to_bits(),
+            self.sbp.to_bits(),
+            self.cos_o.to_bits(),
+            self.sin_o.to_bits(),
+            self.orientation.to_bits(),
+            0,
+            0,
+        ]
+    }
+}
+
+/// A buffer an op binds.
+#[derive(Clone, Copy)]
+enum B<'a> {
+    Img,
+    Tmp,
+    Buf(&'a wgpu::Buffer),
+}
+
+/// One recorded dispatch: pipe 0 upsample, 1 blur_h, 2 blur_v, 3 halve,
+/// 4 dog, 5 extrema, 6 orientations, 7 gradients.
+struct Op<'a> {
+    pipe: usize,
+    slot: u64,
+    bufs: Vec<(u32, B<'a>)>,
+    groups: (u32, u32, u32),
+}
+
+/// Uniform slots, one per op.
+#[derive(Default)]
+struct Slots {
+    words: Vec<u32>,
+}
+
+impl Slots {
+    fn push(&mut self, fields: &[u32]) -> u64 {
+        let slot = (self.words.len() * 4) as u64;
+        let mut s = [0u32; (SLOT / 4) as usize];
+        s[..fields.len()].copy_from_slice(fields);
+        self.words.extend_from_slice(&s);
+        slot
+    }
+}
+
+fn groups2d(w: usize, h: usize, z: usize) -> (u32, u32, u32) {
+    ((w as u32).div_ceil(16), (h as u32).div_ceil(16), z as u32)
+}
+
+/// A separable blur of `src` into `dst` (element offsets) through the
+/// scratch buffer, with the kernel at `(weights offset, radius)`.
+fn blur_ops<'a>(
+    ops: &mut Vec<Op<'a>>,
+    slots: &mut Slots,
+    (w, h): (usize, usize),
+    src: (B<'a>, usize),
+    dst: (B<'a>, usize),
+    (wt_off, radius): (u32, u32),
+) {
+    let (wu, hu) = (w as u32, h as u32);
+    let slot = slots.push(&[wu, hu, src.1 as u32, 0, radius, wt_off, wu, hu]);
+    ops.push(Op {
+        pipe: 1,
+        slot,
+        bufs: vec![(1, src.0), (2, B::Tmp)],
+        groups: groups2d(w, h, 1),
+    });
+    let slot = slots.push(&[wu, hu, 0, dst.1 as u32, radius, wt_off, wu, hu]);
+    ops.push(Op {
+        pipe: 2,
+        slot,
+        bufs: vec![(1, B::Tmp), (2, dst.0)],
+        groups: groups2d(w, h, 1),
+    });
+}
+
+/// `gaussian_kernel_vlfeat`: four-sigma taps, normalized in f64.
+fn gaussian_kernel_vlfeat(sigma: f64) -> Vec<f32> {
+    let sigma = sigma.max(1e-6);
+    let radius = (sigma * 4.0).ceil().max(1.0) as i64;
+    let denom = 2.0 * sigma * sigma;
+    let raw: Vec<f64> = (-radius..=radius)
+        .map(|offset| (-(offset * offset) as f64 / denom).exp())
+        .collect();
+    let sum: f64 = raw.iter().sum();
+    raw.iter().map(|value| (value / sum) as f32).collect()
+}
+
+/// `vlfeat_compatible_octave_count`: COLMAP's four octaves unless the
+/// configuration says otherwise, bounded by the image.
+fn detection_octaves(configured: usize, width: usize, height: usize) -> usize {
+    let min_dimension = width.min(height).max(1) as f64;
+    let auto = ((min_dimension.log2().floor() as i64) - 2).max(1) as usize;
+    if configured == 0 {
+        4usize.min(auto).max(1)
+    } else {
+        configured.min(auto).max(1)
+    }
+}
+
+/// The descriptor pyramid's octaves down to 16 pixels (`build_vlfeat_pyramid`
+/// builds at most these; a keypoint never selects past them).
+fn descriptor_octaves(width: usize, height: usize) -> usize {
+    let min_dimension = width.min(height).max(1) as f64;
+    if min_dimension >= 16.0 {
+        (min_dimension / 16.0).log2().floor() as usize + 1
+    } else {
+        1
+    }
+}
+
+fn dispatch_linear(threads: usize, per_group: usize) -> (u32, u32, u32) {
+    let groups = threads.div_ceil(per_group).max(1) as u32;
+    if groups <= 65535 {
+        (groups, 1, 1)
+    } else {
+        (65535, groups.div_ceil(65535), 1)
+    }
+}
+
+/// Copy `ranges` (byte offset, length) of `buffer` into one host vector.
+fn read_ranges(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    ranges: &[(u64, u64)],
+) -> Vec<u8> {
+    let total: u64 = ranges.iter().map(|&(_, len)| len).sum();
+    if total == 0 {
+        return Vec::new();
+    }
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vl-staging"),
+        size: total,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("vl-readback"),
+    });
+    let mut at = 0u64;
+    for &(offset, len) in ranges {
+        if len > 0 {
+            encoder.copy_buffer_to_buffer(buffer, offset, &staging, at, len);
+            at += len;
+        }
+    }
+    queue.submit(Some(encoder.finish()));
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    let _ = rx.recv();
+    let data = slice.get_mapped_range().expect("map range").to_vec();
+    staging.unmap();
+    data
+}
+
+impl VlfeatSiftGpu {
+    pub fn new(ctx: GpuContext) -> Self {
+        let dev = &ctx.device;
+        let module = |label: &str, src: &str| {
+            dev.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            })
+        };
+        let image = module("vl-image", include_str!("shaders/image.wgsl"));
+        let detect = module("vl-detect", include_str!("shaders/vlfeat_detect.wgsl"));
+        let describe = module("vl-describe", include_str!("shaders/vlfeat_describe.wgsl"));
+        let mk = |m: &wgpu::ShaderModule, entry: &str| {
+            dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: None,
+                module: m,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let pipes = Pipes {
+            upsample: mk(&image, "upsample2x_aligned"),
+            blur_h: mk(&image, "blur_h"),
+            blur_v: mk(&image, "blur_v"),
+            halve: mk(&image, "halve"),
+            dog: mk(&image, "dog"),
+            extrema: mk(&detect, "vl_extrema"),
+            orient: mk(&detect, "vl_orient"),
+            gradient: mk(&describe, "vl_gradient"),
+            describe: mk(&describe, "vl_describe"),
+        };
+        Self {
+            ctx,
+            pipes,
+            cap: INITIAL_CAP,
+            plan: None,
+            desc: None,
+        }
+    }
+
+    pub fn context(&self) -> &GpuContext {
+        &self.ctx
+    }
+
+    pub fn into_context(self) -> GpuContext {
+        self.ctx
+    }
+
+    /// Starts with room for `cap` candidates per octave (grown on demand).
+    #[cfg(test)]
+    fn with_capacity(ctx: GpuContext, cap: usize) -> Self {
+        Self {
+            cap,
+            ..Self::new(ctx)
+        }
+    }
+
+    /// Whether `config` selects the VLFeat-compatible path this extractor
+    /// implements (without domain-size pooling).
+    pub fn supports(config: &SiftConfig) -> bool {
+        config.detector == SiftDetector::Dog
+            && config.vlfeat_compatible_detector
+            && config.vlfeat_compatible_descriptor
+            && !config.domain_size_pooling
+            && !config.affine
+            && !config.multi_anisotropy
+    }
+
+    /// Keypoints and descriptors with the CPU `extract_sift`'s contract for a
+    /// VLFeat-compatible configuration: the same order, orientation cap and
+    /// per-level `max_keypoints` cap, descriptors as byte values (0..=255)
+    /// in COLMAP's UBC layout.
+    pub fn extract(
+        &mut self,
+        image: &GrayImage<'_>,
+        config: &SiftConfig,
+    ) -> Result<(Vec<SiftKeypoint>, Vec<Vec<f32>>), SiftGpuError> {
+        if !Self::supports(config) {
+            return Err(SiftGpuError::Unsupported);
+        }
+        let (w0, h0) = (image.width, image.height);
+        if w0 < 16 || h0 < 16 || image.pixels.len() < w0 * h0 {
+            return Err(SiftGpuError::ImageTooSmall {
+                width: w0,
+                height: h0,
+            });
+        }
+        let candidates = loop {
+            let key = PlanKey::new(w0, h0, self.cap, config);
+            if self.plan.as_ref().map(|p| p.key) != Some(key) {
+                // The descriptor bind group reads the old plan's gradients.
+                self.desc = None;
+                self.plan = Some(self.build_plan(key));
+            }
+            match self.detect(image)? {
+                Ok(candidates) => break candidates,
+                Err(needed) => self.cap = needed.next_power_of_two(),
+            }
+        };
+        let keypoints = select_keypoints(candidates, config);
+        let descriptors = self.describe(&keypoints, config);
+        Ok((keypoints, descriptors))
+    }
+
+    fn build_plan(&self, key: PlanKey) -> Plan {
+        let dev = &self.ctx.device;
+        let queue = &self.ctx.queue;
+        let (w0, h0) = (key.width, key.height);
+        let s = key.intervals;
+        let levels = s + 3;
+        let k = 2.0f64.powf(1.0 / s as f64);
+        let cap = key.cap;
+
+        let n_det = detection_octaves(key.octaves, w0, h0);
+        let mut det_dims = Vec::with_capacity(n_det);
+        let (mut w, mut h) = (2 * w0, 2 * h0);
+        for _ in 0..n_det {
+            det_dims.push((w, h));
+            w /= 2;
+            h /= 2;
+        }
+        let n_desc = descriptor_octaves(w0, h0);
+        let mut desc_dims = Vec::with_capacity(n_desc);
+        let (mut w, mut h) = (w0, h0);
+        for _ in 0..n_desc {
+            desc_dims.push((w, h));
+            w /= 2;
+            h /= 2;
+        }
+        let mut grad_off = Vec::with_capacity(n_desc);
+        let mut grad_len = 0usize;
+        for &(w, h) in &desc_dims {
+            grad_off.push(grad_len);
+            grad_len += levels * w * h;
+        }
+
+        // Blur kernels: an identity tap (no initial blur), then the
+        // detection and descriptor pyramids' initial blurs and level steps.
+        let mut weights: Vec<f32> = vec![1.0];
+        let identity = (0u32, 0u32);
+        let mut add_kernel = |sigma: f64| -> (u32, u32) {
+            let taps = gaussian_kernel_vlfeat(sigma);
+            let entry = (weights.len() as u32, (taps.len() / 2) as u32);
+            weights.extend_from_slice(&taps);
+            entry
+        };
+        let step_sigmas = |base: f64| -> Vec<f64> {
+            (1..levels)
+                .map(|l| {
+                    let target = base * k.powi(l as i32);
+                    let previous = base * k.powi(l as i32 - 1);
+                    (target * target - previous * previous).max(1e-8).sqrt()
+                })
+                .collect()
+        };
+        let det_base = key.sigma_base.max(2.0 * key.sigma_input).max(1e-3);
+        let det_input = (2.0 * key.sigma_input).max(1e-3);
+        let det_initial = if det_base > det_input {
+            add_kernel((det_base * det_base - det_input * det_input).sqrt())
+        } else {
+            identity
+        };
+        let det_steps: Vec<(u32, u32)> = step_sigmas(det_base)
+            .into_iter()
+            .map(&mut add_kernel)
+            .collect();
+        let desc_base = (key.sigma_base.max(1e-3) / 2.0).max(key.sigma_input);
+        let desc_input = key.sigma_input.max(1e-3);
+        let desc_initial = if desc_base > desc_input {
+            add_kernel((desc_base * desc_base - desc_input * desc_input).sqrt())
+        } else {
+            identity
+        };
+        let desc_steps: Vec<(u32, u32)> = step_sigmas(desc_base)
+            .into_iter()
+            .map(&mut add_kernel)
+            .collect();
+
+        let none = wgpu::BufferUsages::empty();
+        let img = storage(dev, "vl-img", (w0 * h0 * 4) as u64, none);
+        let wts = storage(dev, "vl-weights", (weights.len() * 4) as u64, none);
+        queue.write_buffer(&wts, 0, bytemuck::cast_slice(&weights));
+        let (tw, th) = det_dims[0];
+        let tmp = storage(dev, "vl-tmp", (tw * th * 4) as u64, none);
+        let det_gauss: Vec<wgpu::Buffer> = det_dims
+            .iter()
+            .map(|&(w, h)| storage(dev, "vl-gauss", (levels * w * h * 4) as u64, none))
+            .collect();
+        let det_dog: Vec<wgpu::Buffer> = det_dims
+            .iter()
+            .map(|&(w, h)| storage(dev, "vl-dog", ((levels - 1) * w * h * 4) as u64, none))
+            .collect();
+        let desc_gauss: Vec<wgpu::Buffer> = desc_dims
+            .iter()
+            .map(|&(w, h)| storage(dev, "vl-desc-gauss", (levels * w * h * 4) as u64, none))
+            .collect();
+        let cand = storage(dev, "vl-cand", (n_det * cap * CAND_WORDS * 4) as u64, none);
+        let counters = storage(dev, "vl-counters", (n_det.max(4) * 4) as u64, none);
+        let grad = storage(dev, "vl-grad", (grad_len * 8) as u64, none);
+
+        let mut slots = Slots::default();
+        let mut ops: Vec<Op> = Vec::new();
+        let f = |v: f64| (v as f32).to_bits();
+        // Detection: octave bases, Gaussian levels, DoG, extrema, orientations.
+        for (o, &(w, h)) in det_dims.iter().enumerate() {
+            let lvl = w * h;
+            let (wu, hu) = (w as u32, h as u32);
+            let gauss = B::Buf(&det_gauss[o]);
+            if o == 0 {
+                // Upsample into level 1 (scratch), blur into level 0.
+                let slot = slots.push(&[wu, hu, 0, lvl as u32, 0, 0, w0 as u32, h0 as u32]);
+                ops.push(Op {
+                    pipe: 0,
+                    slot,
+                    bufs: vec![(1, B::Img), (2, gauss)],
+                    groups: groups2d(w, h, 1),
+                });
+                blur_ops(
+                    &mut ops,
+                    &mut slots,
+                    (w, h),
+                    (gauss, lvl),
+                    (gauss, 0),
+                    det_initial,
+                );
+            } else {
+                let (pw, ph) = det_dims[o - 1];
+                let slot =
+                    slots.push(&[wu, hu, (s * pw * ph) as u32, 0, 0, 0, pw as u32, ph as u32]);
+                ops.push(Op {
+                    pipe: 3,
+                    slot,
+                    bufs: vec![(1, B::Buf(&det_gauss[o - 1])), (2, gauss)],
+                    groups: groups2d(w, h, 1),
+                });
+            }
+            for (l, &kern) in det_steps.iter().enumerate() {
+                let src = (gauss, l * lvl);
+                blur_ops(
+                    &mut ops,
+                    &mut slots,
+                    (w, h),
+                    src,
+                    (gauss, (l + 1) * lvl),
+                    kern,
+                );
+            }
+            let slot = slots.push(&[wu, hu, 0, 0, 0, 0, wu, hu]);
+            ops.push(Op {
+                pipe: 4,
+                slot,
+                bufs: vec![(1, gauss), (2, B::Buf(&det_dog[o]))],
+                groups: groups2d(w, h, levels - 1),
+            });
+            let vl = |levels_field: usize| {
+                [
+                    wu,
+                    hu,
+                    o as u32,
+                    cap as u32,
+                    f(key.contrast_threshold / s as f64),
+                    f(key.edge_threshold),
+                    f(det_base),
+                    f(k),
+                    f((s + 1) as f64),
+                    key.bilinear as u32,
+                    levels_field as u32,
+                    0,
+                ]
+            };
+            let slot = slots.push(&vl(levels - 1));
+            ops.push(Op {
+                pipe: 5,
+                slot,
+                bufs: vec![
+                    (1, B::Buf(&det_dog[o])),
+                    (2, B::Buf(&cand)),
+                    (3, B::Buf(&counters)),
+                ],
+                groups: groups2d(w, h, s),
+            });
+            let slot = slots.push(&vl(levels));
+            ops.push(Op {
+                pipe: 6,
+                slot,
+                bufs: vec![(1, gauss), (2, B::Buf(&cand)), (3, B::Buf(&counters))],
+                groups: dispatch_linear(cap, 64),
+            });
+        }
+        // Descriptor pyramid at the input resolution, and its gradients.
+        for (o, &(w, h)) in desc_dims.iter().enumerate() {
+            let lvl = w * h;
+            let (wu, hu) = (w as u32, h as u32);
+            let gauss = B::Buf(&desc_gauss[o]);
+            if o == 0 {
+                blur_ops(
+                    &mut ops,
+                    &mut slots,
+                    (w, h),
+                    (B::Img, 0),
+                    (gauss, 0),
+                    desc_initial,
+                );
+            } else {
+                let (pw, ph) = desc_dims[o - 1];
+                let slot =
+                    slots.push(&[wu, hu, (s * pw * ph) as u32, 0, 0, 0, pw as u32, ph as u32]);
+                ops.push(Op {
+                    pipe: 3,
+                    slot,
+                    bufs: vec![(1, B::Buf(&desc_gauss[o - 1])), (2, gauss)],
+                    groups: groups2d(w, h, 1),
+                });
+            }
+            for (l, &kern) in desc_steps.iter().enumerate() {
+                let src = (gauss, l * lvl);
+                blur_ops(
+                    &mut ops,
+                    &mut slots,
+                    (w, h),
+                    src,
+                    (gauss, (l + 1) * lvl),
+                    kern,
+                );
+            }
+            let slot = slots.push(&[wu, hu, levels as u32, grad_off[o] as u32]);
+            ops.push(Op {
+                pipe: 7,
+                slot,
+                bufs: vec![(1, gauss), (2, B::Buf(&grad))],
+                groups: groups2d(w, h, levels),
+            });
+        }
+        let words = slots.words;
+
+        let params = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vl-params"),
+            size: (words.len() * 4) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&params, 0, bytemuck::cast_slice(&words));
+        let pipes = [
+            &self.pipes.upsample,
+            &self.pipes.blur_h,
+            &self.pipes.blur_v,
+            &self.pipes.halve,
+            &self.pipes.dog,
+            &self.pipes.extrema,
+            &self.pipes.orient,
+            &self.pipes.gradient,
+        ];
+        let passes = ops
+            .iter()
+            .map(|op| {
+                let pipe = pipes[op.pipe];
+                let mut entries = vec![wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &params,
+                        offset: op.slot,
+                        size: NonZeroU64::new(SLOT_BIND),
+                    }),
+                }];
+                for &(binding, b) in &op.bufs {
+                    let buffer = match b {
+                        B::Img => &img,
+                        B::Tmp => &tmp,
+                        B::Buf(buffer) => buffer,
+                    };
+                    entries.push(wgpu::BindGroupEntry {
+                        binding,
+                        resource: buffer.as_entire_binding(),
+                    });
+                }
+                if op.pipe == 1 || op.pipe == 2 {
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wts.as_entire_binding(),
+                    });
+                }
+                let bind = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("vl-op"),
+                    layout: &pipe.get_bind_group_layout(0),
+                    entries: &entries,
+                });
+                (op.pipe, bind, op.groups)
+            })
+            .collect();
+        drop(ops);
+
+        let mut scratch = vec![wts, tmp];
+        scratch.extend(det_gauss);
+        scratch.extend(det_dog);
+        scratch.extend(desc_gauss);
+        Plan {
+            key,
+            det_dims,
+            desc_dims,
+            grad_off,
+            img,
+            cand,
+            counters,
+            grad,
+            _scratch: scratch,
+            _params: params,
+            passes,
+        }
+    }
+
+    /// Both scale spaces, the refined extrema and their orientations, read
+    /// back. `Err(needed)` when an octave's candidates overflowed the
+    /// capacity.
+    fn detect(&self, image: &GrayImage<'_>) -> Result<Result<Vec<Candidate>, usize>, SiftGpuError> {
+        let plan = self.plan.as_ref().expect("plan");
+        let dev = &self.ctx.device;
+        let queue = &self.ctx.queue;
+        let (w0, h0) = (image.width, image.height);
+        queue.write_buffer(&plan.img, 0, bytemuck::cast_slice(&image.pixels[..w0 * h0]));
+        let n_det = plan.det_dims.len();
+        queue.write_buffer(&plan.counters, 0, &vec![0u8; n_det.max(4) * 4]);
+        let pipes = [
+            &self.pipes.upsample,
+            &self.pipes.blur_h,
+            &self.pipes.blur_v,
+            &self.pipes.halve,
+            &self.pipes.dog,
+            &self.pipes.extrema,
+            &self.pipes.orient,
+            &self.pipes.gradient,
+        ];
+        let mut encoder = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("vl-detect"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("vl-detect"),
+                timestamp_writes: None,
+            });
+            for (pipe, bind, groups) in &plan.passes {
+                pass.set_pipeline(pipes[*pipe]);
+                pass.set_bind_group(0, bind, &[]);
+                pass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            }
+        }
+        queue.submit(Some(encoder.finish()));
+
+        let counts: Vec<u32> = bytemuck::cast_slice(&read_ranges(
+            dev,
+            queue,
+            &plan.counters,
+            &[(0, (n_det * 4) as u64)],
+        ))
+        .to_vec();
+        let cap = plan.key.cap;
+        if let Some(&max) = counts.iter().max() {
+            if max as usize > cap {
+                return Ok(Err(max as usize));
+            }
+        }
+        let word = 4u64;
+        let ranges: Vec<(u64, u64)> = counts
+            .iter()
+            .enumerate()
+            .map(|(o, &c)| {
+                (
+                    (o * cap * CAND_WORDS) as u64 * word,
+                    (c as usize * CAND_WORDS) as u64 * word,
+                )
+            })
+            .collect();
+        let bytes = read_ranges(dev, queue, &plan.cand, &ranges);
+        let raw: &[u32] = bytemuck::cast_slice(&bytes);
+        let mut candidates = Vec::with_capacity(raw.len() / CAND_WORDS);
+        let mut chunks = raw.chunks_exact(CAND_WORDS);
+        for (o, &c) in counts.iter().enumerate() {
+            for r in chunks.by_ref().take(c as usize) {
+                let orientations = (r[3] as usize).min(4);
+                candidates.push(Candidate {
+                    octave: o,
+                    ox: r[0],
+                    oy: r[1],
+                    level: r[2],
+                    x: f32::from_bits(r[4]),
+                    y: f32::from_bits(r[5]),
+                    scale: f32::from_bits(r[6]),
+                    orientations,
+                    angles: [
+                        f32::from_bits(r[9]),
+                        f32::from_bits(r[10]),
+                        f32::from_bits(r[11]),
+                        f32::from_bits(r[12]),
+                    ],
+                });
+            }
+        }
+        Ok(Ok(candidates))
+    }
+
+    fn describe(&mut self, keypoints: &[SiftKeypoint], config: &SiftConfig) -> Vec<Vec<f32>> {
+        if keypoints.is_empty() {
+            return Vec::new();
+        }
+        let plan = self.plan.as_ref().expect("plan");
+        let s = plan.key.intervals;
+        let levels = s + 3;
+        let k = 2.0f64.powf(1.0 / s as f64);
+        let base = (plan.key.sigma_base.max(1e-3) / 2.0).max(plan.key.sigma_input);
+        let n_desc = plan.desc_dims.len();
+        let words: Vec<u32> = keypoints
+            .iter()
+            .flat_map(|kp| {
+                descriptor_job(kp, base, k, levels, n_desc, &plan.desc_dims, &plan.grad_off).words()
+            })
+            .collect();
+        let n = keypoints.len();
+        let dev = &self.ctx.device;
+        let queue = &self.ctx.queue;
+        if self.desc.as_ref().is_none_or(|d| d.capacity < n) {
+            let capacity = n.next_power_of_two().max(1024);
+            let none = wgpu::BufferUsages::empty();
+            let params = dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vl-desc-params"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let kps = storage(dev, "vl-desc-kps", (capacity * KP_WORDS * 4) as u64, none);
+            let out = storage(dev, "vl-desc-out", (capacity * 32 * 4) as u64, none);
+            let bind = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("vl-describe"),
+                layout: &self.pipes.describe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: plan.grad.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: kps.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: out.as_entire_binding(),
+                    },
+                ],
+            });
+            self.desc = Some(DescBuffers {
+                capacity,
+                params,
+                kps,
+                out,
+                bind,
+            });
+        }
+        let desc = self.desc.as_ref().expect("descriptor buffers");
+        let l1 = matches!(config.normalization, SiftNormalization::L1Root) as u32;
+        queue.write_buffer(&desc.params, 0, bytemuck::cast_slice(&[n as u32, l1, 0, 0]));
+        queue.write_buffer(&desc.kps, 0, bytemuck::cast_slice(&words));
+        let mut encoder = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("vl-describe"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("vl-describe"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipes.describe);
+            pass.set_bind_group(0, &desc.bind, &[]);
+            let g = dispatch_linear(n, 64);
+            pass.dispatch_workgroups(g.0, g.1, g.2);
+        }
+        queue.submit(Some(encoder.finish()));
+        let bytes = read_ranges(dev, queue, &desc.out, &[(0, (n * 128) as u64)]);
+        bytes
+            .chunks_exact(128)
+            .map(|d| d.iter().map(|&b| b as f32).collect())
+            .collect()
+    }
+}
+
+/// `VlfeatPyramid::select` and `describe_raw_vlfeat`'s window, in f64: the
+/// gradient level, its sampling window and the keypoint frame.
+fn descriptor_job(
+    kp: &SiftKeypoint,
+    base: f64,
+    k: f64,
+    levels: usize,
+    n_desc: usize,
+    desc_dims: &[(usize, usize)],
+    grad_off: &[usize],
+) -> DescKp {
+    let sigma = if kp.sigma.is_finite() && kp.sigma > 0.0 {
+        kp.sigma
+    } else {
+        base
+    };
+    let ratio = (sigma / base).max(f64::MIN_POSITIVE);
+    let intervals = k.log2().recip();
+    let octave_phase = ratio.log2() - 0.5 / intervals;
+    let octave = (octave_phase.floor().max(0.0) as usize).min(n_desc - 1);
+    let pixel_scale = 2.0f64.powi(octave as i32);
+    let local_sigma = sigma / pixel_scale;
+    let top = levels.saturating_sub(3) as f64;
+    let position = ((local_sigma / base).max(f64::MIN_POSITIVE).log2() * intervals).clamp(1.0, top);
+    let level = position.round().clamp(1.0, top) as usize;
+    let sbp = (3.0 * local_sigma + f64::EPSILON).max(1e-6);
+    let (lw, lh) = desc_dims[octave];
+    let local_x = (kp.x - 0.5) / pixel_scale;
+    let local_y = (kp.y - 0.5) / pixel_scale;
+    let xi = (local_x + 0.5).floor() as i64;
+    let yi = (local_y + 0.5).floor() as i64;
+    let window = if sbp.is_finite() && sbp > 0.0 {
+        (std::f64::consts::SQRT_2 * sbp * 5.0 / 2.0 + 0.5).floor() as i64
+    } else {
+        0
+    };
+    let (mut min_dx, mut max_dx) = ((-window).max(1 - xi), window.min(lw as i64 - 2 - xi));
+    let (mut min_dy, mut max_dy) = ((-window).max(1 - yi), window.min(lh as i64 - 2 - yi));
+    if min_dx > max_dx || min_dy > max_dy {
+        (min_dx, max_dx, min_dy, max_dy) = (0, -1, 0, -1);
+    }
+    DescKp {
+        off: (grad_off[octave] + level * lw * lh) as u32,
+        lw: lw as u32,
+        xi: xi as i32,
+        yi: yi as i32,
+        min_dx: min_dx as i32,
+        max_dx: max_dx as i32,
+        min_dy: min_dy as i32,
+        max_dy: max_dy as i32,
+        off_x: (xi as f64 - local_x) as f32,
+        off_y: (yi as f64 - local_y) as f32,
+        sbp: sbp as f32,
+        cos_o: kp.orientation.cos() as f32,
+        sin_o: kp.orientation.sin() as f32,
+        orientation: kp.orientation as f32,
+    }
+}
+
+/// The CPU detector's bookkeeping on the GPU's candidates: its scan order
+/// (octave, level, row, column), the per-locus orientation cap, then
+/// `cap_vlfeat_oriented_detections_by_level` (a suffix of whole
+/// (octave, level) groups, counted in unoriented extrema).
+fn select_keypoints(mut candidates: Vec<Candidate>, config: &SiftConfig) -> Vec<SiftKeypoint> {
+    candidates.sort_unstable_by_key(|c| (c.octave, c.level, c.oy, c.ox));
+    let s = config.intervals.max(1);
+    let k = 2.0f64.powf(1.0 / s as f64);
+    let base = config.sigma_base.max(2.0 * config.sigma_input).max(1e-3);
+    let orientation_cap = if config.max_orientations == 0 {
+        2
+    } else {
+        config.max_orientations.min(4)
+    };
+    // Groups in scan order and their candidate counts.
+    let mut group_of = Vec::with_capacity(candidates.len());
+    let mut groups: Vec<usize> = Vec::new();
+    let mut last = None;
+    for c in &candidates {
+        let key = (c.octave, c.level);
+        if last != Some(key) {
+            groups.push(0);
+            last = Some(key);
+        }
+        *groups.last_mut().expect("group") += 1;
+        group_of.push(groups.len() - 1);
+    }
+    let mut first_group = 0;
+    if config.max_keypoints != usize::MAX {
+        let mut counted = 0usize;
+        for g in (0..groups.len()).rev() {
+            counted = counted.saturating_add(groups[g]);
+            if counted > config.max_keypoints {
+                first_group = g;
+                break;
+            }
+        }
+    }
+    let mut keypoints = Vec::new();
+    for (c, &g) in candidates.iter().zip(&group_of) {
+        if g < first_group {
+            continue;
+        }
+        let xper = 2.0f64.powi(c.octave as i32) / 2.0;
+        let local_sigma = base * k.powf(c.scale as f64 + 1.0);
+        for &angle in c.angles.iter().take(c.orientations.min(orientation_cap)) {
+            keypoints.push(SiftKeypoint::from_location_scale_orientation(
+                c.x as f64 * xper + 0.5,
+                c.y as f64 * xper + 0.5,
+                local_sigma * xper,
+                angle as f64,
+            ));
+        }
+    }
+    keypoints
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::try_context;
+    use visloc_vision::features::sift::extract_sift;
+
+    /// `gsplat_photos`' SIFT settings.
+    fn photos_config() -> SiftConfig {
+        SiftConfig {
+            max_keypoints: 8192,
+            normalization: SiftNormalization::L1Root,
+            descriptor_magnification: 3.0,
+            max_orientations: 2,
+            prefer_larger_scale: true,
+            vlfeat_compatible_detector: true,
+            vlfeat_compatible_descriptor: true,
+            vlfeat_bilinear_orientations: true,
+            ..SiftConfig::default()
+        }
+    }
+
+    /// Deterministic texture in [0, 1]: blobs of several sizes over smooth
+    /// waves, so every octave has extrema.
+    fn texture(w: usize, h: usize) -> Vec<f32> {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as f64 / (1u64 << 31) as f64
+        };
+        let blobs: Vec<(f64, f64, f64, f64)> = (0..90)
+            .map(|_| {
+                (
+                    next() * w as f64,
+                    next() * h as f64,
+                    1.0 + 9.0 * next() * next(),
+                    if next() < 0.5 { -0.35 } else { 0.35 },
+                )
+            })
+            .collect();
+        let mut px = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f64, y as f64);
+                let mut v = 0.5 + 0.08 * (fx * 0.11).sin() * (fy * 0.07).cos();
+                for &(cx, cy, s, a) in &blobs {
+                    let d2 = (fx - cx).powi(2) + (fy - cy).powi(2);
+                    v += a * (-d2 / (2.0 * s * s)).exp();
+                }
+                px[y * w + x] = v.clamp(0.0, 1.0) as f32;
+            }
+        }
+        px
+    }
+
+    /// Keypoints of `a` with a counterpart in `b` (position within 0.01 px,
+    /// scale within 0.1%, orientation within 0.01 rad), as index pairs.
+    fn pair_up(a: &[SiftKeypoint], b: &[SiftKeypoint]) -> Vec<(usize, usize)> {
+        let mut used = vec![false; b.len()];
+        let mut pairs = Vec::new();
+        for (i, p) in a.iter().enumerate() {
+            let hit = b.iter().enumerate().position(|(j, q)| {
+                let d = (p.orientation - q.orientation).rem_euclid(std::f64::consts::TAU);
+                !used[j]
+                    && (p.x - q.x).abs() < 0.01
+                    && (p.y - q.y).abs() < 0.01
+                    && (p.sigma - q.sigma).abs() < 1e-3 * p.sigma
+                    && d.min(std::f64::consts::TAU - d) < 0.01
+            });
+            if let Some(j) = hit {
+                used[j] = true;
+                pairs.push((i, j));
+            }
+        }
+        pairs
+    }
+
+    #[test]
+    fn gpu_vlfeat_sift_matches_the_cpu_path() {
+        let Some(ctx) = try_context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (w, h) = (256, 176);
+        let px = texture(w, h);
+        let image = GrayImage::new(w, h, &px).unwrap();
+        let config = photos_config();
+        let (ck, cd) = extract_sift(&image, &config).unwrap();
+        let mut gpu = VlfeatSiftGpu::new(ctx);
+        let (gk, gd) = gpu.extract(&image, &config).unwrap();
+        assert!(ck.len() > 100, "{} CPU keypoints", ck.len());
+        let pairs = pair_up(&ck, &gk);
+        let found = pairs.len() as f64 / ck.len() as f64;
+        let precise = pairs.len() as f64 / gk.len() as f64;
+        eprintln!(
+            "cpu {} gpu {} paired {} ({:.4} of cpu, {:.4} of gpu)",
+            ck.len(),
+            gk.len(),
+            pairs.len(),
+            found,
+            precise
+        );
+        assert!(found >= 0.98 && precise >= 0.98);
+        // Paired keypoints are in the same order.
+        assert!(pairs.windows(2).all(|p| p[0].1 < p[1].1));
+        let mut worst = 0.0f32;
+        let mut sum = 0.0f64;
+        for &(i, j) in &pairs {
+            for (a, b) in cd[i].iter().zip(&gd[j]) {
+                worst = worst.max((a - b).abs());
+                sum += (a - b).abs() as f64;
+            }
+        }
+        let mean = sum / (pairs.len() * 128) as f64;
+        eprintln!("descriptor bytes: worst {worst}, mean {mean:.5}");
+        assert!(worst <= 3.0 && mean < 0.02, "worst {worst} mean {mean}");
+        // A second image of the same size reuses the plan.
+        let (gk2, gd2) = gpu.extract(&image, &config).unwrap();
+        assert_eq!(gk, gk2);
+        assert_eq!(gd, gd2);
+    }
+
+    /// An octave with more candidates than the buffer holds is redone with
+    /// a larger one, and the result does not depend on the starting size.
+    #[test]
+    fn candidate_overflow_grows_the_buffer() {
+        let Some(ctx) = try_context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (w, h) = (160, 112);
+        let px = texture(w, h);
+        let image = GrayImage::new(w, h, &px).unwrap();
+        let config = photos_config();
+        let mut small = VlfeatSiftGpu::with_capacity(ctx, 4);
+        let (sk, sd) = small.extract(&image, &config).unwrap();
+        assert!(small.cap > 4, "capacity grew to {}", small.cap);
+        let mut big = VlfeatSiftGpu::new(small.into_context());
+        let (bk, bd) = big.extract(&image, &config).unwrap();
+        assert!(!sk.is_empty());
+        assert_eq!(sk, bk);
+        assert_eq!(sd, bd);
+    }
+
+    /// Alternating image sizes rebuild the plan each time and give what a
+    /// fresh extractor gives.
+    #[test]
+    fn image_sizes_can_alternate() {
+        let Some(ctx) = try_context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let config = photos_config();
+        let small = texture(160, 112);
+        let large = texture(256, 176);
+        let small_image = GrayImage::new(160, 112, &small).unwrap();
+        let large_image = GrayImage::new(256, 176, &large).unwrap();
+        let mut gpu = VlfeatSiftGpu::new(ctx);
+        let first_small = gpu.extract(&small_image, &config).unwrap();
+        let first_large = gpu.extract(&large_image, &config).unwrap();
+        let second_small = gpu.extract(&small_image, &config).unwrap();
+        let second_large = gpu.extract(&large_image, &config).unwrap();
+        assert_eq!(first_small, second_small);
+        assert_eq!(first_large, second_large);
+        let mut fresh = VlfeatSiftGpu::new(gpu.into_context());
+        assert_eq!(fresh.extract(&large_image, &config).unwrap(), first_large);
+    }
+
+    /// The per-level feature cap keeps a suffix of whole (octave, level)
+    /// groups, counted in unoriented extrema, like the CPU path.
+    #[test]
+    fn feature_cap_matches_the_cpu_path() {
+        let Some(ctx) = try_context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (w, h) = (256, 176);
+        let px = texture(w, h);
+        let image = GrayImage::new(w, h, &px).unwrap();
+        let mut gpu = VlfeatSiftGpu::new(ctx);
+        for max_keypoints in [10, 40, 70] {
+            let config = SiftConfig {
+                max_keypoints,
+                ..photos_config()
+            };
+            let (ck, _) = extract_sift(&image, &config).unwrap();
+            let (gk, _) = gpu.extract(&image, &config).unwrap();
+            let pairs = pair_up(&ck, &gk);
+            assert!(
+                pairs.len() + 1 >= ck.len() && pairs.len() + 1 >= gk.len(),
+                "max {max_keypoints}: cpu {} gpu {} paired {}",
+                ck.len(),
+                gk.len(),
+                pairs.len()
+            );
+        }
+    }
+}

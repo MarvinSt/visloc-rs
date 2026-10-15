@@ -18,6 +18,8 @@ mod descriptor_matcher;
 mod extractor;
 #[cfg(feature = "gpu")]
 mod matcher;
+#[cfg(feature = "gpu")]
+mod vlfeat;
 
 #[cfg(feature = "gpu")]
 pub use descriptor_matcher::WgpuDescriptorMatcher;
@@ -27,6 +29,8 @@ pub use extractor::{SiftGpu, SiftGpuError};
 pub use matcher::{FeatureBank, GpuMatcher};
 #[cfg(feature = "gpu")]
 pub use visloc_gsplat_render::{try_context, GpuContext, GpuError};
+#[cfg(feature = "gpu")]
+pub use vlfeat::VlfeatSiftGpu;
 
 #[cfg(all(test, feature = "gpu"))]
 mod tests {

@@ -64,6 +64,23 @@ The remaining CPs are 0.6–4.2 m off, and their residual vectors vary
 smoothly along the route. A 2D similarity fit with a yaw drift and a scale
 drift that are linear in time explains them (next section).
 
+The ride does not cause that scale error. With the per-device refinement
+and the 0.5 px KLT threshold
+([`lamaria_klt_threshold.md`](lamaria_klt_threshold.md)), a VIO started at
+200 s, after the ride, measures the route as short as one that rode the
+funicular:
+
+| VIO on sequence_5_11 | Full sequence | Started after the ride |
+|---|---:|---:|
+| Scale of the evaluator's Sim(3) alignment | 1.065 | 1.063 |
+| Distance ratio of CP pairs, 264–626 s | 0.916 | 0.925 |
+| Distance ratio of CP pairs, 626–1100 s | 0.948 | 0.946 |
+| Fitted scale drift over the CP span | −5.1 % | −4.6 % |
+
+The ratios compare the estimated and surveyed distances of CP pairs at most
+250 s apart. The same device measures sequence_4_10 at a Sim(3) scale of
+0.998, so the device calibration alone does not explain it either.
+
 ## Drift models fitted to the CP residuals
 
 The fits take the triangulated CPs from the evaluator's output and fit them
@@ -385,3 +402,7 @@ so it stays off.
 4. **The funicular ride.** It is worth at most +5.2 on sequence_5_11. The
    test set's Moving sequences are 11–24 GB, against 10 GB for
    sequence_5_11, and may contain longer rides.
+5. **The scale of sequence_5_11.** The VIO measures the route about 6 %
+   short with or without the ride. Removing the fitted scale drift alone
+   would lift its Score from about 50 to 65 (VIO) and 57 to 75 (mapper),
+   the largest gain left on any track.

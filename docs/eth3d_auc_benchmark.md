@@ -262,12 +262,16 @@ built from source with CUDA and Caspar, its GPU bundle adjuster:
 The same machine and settings as the CPU run above: visloc-rs's matches of
 the 5,822 photos, 21 threads.
 
-| | visloc-rs | visloc-rs, `--gpu-ba 1` | COLMAP global, Caspar |
-|---|---|---|---|
-| Mapper wall time | **19.5 min** | 19.9 min | unfinished, stopped at 90 min |
-| Peak memory | 18.8 GiB | **16.9 GiB** | 31.4 GiB up to the stop |
-| Registered | 5,816 / 5,822 | 5,816 / 5,822 | — |
-| Camera-centre error, median / p90 | 0.281 m / 0.731 m | 0.577 m / 1.946 m | — |
+| | visloc-rs | visloc-rs, `--gpu-ba 1` | COLMAP global, Caspar | COLMAP incremental, Caspar |
+|---|---|---|---|---|
+| Mapper wall time | **19.5 min** | 19.9 min | unfinished, stopped at 90 min | unfinished, stopped at 75 min |
+| Peak memory | 18.8 GiB | 16.9 GiB | 31.4 GiB up to the stop | **5.9 GiB** up to the stop |
+| Registered | 5,816 / 5,822 | 5,816 / 5,822 | — | 5,352 when stopped |
+| Camera-centre error, median / p90 | 0.281 m / 0.731 m | 0.577 m / 1.946 m | — | — |
+
+COLMAP's incremental mapper registered about 1,000 images every 14 minutes
+and would have needed about 80 minutes for all of them, before its last
+global bundle adjustment.
 
 COLMAP's stages up to the stop, against the CPU-only run above (32
 threads). The cap also covered its database (1.4 min) and re-verifying the
@@ -295,6 +299,8 @@ matches (6.6 min):
 - **The GPU bundle adjustment** is not faster on this GPU, and its run parts
   from the CPU run after its first solve
   ([GPU bundle adjustment](gpu_bundle_adjustment.md)).
+- The ETH3D results are in `benchmarks/eth3d_auc_gpu/`, the SmallCity logs
+  in `benchmarks/smallcity_gpu/`.
 
 ## Caveats
 

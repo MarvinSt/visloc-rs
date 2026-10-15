@@ -28,10 +28,11 @@ gate), only `config.optical_flow_max_recovered_dist2` changed from 0.04 to
 |---|---|---|---|---|
 | sequence_4_10 | Low light | 34.49 → **39.00** | 31.62 → 36.65 | 5.5 / 86.5 % → **14.1 / 98.6 %** |
 | sequence_1_19 | Short | 71.96 → **73.79** | 68.54 → 70.08 | 76.3 / 100 % → 74.5 / 100 % |
+| sequence_5_11 | Moving platform | 43.14 → 44.73 | 49.84 → **52.99** | n/a |
 
 On sequence_4_10 the RMSE over separately aligned 60 s segments falls from
 0.442 m to 0.381 m. The VIO takes about 11 % longer, since more tracks
 survive.
 
-Status: better on both tracks measured so far; Medium, Long and Moving
-platform are still to be measured before it becomes the default.
+Status: better on all three tracks measured so far; Medium and Long are
+still to be measured before it becomes the default.

@@ -390,6 +390,21 @@ struct Problem {
     /// Free frames from which the reduced system is solved iteratively
     /// ([`iterative_min_free_frames`]; tests lower it).
     iterative_min_free_frames: usize,
+    /// Unique per problem: lets a [`ReducedSolveAccelerator`] keep what it
+    /// derived from the structure across the trials of one solve.
+    structure_id: u64,
+    /// The free slot of each `point_free_frames` entry, flattened like
+    /// [`Linearization::hcp`]; built only for a registered accelerator's
+    /// point elimination (empty otherwise).
+    point_nodes: Vec<u32>,
+}
+
+/// Source of [`Problem::structure_id`] and of the linearization ids given to
+/// a [`ReducedSolveAccelerator`].
+static NEXT_ACCELERATOR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_accelerator_id() -> u64 {
+    NEXT_ACCELERATOR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Which points observe each free frame of the reduced camera system, in
@@ -830,6 +845,16 @@ fn cluster_preconditioner(
     offdiag: &[Matrix6<f64>],
     k: usize,
 ) -> Option<Vec<(usize, DMatrix<f64>)>> {
+    cluster_inverses(diag, k, edges.iter().copied().zip(offdiag))
+}
+
+/// [`cluster_preconditioner`] from `((a, b), block)` pairs (blocks of edges
+/// outside the runs are ignored).
+fn cluster_inverses<'a>(
+    diag: &[Matrix6<f64>],
+    k: usize,
+    blocks: impl Iterator<Item = ((u32, u32), &'a Matrix6<f64>)>,
+) -> Option<Vec<(usize, DMatrix<f64>)>> {
     let n = diag.len();
     let starts: Vec<usize> = (0..n).step_by(k).collect();
     let mut mats: Vec<DMatrix<f64>> = starts
@@ -843,7 +868,7 @@ fn cluster_preconditioner(
             mat
         })
         .collect();
-    for (&(a, b), blk) in edges.iter().zip(offdiag) {
+    for ((a, b), blk) in blocks {
         let (a, b) = (a as usize, b as usize);
         if a / k != b / k {
             continue;
@@ -977,6 +1002,44 @@ fn coarse_correction(
         view += blk;
         let mut view = a.view_mut((ga, gb), (6, 6));
         view += blk.transpose();
+    }
+    a.cholesky().map(|chol| CoarseCorrection {
+        group,
+        n_frames,
+        chol,
+    })
+}
+
+/// [`coarse_correction`] from per-aggregate-pair block sums
+/// (`sums[g * m + h]`, `g <= h`: the blocks of edges from aggregate `g` to
+/// `h`), as [`crate::ba_accel::EliminatedBlocks::coarse_sums`] returns them;
+/// `group` is already [`coarse_correction`]'s adjusted aggregate size.
+fn coarse_from_sums(
+    diag: &[Matrix6<f64>],
+    sums: &[Matrix6<f64>],
+    n_frames: usize,
+    group: usize,
+) -> Option<CoarseCorrection> {
+    let m = n_frames.div_ceil(group);
+    if m < 2 || sums.len() != m * m {
+        return None;
+    }
+    let mut a = DMatrix::<f64>::zeros(m * 6, m * 6);
+    for (i, d) in diag.iter().enumerate().take(n_frames) {
+        let g = i / group * 6;
+        let mut view = a.view_mut((g, g), (6, 6));
+        view += d;
+    }
+    for g in 0..m {
+        for h in g..m {
+            let sum = &sums[g * m + h];
+            // `sum` adds to the (row h, column g) block, its transpose to
+            // the (row g, column h) block.
+            let mut view = a.view_mut((h * 6, g * 6), (6, 6));
+            view += sum;
+            let mut view = a.view_mut((g * 6, h * 6), (6, 6));
+            view += sum.transpose();
+        }
     }
     a.cholesky().map(|chol| CoarseCorrection {
         group,
@@ -1404,6 +1467,16 @@ fn assemble_problem(
     for frames in &point_free_frames {
         hcp_off.push(hcp_off.last().copied().unwrap_or(0) + frames.len());
     }
+    let point_nodes: Vec<u32> =
+        if contributions.is_some() && crate::ba_accel::reduced_solve_accelerator().is_some() {
+            point_free_frames
+                .iter()
+                .flatten()
+                .map(|&f| free_frame_slot[f as usize].expect("free"))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     Ok(Problem {
         free_frame_slot,
@@ -1422,6 +1495,8 @@ fn assemble_problem(
         n_frames,
         extras,
         iterative_min_free_frames: iterative_min_free_frames(),
+        structure_id: next_accelerator_id(),
+        point_nodes,
     })
 }
 
@@ -2172,18 +2247,7 @@ fn eliminate_by_output(
 ) -> (Vec<Matrix6<f64>>, Vec<Matrix6<f64>>, Vec<Vector6<f64>>) {
     let n_free = problem.n_free_frames;
     let point_pair_edge_idx = &problem.point_pair_edge_idx;
-    let hpp_inv: Vec<Option<Matrix3<f64>>> = lin
-        .points
-        .par_iter()
-        .zip(&problem.point_free_frames)
-        .map(|(pl, frames)| {
-            if !pl.free || frames.is_empty() {
-                None
-            } else {
-                damped_hpp_inverse(&pl.hpp, mu)
-            }
-        })
-        .collect();
+    let hpp_inv = point_inverses(problem, lin, mu);
     // Row `s` (edges `(s, _)`), the diagonal block and the right-hand side
     // of free frame `s` all come from the points observing `s`, in
     // ascending order, so one pass computes them; each row is built in its
@@ -2259,6 +2323,213 @@ fn eliminate_by_output(
     (flat_offdiag, diag_delta, bc_delta)
 }
 
+/// Each point's damped inverse Hessian block, `None` for a point that
+/// contributes nothing to the elimination (fixed, unobserved by free frames,
+/// or degenerate).
+fn point_inverses(problem: &Problem, lin: &Linearization, mu: f64) -> Vec<Option<Matrix3<f64>>> {
+    lin.points
+        .par_iter()
+        .zip(&problem.point_free_frames)
+        .map(|(pl, frames)| {
+            if !pl.free || frames.is_empty() {
+                None
+            } else {
+                damped_hpp_inverse(&pl.hpp, mu)
+            }
+        })
+        .collect()
+}
+
+/// The diagonal blocks and right-hand side of [`eliminate_by_output`]: the
+/// same sums, in the same order (shard partial sums included), without the
+/// off-diagonal pairs.
+fn eliminate_diagonal(
+    problem: &Problem,
+    index: &ContributionIndex,
+    lin: &Linearization,
+    hpp_inv: &[Option<Matrix3<f64>>],
+) -> (Vec<Matrix6<f64>>, Vec<Vector6<f64>>) {
+    (0..problem.n_free_frames)
+        .into_par_iter()
+        .map(|s| {
+            let (mut diag_total, mut diag_acc) = (Matrix6::<f64>::zeros(), Matrix6::zeros());
+            let (mut bc_total, mut bc_acc) = (Vector6::<f64>::zeros(), Vector6::zeros());
+            let mut current_shard = None;
+            for &[p, k] in &index.slot[index.slot_off[s]..index.slot_off[s + 1]] {
+                let (p, k) = (p as usize, k as usize);
+                let Some(inv) = hpp_inv[p] else {
+                    continue;
+                };
+                let point_shard = Some(index.point_shard[p]);
+                if current_shard != point_shard {
+                    if current_shard.is_some() {
+                        diag_total += diag_acc;
+                        bc_total += bc_acc;
+                        diag_acc = Matrix6::zeros();
+                        bc_acc = Vector6::zeros();
+                    }
+                    current_shard = point_shard;
+                }
+                let hcp = lin.hcp(problem, p);
+                let scaled = hcp[k] * inv;
+                diag_acc -= scaled * hcp[k].transpose();
+                bc_acc -= scaled * lin.points[p].bp;
+            }
+            if current_shard.is_some() {
+                diag_total += diag_acc;
+                bc_total += bc_acc;
+            }
+            (diag_total, bc_total)
+        })
+        .unzip()
+}
+
+/// [`solve_step`]'s iterative branch with the point elimination's pairs on
+/// a [`crate::ba_accel::ReducedSolveAccelerator`]: the CPU forms the
+/// diagonal blocks and the right-hand side ([`eliminate_diagonal`], the CPU
+/// path's arithmetic), the accelerator the off-diagonal blocks and the
+/// conjugate gradients, with the preconditioner factored here from the
+/// blocks it returns. `None`: the caller eliminates on the CPU.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+fn solve_step_device_elimination(
+    problem: &Problem,
+    index: &ContributionIndex,
+    lin: &Linearization,
+    linearization_id: u64,
+    accelerator: &dyn crate::ba_accel::ReducedSolveAccelerator,
+    frame_diag_raw: &[Matrix6<f64>],
+    frame_bc_raw: &[Vector6<f64>],
+    offdiag_raw: Option<&[Matrix6<f64>]>,
+    mu: f64,
+    timings: &mut PhaseTimings,
+) -> Option<(Vec<Vector6<f64>>, Vec<Vector3<f64>>, f64)> {
+    if problem.point_nodes.is_empty() {
+        return None;
+    }
+    let n_free = problem.n_free_frames;
+    let edges = &problem.edges;
+    let first_extra = n_free - problem.extras.len();
+    let t = Instant::now();
+    let hpp_inv = point_inverses(problem, lin, mu);
+    let (diag_delta, bc_delta) = eliminate_diagonal(problem, index, lin, &hpp_inv);
+    let scale: Vec<Vector6<f64>> = diag_delta
+        .iter()
+        .map(|d| Vector6::from_fn(|i, _| (-d[(i, i)]).max(0.0).sqrt()))
+        .collect();
+    // Direct couplings only join an extra node (the last nodes, so the
+    // larger end of an edge).
+    let extra: Vec<(u32, Matrix6<f64>)> = offdiag_raw
+        .map(|raw| {
+            edges
+                .iter()
+                .zip(raw)
+                .enumerate()
+                .filter(|(_, (&(_, b), m))| {
+                    b as usize >= first_extra && m.iter().any(|&v| v != 0.0)
+                })
+                .map(|(e, (_, m))| (e as u32, *m))
+                .collect()
+        })
+        .unwrap_or_default();
+    let cluster_k = pcg_cluster_size();
+    let run_edges: Vec<u32> = cluster_k.map_or_else(Vec::new, |k| {
+        (0..edges.len() as u32)
+            .filter(|&e| {
+                let (a, b) = edges[e as usize];
+                a as usize / k == b as usize / k
+            })
+            .collect()
+    });
+    // `coarse_correction`'s aggregate size and coverage.
+    let coarse_spec = pcg_coarse_size()
+        .filter(|_| mu <= PCG_COARSE_MAX_MU)
+        .map(|g| {
+            (
+                g.max(first_extra.div_ceil(PCG_COARSE_MAX_AGGREGATES)),
+                first_extra,
+            )
+        })
+        .filter(|&(group, nodes)| nodes.div_ceil(group) >= 2);
+    let blocks = accelerator.eliminate(&crate::ba_accel::PointElimination {
+        structure_id: problem.structure_id,
+        linearization_id,
+        edges,
+        row_off: &index.row_off,
+        slot_off: &index.slot_off,
+        slots: &index.slot,
+        point_off: &problem.hcp_off,
+        point_nodes: &problem.point_nodes,
+        hcp: &lin.hcp,
+        point_inverse: &hpp_inv,
+        scale: &scale,
+        extra: &extra,
+        run_edges: &run_edges,
+        coarse: coarse_spec,
+    })?;
+    timings.eliminate += t.elapsed();
+
+    let t = Instant::now();
+    let mut frame_diag: Vec<Matrix6<f64>> = frame_diag_raw.to_vec();
+    let mut frame_bc: Vec<Vector6<f64>> = frame_bc_raw.to_vec();
+    for a in 0..n_free {
+        frame_diag[a] += diag_delta[a];
+        frame_bc[a] += bc_delta[a];
+        let d = clamp_diag6(&frame_diag_raw[a]);
+        for i in 0..6 {
+            frame_diag[a][(i, i)] += mu * d[i];
+        }
+    }
+    for e in 0..problem.extras.len() {
+        let free = problem.extras.free(e);
+        for i in (0..6).filter(|&i| !free[i]) {
+            frame_diag[first_extra + e][(i, i)] = 1.0;
+        }
+    }
+    timings.assemble += t.elapsed();
+
+    let t = Instant::now();
+    let clusters = cluster_k.and_then(|k| {
+        cluster_inverses(
+            &frame_diag,
+            k,
+            run_edges
+                .iter()
+                .map(|&e| edges[e as usize])
+                .zip(&blocks.run_blocks),
+        )
+    });
+    let coarse = coarse_spec.and_then(|(group, nodes)| {
+        coarse_from_sums(&frame_diag, &blocks.coarse_sums, nodes, group)
+    });
+    let coarse_inverse = coarse.as_ref().map(CoarseCorrection::inverse);
+    let (dx_frames, iterations) = accelerator.solve(&ReducedCameraSystem {
+        structure_id: problem.structure_id,
+        diag: &frame_diag,
+        edges,
+        offdiag: &[],
+        rhs: &frame_bc,
+        clusters: clusters.as_deref(),
+        coarse: coarse
+            .as_ref()
+            .zip(coarse_inverse.as_ref())
+            .map(|(c, inverse)| (c.group, c.n_frames, inverse)),
+        tol: pcg_relative_tolerance(),
+        max_iterations: PCG_MAX_ITERATIONS,
+    })?;
+    timings.pcg_iterations += iterations;
+    timings.linsolve += t.elapsed();
+    Some(back_substitute(
+        problem,
+        lin,
+        frame_diag_raw,
+        frame_bc_raw,
+        dx_frames,
+        mu,
+        timings,
+    ))
+}
+
 /// Shard count for [`eliminate_and_accumulate`]: capped so the transient
 /// per-shard `edges_len`-sized buffers (`3 shards worth` — see its `local_*`
 /// locals — of `Matrix6` = 288 bytes each) never exceed roughly 256MB in
@@ -2329,6 +2600,7 @@ fn balanced_shard_boundaries(point_free_frames: &[Vec<u32>], n_shards: usize) ->
 fn solve_step(
     problem: &Problem,
     lin: &Linearization,
+    linearization_id: u64,
     edges: &[(u32, u32)],
     frame_diag_raw: &[Matrix6<f64>],
     frame_bc_raw: &[Vector6<f64>],
@@ -2339,6 +2611,29 @@ fn solve_step(
     timings: &mut PhaseTimings,
 ) -> Option<(Vec<Vector6<f64>>, Vec<Vector3<f64>>, f64)> {
     let n_free = problem.n_free_frames;
+    // The iterative branch with the points eliminated by a registered
+    // accelerator; when it declines, the CPU eliminates below.
+    if n_free >= problem.iterative_min_free_frames && order.is_none() {
+        if let (Some(accelerator), Some(index)) = (
+            crate::ba_accel::reduced_solve_accelerator(),
+            &problem.contributions,
+        ) {
+            if let Some(step) = solve_step_device_elimination(
+                problem,
+                index,
+                lin,
+                linearization_id,
+                accelerator,
+                frame_diag_raw,
+                frame_bc_raw,
+                offdiag_raw,
+                mu,
+                timings,
+            ) {
+                return Some(step);
+            }
+        }
+    }
     let t = Instant::now();
     let (mut flat_offdiag, diag_delta, bc_delta) =
         eliminate_and_accumulate(problem, lin, edges.len(), mu);
@@ -2441,6 +2736,7 @@ fn solve_step(
                 });
             let coarse_inverse = coarse.as_ref().map(CoarseCorrection::inverse);
             let system = ReducedCameraSystem {
+                structure_id: problem.structure_id,
                 diag: &frame_diag,
                 edges,
                 offdiag: &offdiag,
@@ -2896,6 +3192,7 @@ fn optimize_problem(
         timings.linearize_calls += 1;
         (0.5 * full, pl, fd, fb, cl)
     };
+    let mut linearization_id = next_accelerator_id();
     let initial_cost = 2.0 * half_cost;
     if problem.n_free_frames >= problem.iterative_min_free_frames
         || std::env::var_os("VISLOC_BA_MEMORY").is_some()
@@ -2965,6 +3262,7 @@ fn optimize_problem(
         let Some((dx_frames, dx_points, predicted)) = solve_step(
             problem,
             &lin,
+            linearization_id,
             &problem.edges,
             &frame_diag_raw,
             &frame_bc_raw,
@@ -3099,6 +3397,7 @@ fn optimize_problem(
             timings.linearize_calls += 1;
             half_cost = 0.5 * full;
             lin = pl;
+            linearization_id = next_accelerator_id();
             frame_diag_raw = fd;
             frame_bc_raw = fb;
             offdiag_raw = cl;

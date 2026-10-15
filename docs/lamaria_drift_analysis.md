@@ -279,6 +279,36 @@ keyframe and the mapper's landmarks. The roll-pitch measurements come from
 the VIO's own keyframe poses, so it is the relative-pose factors, not the
 reprojection terms, that pull the mapper away from the VIO.
 
+Each marginalized keyframe contributes a relative-pose factor to every other
+keyframe in the VIO window, about 30 with the big-window config. The
+information of each factor is the marginal information of that one relative
+pose, so the same IMU and visual information is counted up to 30 times.
+`--relative-pose-max-neighbors 2` (opt-in) keeps only the factors to the two
+keyframes nearest in time. Crossed with loop matching on and off
+(`--no-loop-matching`), on sequence_4_10:
+
+| Mapper on sequence_4_10 | Loops on | Loops off |
+|---|---|---|
+| Factors to every keyframe in the window (default) | 31.62 (R@5m 75.7 %) | 31.70 (76.0 %) |
+| Factors to the 2 nearest keyframes | **34.83 (88.8 %)** | 31.65 (78.2 %) |
+
+The VIO alone scores 34.49 (86.5 %).
+
+- **Loops off:** both versions move the VIO by the same 3 m. The relative
+  poses recovered from the marginalization data do not chain up to the VIO
+  trajectory; the loops are not what bends it.
+- **Default with loops:** the 13 loops of sequence_4_10 change nothing,
+  since the 30-fold relative-pose chain is too stiff to move.
+- **2 nearest keyframes with loops:** the loops pull the trajectory back. The
+  relative-pose and roll-pitch residuals at the optimum fall about 30-fold
+  (9.7e3 and 1.9e3, against 3.0e5 and 3.9e4). This is the first mapper
+  setting that beats the VIO on a track where the default mapper loses.
+
+All 13 accepted loops are short revisits that the pseudo-GT confirms: the
+two keyframes lie 0.1–7.7 m apart and the map distance matches within
+0.6 m. With the 2-neighbor limit the mapper's final optimization takes
+136 s instead of 1,368 s, and the peak memory is 761 MB instead of 1.7 GB.
+
 ### Calibration without ground truth (not usable yet)
 
 - **Camera-only rotations** (KLT + essential matrix on cam0, 150 ms pairs)
@@ -329,9 +359,13 @@ so it stays off.
 ## Open items
 
 1. **Mapper on the refined VIO.** The mapper now loses to the VIO on three
-   of five tracks ([With the online mapper](#with-the-online-mapper)), and
-   a higher relative-pose weight does not help. What is left to separate is
-   whether the loops or the relative-pose factors themselves bend the VIO.
+   of five tracks ([With the online mapper](#with-the-online-mapper)). On
+   sequence_4_10, limiting the relative-pose factors to the 2 nearest
+   keyframes turns that into a small gain. It still has to be measured on
+   the other tracks, including the ones where the default mapper wins.
+   Without loops, the recovered relative poses still drift 3 m away from the
+   VIO; taking the factor measurements from the VIO trajectory itself is
+   the next candidate.
 2. **Calibration without the device table.** The refinement relies on
    both devices having training pseudo-GT. Estimating the gyro delay and the
    IMU-camera rotation online in the VIO would remove that dependency and

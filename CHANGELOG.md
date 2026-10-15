@@ -133,10 +133,15 @@ All notable changes to `visloc-rs` will be documented here.
   - **On the host, as the CPU path does:** the scan order, the per-locus
     orientation cap, the per-level `max_keypoints` cap and each keypoint's
     descriptor level, in f64.
-  - **Against the CPU extractor (f64):** on SmallCity photos 99.96% of the
-    keypoints pair up both ways and descriptor bytes differ by at most one.
-    On 40 SmallCity photos `gsplat_photos` verifies 700 of 780 pairs and
-    registers 40/40 either way.
+  - **Against the CPU extractor (f64):** on 50 SmallCity photos and an RTX
+    3090, 99.97% of the keypoints pair up both ways; descriptor bytes
+    differ by 0.0007 on average and by at most 35 (at most one on
+    llvmpipe). On 40 SmallCity photos `gsplat_photos` verifies 700 of 780
+    pairs and registers 40/40 either way.
+  - **Speed:** on an RTX 3090, SmallCity's 5,822 photos at 1,024 px take
+    43.8 s (7.5 ms a photo), against 201.9 s for the CPU extractor on 23
+    threads. Images of one size are pipelined: the GPU detects the next
+    image while the host orders and caps the current one's candidates.
   - Each pyramid level is its own buffer, so no binding exceeds one level;
     an image past the device's limit is extracted on the CPU.
     `sift_vlfeat_gpu_bench` compares the two extractors on a directory of

@@ -14,9 +14,10 @@
 //!
 //! `VlfeatSiftGpu` runs the VLFeat-compatible path `gsplat_photos` uses
 //! (`vlfeat_compatible_detector` + `vlfeat_compatible_descriptor`, COLMAP's
-//! byte descriptors), also as an f32 port: on SmallCity photos 99.96% of
-//! its keypoints pair up with the CPU extractor's and descriptor bytes
-//! differ by at most one (see `examples/sift_vlfeat_gpu_bench.rs`).
+//! byte descriptors), also as an f32 port: on SmallCity photos and an RTX
+//! 3090, 99.97% of its keypoints pair up with the CPU extractor's and
+//! descriptor bytes differ by 0.0007 on average (see
+//! `examples/sift_vlfeat_gpu_bench.rs`).
 
 #[cfg(feature = "gpu")]
 mod descriptor_matcher;

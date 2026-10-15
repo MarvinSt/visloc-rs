@@ -46,7 +46,7 @@ use visloc_basalt::{
     mapper_online::{
         run_mapper_thread, OnlineIngestReport, OnlineMapperConfig, OnlineNfrMapper, SentImageFilter,
     },
-    vio::MargData,
+    vio::{FramePoseData, FrameStateData, MargData},
     BasaltAdapterError, BasaltAdapterOutput, BasaltVioEstimatorAdapter, EurocSensorDataset,
     RejectReason, TimingBreakdown,
 };
@@ -140,6 +140,9 @@ struct Args {
     /// Relative-pose factors per marginalized keyframe, to the keyframes
     /// nearest in time; None keeps every keyframe in the window.
     relative_pose_max_neighbors: Option<usize>,
+    /// Replace the window poses in each mapper packet with the VIO's own
+    /// per-frame output before the mapper recovers its factors.
+    mapper_vio_output_poses: bool,
     /// Weight for raw preintegrated-IMU mapper edges; None means disabled (0.0).
     imu_preintegration_weight: Option<f64>,
     /// Weight for the joint visual-inertial global BA (full 15-dof-per-
@@ -449,6 +452,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // demo's own bookkeeping/channel-send; it never touches VIO arithmetic,
     // which is what keeps `--pipeline`'s output identical to the serial
     // path's.
+    let mapper_vio_output_poses = args.mapper_vio_output_poses;
     let mut handle_output = |output: BasaltAdapterOutput,
                              _timing: &mut TimingBreakdown|
      -> Result<(), BasaltAdapterError> {
@@ -469,6 +473,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         if output.estimator.marg_data.is_mapper_packet() {
             let mut marg_data = output.estimator.marg_data;
+            if mapper_vio_output_poses {
+                use_vio_output_poses(
+                    &mut marg_data.frame_poses,
+                    &mut marg_data.frame_states,
+                    &vio_trajectory,
+                );
+            }
             sent_images.strip_sent(&mut marg_data);
             let depth_after_send = {
                 let mut guard = send_times.lock().expect("lock");
@@ -978,6 +989,36 @@ fn tum_string(poses: &[(i64, SE3)]) -> String {
 /// boundary and shows up as relative-pose error. Keyframes themselves are
 /// still exact, and frames before the first or after the last keyframe use
 /// that keyframe's correction.
+/// Overwrite the poses of a mapper packet with the VIO's per-frame output.
+///
+/// A packet carries the window's current estimates at marginalization time.
+/// Chained by the mapper, they can end far from the trajectory the VIO
+/// reports frame by frame: 3 m on LaMAria sequence_4_10 without loops. With
+/// the output poses, the relative-pose and roll-pitch factors measure the
+/// VIO's own trajectory; their information is unchanged. Frames the VIO has
+/// not reported keep their packet pose.
+fn use_vio_output_poses(
+    frame_poses: &mut [FramePoseData],
+    frame_states: &mut [FrameStateData],
+    vio_trajectory: &BTreeMap<u64, (i64, SE3)>,
+) {
+    let to_array = |pose: &SE3| {
+        let q = pose.rotation.quaternion();
+        let t = pose.translation;
+        [t.x, t.y, t.z, q.w, q.i, q.j, q.k]
+    };
+    for frame in frame_poses.iter_mut() {
+        if let Some((_, pose)) = vio_trajectory.get(&frame.frame_id) {
+            frame.pose = to_array(pose);
+        }
+    }
+    for state in frame_states.iter_mut() {
+        if let Some((_, pose)) = vio_trajectory.get(&state.frame_id) {
+            state.pose = to_array(pose);
+        }
+    }
+}
+
 fn propagate_interpolated(
     vio_trajectory: &BTreeMap<u64, (i64, SE3)>,
     mapper_poses: &BTreeMap<u64, SE3>,
@@ -1060,6 +1101,7 @@ impl Args {
         let mut joint_vi_ba_weight = None;
         let mut relative_pose_weight = None;
         let mut relative_pose_max_neighbors = None;
+        let mut mapper_vio_output_poses = false;
         let mut roll_pitch_weight = None;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -1218,6 +1260,7 @@ impl Args {
                             .map_err(|error| format!("invalid --relative-pose-weight: {error}"))?,
                     );
                 }
+                "--mapper-vio-output-poses" => mapper_vio_output_poses = true,
                 "--relative-pose-max-neighbors" => {
                     relative_pose_max_neighbors = Some(
                         next(&mut arguments, &option)?
@@ -1305,6 +1348,7 @@ impl Args {
             joint_vi_ba_weight,
             relative_pose_weight,
             relative_pose_max_neighbors,
+            mapper_vio_output_poses,
             roll_pitch_weight,
         })
     }
@@ -1321,7 +1365,8 @@ impl Args {
          [--loop-match-max-rot-error DEG] \
          [--loop-closure-factors] [--loop-closure-min-corr N] [--loop-closure-weight W] \
          [--loop-closure-max-rot-error DEG] [--local-ba-window N] [--local-ba-iterations N] \
-         [--relative-pose-weight W] [--relative-pose-max-neighbors N] [--roll-pitch-weight W] \
+         [--relative-pose-weight W] [--relative-pose-max-neighbors N] [--mapper-vio-output-poses] \
+         [--roll-pitch-weight W] \
          [--imu-preintegration-weight W] [--joint-vi-ba-weight W]"
             .into()
     }
@@ -1339,6 +1384,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vio_output_poses_replace_reported_frames_only() {
+        let pose = |x: f64| [x, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        let mut frame_poses = vec![
+            FramePoseData {
+                frame_id: 1,
+                timestamp_ns: 10,
+                pose: pose(1.0),
+                is_keyframe: true,
+            },
+            FramePoseData {
+                frame_id: 2,
+                timestamp_ns: 20,
+                pose: pose(2.0),
+                is_keyframe: true,
+            },
+        ];
+        let mut frame_states = vec![FrameStateData {
+            frame_id: 3,
+            timestamp_ns: 30,
+            pose: pose(3.0),
+            velocity: [0.0; 3],
+            gyro_bias: [0.0; 3],
+            accel_bias: [0.0; 3],
+            linearized: false,
+            is_keyframe: false,
+            is_latest: true,
+        }];
+        let rotation = nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, 0.5);
+        let reported = SE3::new(rotation, nalgebra::Vector3::new(7.0, 8.0, 9.0));
+        let vio_trajectory: BTreeMap<u64, (i64, SE3)> =
+            [(1, (10, reported.clone())), (3, (30, reported.clone()))].into();
+        use_vio_output_poses(&mut frame_poses, &mut frame_states, &vio_trajectory);
+        let q = rotation.quaternion();
+        let expected = [7.0, 8.0, 9.0, q.w, q.i, q.j, q.k];
+        assert_eq!(frame_poses[0].pose, expected);
+        assert_eq!(frame_poses[1].pose, pose(2.0));
+        assert_eq!(frame_states[0].pose, expected);
+    }
 
     #[test]
     fn parser_requires_euroc_dir_and_calibration() {

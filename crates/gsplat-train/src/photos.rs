@@ -555,18 +555,28 @@ pub fn build_photo_dataset(
             ));
             for chunk in decoded.chunks(256) {
                 let grays: Vec<Vec<f32>> = chunk.par_iter().map(|(img, _)| gray_of(img)).collect();
-                for g in &grays {
-                    let gray = GrayImage::new(width as usize, height as usize, g)
-                        .map_err(|e| EurocError::Sift(format!("{e}")))?;
-                    // An image past the device's binding limit: the CPU.
-                    let (kps, desc) = match vl.extract(&gray, &sift_cfg) {
-                        Err(visloc_sift_gpu::SiftGpuError::Unsupported) => {
-                            extract_sift(&gray, &sift_cfg)
-                                .map_err(|e| EurocError::Sift(format!("{e}")))?
+                let images = grays
+                    .iter()
+                    .map(|g| GrayImage::new(width as usize, height as usize, g))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| EurocError::Sift(format!("{e}")))?;
+                // Pipelined: the GPU detects the next photo while the host
+                // handles the current one. Photos past the device's binding
+                // limit go to the CPU.
+                match vl.extract_batch(&images, &sift_cfg) {
+                    Err(visloc_sift_gpu::SiftGpuError::Unsupported) => {
+                        for gray in &images {
+                            let (kps, desc) = extract_sift(gray, &sift_cfg)
+                                .map_err(|e| EurocError::Sift(format!("{e}")))?;
+                            features.push(to_features(kps, desc));
                         }
-                        other => other.map_err(|e| EurocError::Sift(format!("{e}")))?,
-                    };
-                    features.push(to_features(kps, desc));
+                    }
+                    other => {
+                        let results = other.map_err(|e| EurocError::Sift(format!("{e}")))?;
+                        for (kps, desc) in results {
+                            features.push(to_features(kps, desc));
+                        }
+                    }
                 }
             }
             if cfg.gpu {

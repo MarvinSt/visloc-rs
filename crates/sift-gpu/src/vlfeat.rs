@@ -117,6 +117,8 @@ struct Plan {
     args: wgpu::Buffer,
     /// Host-readable copy of the counters and candidates.
     staging: wgpu::Buffer,
+    /// `vl_describe`'s buffers for this plan's gradients (grown on demand).
+    desc: Option<DescBuffers>,
     // Kept alive for the bind groups.
     _levels: Vec<wgpu::Buffer>,
     _params: wgpu::Buffer,
@@ -149,8 +151,9 @@ pub struct VlfeatSiftGpu {
     ctx: GpuContext,
     pipes: Pipes,
     cap: usize,
-    plan: Option<Plan>,
-    desc: Option<DescBuffers>,
+    /// One plan for `extract`; `extract_batch` alternates two, so one image
+    /// is detected while the host handles the previous one.
+    plans: Vec<Plan>,
 }
 
 /// One refined DoG extremum read back from the GPU.
@@ -322,15 +325,14 @@ fn staging_buffer(device: &wgpu::Device, bytes: u64) -> wgpu::Buffer {
     })
 }
 
-/// Copy `(buffer, byte offset, length)` ranges through `staging` into one
-/// host vector, after the work in `encoder`.
-fn read_ranges(
-    device: &wgpu::Device,
+/// Encode copies of `(buffer, byte offset, length)` ranges into `staging`
+/// after the work in `encoder` and submit it all; the bytes copied.
+fn submit_copies(
     queue: &wgpu::Queue,
     mut encoder: wgpu::CommandEncoder,
     staging: &wgpu::Buffer,
     ranges: &[(&wgpu::Buffer, u64, u64)],
-) -> Vec<u8> {
+) -> (wgpu::SubmissionIndex, u64) {
     let mut at = 0u64;
     for &(buffer, offset, len) in ranges {
         if len > 0 {
@@ -338,16 +340,31 @@ fn read_ranges(
             at += len;
         }
     }
-    queue.submit(Some(encoder.finish()));
-    if at == 0 {
+    (queue.submit(Some(encoder.finish())), at)
+}
+
+/// The first `len` bytes of `staging` once submission `index` is done (not
+/// waiting for later submissions).
+fn map_read(
+    device: &wgpu::Device,
+    staging: &wgpu::Buffer,
+    index: wgpu::SubmissionIndex,
+    len: u64,
+) -> Vec<u8> {
+    if len == 0 {
         return Vec::new();
     }
-    let slice = staging.slice(..at);
+    let slice = staging.slice(..len);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
-    device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: None,
+        })
+        .ok();
     let _ = rx.recv();
     let data = slice.get_mapped_range().expect("map range").to_vec();
     staging.unmap();
@@ -392,8 +409,7 @@ impl VlfeatSiftGpu {
             ctx,
             pipes,
             cap: INITIAL_CAP,
-            plan: None,
-            desc: None,
+            plans: Vec::new(),
         }
     }
 
@@ -435,6 +451,71 @@ impl VlfeatSiftGpu {
         image: &GrayImage<'_>,
         config: &SiftConfig,
     ) -> Result<(Vec<SiftKeypoint>, Vec<Vec<f32>>), SiftGpuError> {
+        Self::check(image, config)?;
+        let candidates = loop {
+            self.ensure_plans(PlanKey::new(image.width, image.height, self.cap, config), 1)?;
+            let index = self.submit_detect(0, image);
+            match self.read_counts(0, index) {
+                Ok(counts) => {
+                    let (index, len) = self.submit_candidate_copy(0, &counts);
+                    break self.read_candidates(0, index, &counts, len);
+                }
+                Err(needed) => self.cap = needed.next_power_of_two(),
+            }
+        };
+        let keypoints = select_keypoints(candidates, config);
+        let descriptors = self.describe(0, &keypoints, config);
+        Ok((keypoints, descriptors))
+    }
+
+    /// [`Self::extract`] for each image, with the same results; images of
+    /// one size are pipelined: the next image is detected on the GPU while
+    /// the host orders and caps the current one's candidates.
+    #[allow(clippy::type_complexity)]
+    pub fn extract_batch(
+        &mut self,
+        images: &[GrayImage<'_>],
+        config: &SiftConfig,
+    ) -> Result<Vec<(Vec<SiftKeypoint>, Vec<Vec<f32>>)>, SiftGpuError> {
+        let same_size = images
+            .windows(2)
+            .all(|w| (w[0].width, w[0].height) == (w[1].width, w[1].height));
+        if images.len() < 2 || !same_size {
+            return images.iter().map(|im| self.extract(im, config)).collect();
+        }
+        for image in images {
+            Self::check(image, config)?;
+        }
+        let (w0, h0) = (images[0].width, images[0].height);
+        self.ensure_plans(PlanKey::new(w0, h0, self.cap, config), 2)?;
+        let mut out = Vec::with_capacity(images.len());
+        let mut pending = self.submit_detect(0, &images[0]);
+        for i in 0..images.len() {
+            let p = i % 2;
+            let counts = match self.read_counts(p, pending.clone()) {
+                Ok(counts) => counts,
+                Err(needed) => {
+                    // An octave overflowed: grow, and finish one at a time.
+                    self.cap = needed.next_power_of_two();
+                    for image in &images[i..] {
+                        out.push(self.extract(image, config)?);
+                    }
+                    return Ok(out);
+                }
+            };
+            let (index, len) = self.submit_candidate_copy(p, &counts);
+            if i + 1 < images.len() {
+                pending = self.submit_detect(1 - p, &images[i + 1]);
+            }
+            let candidates = self.read_candidates(p, index, &counts, len);
+            let keypoints = select_keypoints(candidates, config);
+            let descriptors = self.describe(p, &keypoints, config);
+            out.push((keypoints, descriptors));
+        }
+        Ok(out)
+    }
+
+    fn check(image: &GrayImage<'_>, config: &SiftConfig) -> Result<(), SiftGpuError> {
         if !Self::supports(config) {
             return Err(SiftGpuError::Unsupported);
         }
@@ -445,22 +526,19 @@ impl VlfeatSiftGpu {
                 height: h0,
             });
         }
-        let candidates = loop {
-            let key = PlanKey::new(w0, h0, self.cap, config);
-            if self.plan.as_ref().map(|p| p.key) != Some(key) {
-                // The descriptor bind groups read the old plan's gradients.
-                self.desc = None;
-                self.plan = None;
-                self.plan = Some(self.build_plan(key)?);
-            }
-            match self.detect(image) {
-                Ok(candidates) => break candidates,
-                Err(needed) => self.cap = needed.next_power_of_two(),
-            }
-        };
-        let keypoints = select_keypoints(candidates, config);
-        let descriptors = self.describe(&keypoints, config);
-        Ok((keypoints, descriptors))
+        Ok(())
+    }
+
+    /// At least `count` plans for `key` (rebuilt when the key changed).
+    fn ensure_plans(&mut self, key: PlanKey, count: usize) -> Result<(), SiftGpuError> {
+        if self.plans.first().map(|p| p.key) != Some(key) {
+            self.plans.clear();
+        }
+        while self.plans.len() < count {
+            let plan = self.build_plan(key)?;
+            self.plans.push(plan);
+        }
+        Ok(())
     }
 
     fn build_plan(&self, key: PlanKey) -> Result<Plan, SiftGpuError> {
@@ -799,17 +877,17 @@ impl VlfeatSiftGpu {
             args,
             staging,
             grad,
+            desc: None,
             _levels: levels_kept,
             _params: params,
             passes,
         })
     }
 
-    /// Both scale spaces, the refined extrema and their orientations, read
-    /// back. `Err(needed)` when an octave's candidates overflowed the
-    /// capacity.
-    fn detect(&self, image: &GrayImage<'_>) -> Result<Vec<Candidate>, usize> {
-        let plan = self.plan.as_ref().expect("plan");
+    /// Upload `image` to plan `p` and submit both scale spaces, the refined
+    /// extrema, their orientations and the counters' copy.
+    fn submit_detect(&self, p: usize, image: &GrayImage<'_>) -> wgpu::SubmissionIndex {
+        let plan = &self.plans[p];
         let dev = &self.ctx.device;
         let queue = &self.ctx.queue;
         let (w0, h0) = (image.width, image.height);
@@ -820,11 +898,6 @@ impl VlfeatSiftGpu {
         let mut encoder = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("vl-detect"),
         });
-        let new_encoder = || {
-            dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("vl-readback"),
-            })
-        };
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("vl-detect"),
@@ -841,26 +914,49 @@ impl VlfeatSiftGpu {
                 }
             }
         }
-        let counts: Vec<u32> = bytemuck::cast_slice(&read_ranges(
-            dev,
-            queue,
-            encoder,
-            &plan.staging,
-            &[(&plan.counters, 0, (n_det * 4) as u64)],
-        ))
-        .to_vec();
-        let cap = plan.key.cap;
-        if let Some(&max) = counts.iter().max() {
-            if max as usize > cap {
-                return Err(max as usize);
-            }
+        let counters = [(&plan.counters, 0, (n_det * 4) as u64)];
+        submit_copies(queue, encoder, &plan.staging, &counters).0
+    }
+
+    /// Plan `p`'s candidate counts per octave, `Err(needed)` when one
+    /// overflowed the capacity.
+    fn read_counts(&self, p: usize, index: wgpu::SubmissionIndex) -> Result<Vec<u32>, usize> {
+        let plan = &self.plans[p];
+        let n_det = plan.det_dims.len();
+        let bytes = map_read(&self.ctx.device, &plan.staging, index, (n_det * 4) as u64);
+        let counts: Vec<u32> = bytemuck::cast_slice(&bytes).to_vec();
+        match counts.iter().max() {
+            Some(&max) if max as usize > plan.key.cap => Err(max as usize),
+            _ => Ok(counts),
         }
+    }
+
+    /// Submit the copy of plan `p`'s candidates; the bytes copied.
+    fn submit_candidate_copy(&self, p: usize, counts: &[u32]) -> (wgpu::SubmissionIndex, u64) {
+        let plan = &self.plans[p];
         let ranges: Vec<(&wgpu::Buffer, u64, u64)> = counts
             .iter()
             .zip(&plan.cand)
             .map(|(&c, buffer)| (buffer, 0, (c as usize * CAND_WORDS * 4) as u64))
             .collect();
-        let bytes = read_ranges(dev, queue, new_encoder(), &plan.staging, &ranges);
+        let encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vl-readback"),
+            });
+        submit_copies(&self.ctx.queue, encoder, &plan.staging, &ranges)
+    }
+
+    /// Plan `p`'s candidates, octave by octave.
+    fn read_candidates(
+        &self,
+        p: usize,
+        index: wgpu::SubmissionIndex,
+        counts: &[u32],
+        len: u64,
+    ) -> Vec<Candidate> {
+        let bytes = map_read(&self.ctx.device, &self.plans[p].staging, index, len);
         let raw: &[u32] = bytemuck::cast_slice(&bytes);
         let mut candidates = Vec::with_capacity(raw.len() / CAND_WORDS);
         let mut chunks = raw.chunks_exact(CAND_WORDS);
@@ -884,16 +980,21 @@ impl VlfeatSiftGpu {
                 });
             }
         }
-        Ok(candidates)
+        candidates
     }
 
     /// Descriptors of `keypoints`, one dispatch per gradient level with that
     /// level's keypoints.
-    fn describe(&mut self, keypoints: &[SiftKeypoint], config: &SiftConfig) -> Vec<Vec<f32>> {
+    fn describe(
+        &mut self,
+        p: usize,
+        keypoints: &[SiftKeypoint],
+        config: &SiftConfig,
+    ) -> Vec<Vec<f32>> {
         if keypoints.is_empty() {
             return Vec::new();
         }
-        let plan = self.plan.as_ref().expect("plan");
+        let plan = &self.plans[p];
         let s = plan.key.intervals;
         let k = 2.0f64.powf(1.0 / s as f64);
         let base = (plan.key.sigma_base.max(1e-3) / 2.0).max(plan.key.sigma_input);
@@ -920,7 +1021,7 @@ impl VlfeatSiftGpu {
         let n = keypoints.len();
         let dev = &self.ctx.device;
         let queue = &self.ctx.queue;
-        if self.desc.as_ref().is_none_or(|d| d.capacity < n) {
+        if plan.desc.as_ref().is_none_or(|d| d.capacity < n) {
             let capacity = n.next_power_of_two().max(1024);
             let none = wgpu::BufferUsages::empty();
             let params = dev.create_buffer(&wgpu::BufferDescriptor {
@@ -962,7 +1063,7 @@ impl VlfeatSiftGpu {
                     })
                 })
                 .collect();
-            self.desc = Some(DescBuffers {
+            self.plans[p].desc = Some(DescBuffers {
                 capacity,
                 params,
                 kps,
@@ -971,7 +1072,7 @@ impl VlfeatSiftGpu {
                 binds,
             });
         }
-        let desc = self.desc.as_ref().expect("descriptor buffers");
+        let desc = self.plans[p].desc.as_ref().expect("descriptor buffers");
         let l1 = matches!(config.normalization, SiftNormalization::L1Root) as u32;
         let mut slots = Slots::default();
         for &(first, num) in &ranges {
@@ -998,13 +1099,13 @@ impl VlfeatSiftGpu {
                 pass.dispatch_workgroups(groups.0, groups.1, groups.2);
             }
         }
-        let bytes = read_ranges(
-            dev,
+        let (index, len) = submit_copies(
             queue,
             encoder,
             &desc.staging,
             &[(&desc.out, 0, (n * 128) as u64)],
         );
+        let bytes = map_read(dev, &desc.staging, index, len);
         let mut descriptors = vec![Vec::new(); n];
         for (at, &i) in order.iter().enumerate() {
             descriptors[i] = bytes[at * 128..(at + 1) * 128]
@@ -1298,6 +1399,39 @@ mod tests {
         assert_eq!(first_large, second_large);
         let mut fresh = VlfeatSiftGpu::new(gpu.into_context());
         assert_eq!(fresh.extract(&large_image, &config).unwrap(), first_large);
+    }
+
+    /// The pipelined batch gives each image what `extract` gives it, also
+    /// across an overflow that grows the candidate buffer midway.
+    #[test]
+    fn batch_matches_one_at_a_time() {
+        let Some(ctx) = try_context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let config = photos_config();
+        let (w, h) = (192, 128);
+        let pixels: Vec<Vec<f32>> = (0..5)
+            .map(|i| {
+                let mut px = texture(w + 8 * i, h);
+                px.truncate(w * h);
+                px
+            })
+            .collect();
+        let images: Vec<GrayImage> = pixels
+            .iter()
+            .map(|px| GrayImage::new(w, h, px).unwrap())
+            .collect();
+        let mut one = VlfeatSiftGpu::new(ctx);
+        let expected: Vec<_> = images
+            .iter()
+            .map(|im| one.extract(im, &config).unwrap())
+            .collect();
+        let mut batch = VlfeatSiftGpu::new(one.into_context());
+        assert_eq!(batch.extract_batch(&images, &config).unwrap(), expected);
+        let mut small = VlfeatSiftGpu::with_capacity(batch.into_context(), 4);
+        assert_eq!(small.extract_batch(&images, &config).unwrap(), expected);
+        assert!(small.cap > 4);
     }
 
     /// The per-level feature cap keeps a suffix of whole (octave, level)

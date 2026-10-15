@@ -474,9 +474,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if output.estimator.marg_data.is_mapper_packet() {
             let mut marg_data = output.estimator.marg_data;
             if mapper_vio_output_poses {
-                use_vio_output_poses(
-                    &mut marg_data.frame_poses,
-                    &mut marg_data.frame_states,
+                marg_data.measurement_poses = vio_output_poses(
+                    &marg_data.frame_poses,
+                    &marg_data.frame_states,
                     &vio_trajectory,
                 );
             }
@@ -975,6 +975,44 @@ fn tum_string(poses: &[(i64, SE3)]) -> String {
     buffer
 }
 
+/// The VIO's per-frame output for every frame of a mapper packet, as the
+/// packet's `measurement_poses`.
+///
+/// A packet carries the window's current estimates at marginalization time.
+/// Chained by the mapper, they can end far from the trajectory the VIO
+/// reports frame by frame: 3 m on LaMAria sequence_4_10 without loops. With
+/// the output poses as measurements, the relative-pose and roll-pitch
+/// factors measure the VIO's own trajectory; their information still comes
+/// from the packet. Frames the VIO has not reported are left out and keep
+/// their packet pose.
+fn vio_output_poses(
+    frame_poses: &[FramePoseData],
+    frame_states: &[FrameStateData],
+    vio_trajectory: &BTreeMap<u64, (i64, SE3)>,
+) -> Vec<FramePoseData> {
+    let frames = frame_poses
+        .iter()
+        .map(|frame| (frame.frame_id, frame.is_keyframe))
+        .chain(
+            frame_states
+                .iter()
+                .map(|state| (state.frame_id, state.is_keyframe)),
+        );
+    frames
+        .filter_map(|(frame_id, is_keyframe)| {
+            let (timestamp_ns, pose) = vio_trajectory.get(&frame_id)?;
+            let q = pose.rotation.quaternion();
+            let t = pose.translation;
+            Some(FramePoseData {
+                frame_id,
+                timestamp_ns: *timestamp_ns,
+                pose: [t.x, t.y, t.z, q.w, q.i, q.j, q.k],
+                is_keyframe,
+            })
+        })
+        .collect()
+}
+
 /// Like [`propagate_to_all_frames`], but the correction applied to a frame
 /// between keyframes `k0 < f < k1` is interpolated on SE(3) by timestamp:
 ///
@@ -989,36 +1027,6 @@ fn tum_string(poses: &[(i64, SE3)]) -> String {
 /// boundary and shows up as relative-pose error. Keyframes themselves are
 /// still exact, and frames before the first or after the last keyframe use
 /// that keyframe's correction.
-/// Overwrite the poses of a mapper packet with the VIO's per-frame output.
-///
-/// A packet carries the window's current estimates at marginalization time.
-/// Chained by the mapper, they can end far from the trajectory the VIO
-/// reports frame by frame: 3 m on LaMAria sequence_4_10 without loops. With
-/// the output poses, the relative-pose and roll-pitch factors measure the
-/// VIO's own trajectory; their information is unchanged. Frames the VIO has
-/// not reported keep their packet pose.
-fn use_vio_output_poses(
-    frame_poses: &mut [FramePoseData],
-    frame_states: &mut [FrameStateData],
-    vio_trajectory: &BTreeMap<u64, (i64, SE3)>,
-) {
-    let to_array = |pose: &SE3| {
-        let q = pose.rotation.quaternion();
-        let t = pose.translation;
-        [t.x, t.y, t.z, q.w, q.i, q.j, q.k]
-    };
-    for frame in frame_poses.iter_mut() {
-        if let Some((_, pose)) = vio_trajectory.get(&frame.frame_id) {
-            frame.pose = to_array(pose);
-        }
-    }
-    for state in frame_states.iter_mut() {
-        if let Some((_, pose)) = vio_trajectory.get(&state.frame_id) {
-            state.pose = to_array(pose);
-        }
-    }
-}
-
 fn propagate_interpolated(
     vio_trajectory: &BTreeMap<u64, (i64, SE3)>,
     mapper_poses: &BTreeMap<u64, SE3>,
@@ -1386,9 +1394,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vio_output_poses_replace_reported_frames_only() {
+    fn vio_output_poses_cover_reported_frames_only() {
         let pose = |x: f64| [x, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
-        let mut frame_poses = vec![
+        let frame_poses = vec![
             FramePoseData {
                 frame_id: 1,
                 timestamp_ns: 10,
@@ -1402,7 +1410,7 @@ mod tests {
                 is_keyframe: true,
             },
         ];
-        let mut frame_states = vec![FrameStateData {
+        let frame_states = vec![FrameStateData {
             frame_id: 3,
             timestamp_ns: 30,
             pose: pose(3.0),
@@ -1417,12 +1425,19 @@ mod tests {
         let reported = SE3::new(rotation, nalgebra::Vector3::new(7.0, 8.0, 9.0));
         let vio_trajectory: BTreeMap<u64, (i64, SE3)> =
             [(1, (10, reported.clone())), (3, (30, reported.clone()))].into();
-        use_vio_output_poses(&mut frame_poses, &mut frame_states, &vio_trajectory);
+        let measured = vio_output_poses(&frame_poses, &frame_states, &vio_trajectory);
         let q = rotation.quaternion();
         let expected = [7.0, 8.0, 9.0, q.w, q.i, q.j, q.k];
-        assert_eq!(frame_poses[0].pose, expected);
-        assert_eq!(frame_poses[1].pose, pose(2.0));
-        assert_eq!(frame_states[0].pose, expected);
+        assert_eq!(
+            measured
+                .iter()
+                .map(|f| (f.frame_id, f.timestamp_ns, f.pose, f.is_keyframe))
+                .collect::<Vec<_>>(),
+            vec![(1, 10, expected, true), (3, 30, expected, false)]
+        );
+        // The packet's own poses stay untouched for the FEJ contract.
+        assert_eq!(frame_poses[0].pose, pose(1.0));
+        assert_eq!(frame_states[0].pose, pose(3.0));
     }
 
     #[test]

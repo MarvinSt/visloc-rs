@@ -4216,6 +4216,7 @@ impl BasaltVioEstimator {
             frame_poses_fej,
             frame_states_fej,
             fej_complete: true,
+            measurement_poses: Vec::new(),
             // The pinned VIO path writes `MargData::use_imu = true` for every
             // mapper packet, even when a synthetic packet has no retained
             // link after the active-window shift.  Keep the richer Rust
@@ -4358,6 +4359,7 @@ impl BasaltVioEstimator {
             frame_poses_fej,
             frame_states_fej,
             fej_complete: true,
+            measurement_poses: Vec::new(),
             used_imu: !self.imu_links.is_empty(),
             provenance_version: "basalt-0f3b2b52".into(),
         }

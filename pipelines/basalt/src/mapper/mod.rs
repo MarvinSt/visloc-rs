@@ -3652,9 +3652,12 @@ pub fn relPoseError(
     rel_pose_error(measured, pose_i, pose_j)
 }
 
+/// The pose a recovered factor measures for `frame_id`: the packet's
+/// `measurement_poses` entry when it has one, else its own window estimate.
 fn pose_for_id(data: &MargData, frame_id: u64) -> Option<[f64; 7]> {
-    data.frame_poses
+    data.measurement_poses
         .iter()
+        .chain(&data.frame_poses)
         .find(|pose| pose.frame_id == frame_id)
         .map(|pose| pose.pose)
         .or_else(|| {
@@ -4285,6 +4288,7 @@ mod ba_tests {
             frame_poses_fej: Default::default(),
             frame_states_fej: Default::default(),
             fej_complete: false,
+            measurement_poses: Vec::new(),
             used_imu: false,
             provenance_version: "basalt-x".into(),
         }
@@ -4795,6 +4799,7 @@ mod tests {
             frame_poses_fej: Default::default(),
             frame_states_fej: Default::default(),
             fej_complete: false,
+            measurement_poses: Vec::new(),
             used_imu: true,
             provenance_version: "basalt-0f3b2b52".into(),
         }
@@ -4950,6 +4955,7 @@ mod m8_fixture_tests {
             frame_poses_fej: Default::default(),
             frame_states_fej: Default::default(),
             fej_complete: false,
+            measurement_poses: Vec::new(),
             used_imu: input["use_imu"].as_bool().unwrap(),
             provenance_version: "basalt-0f3b2b52".into(),
         };
@@ -5063,6 +5069,45 @@ mod m8_fixture_tests {
             limited.relative_pose.iter().collect::<Vec<_>>(),
             nearest[..2].to_vec()
         );
+    }
+
+    #[test]
+    fn m8b_measures_the_measurement_poses_when_a_packet_has_them() {
+        let (mut data, _root) = fixture();
+        process_marg_data(&mut data).expect("M8a process");
+        let base = extract_nonlinear_factors(&data, MapperConfig::default()).expect("M8b");
+        // The packet's own poses as measurement poses change nothing.
+        data.measurement_poses = data.frame_poses.clone();
+        assert_eq!(
+            extract_nonlinear_factors(&data, MapperConfig::default()).expect("M8b same"),
+            base
+        );
+        // Moving one non-marginalized keyframe moves only its own measurement.
+        let moved = base.relative_pose[0].to;
+        let mut pose = pose_for_id(&data, moved).expect("pose");
+        pose[0] += 1.0;
+        data.measurement_poses = vec![FramePoseData {
+            frame_id: moved,
+            timestamp_ns: 0,
+            pose,
+            is_keyframe: true,
+        }];
+        let shifted = extract_nonlinear_factors(&data, MapperConfig::default()).expect("M8b");
+        assert_eq!(shifted.roll_pitch, base.roll_pitch);
+        for (after, before) in shifted.relative_pose.iter().zip(&base.relative_pose) {
+            let dx: f64 = after
+                .translation
+                .iter()
+                .zip(before.translation)
+                .map(|(a, b)| (a - b).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if after.to == moved {
+                assert!((dx - 1.0).abs() < 1e-9, "moved factor shifts by {dx}");
+            } else {
+                assert_eq!(after, before);
+            }
+        }
     }
 
     #[test]

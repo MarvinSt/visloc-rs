@@ -78,6 +78,7 @@ fn main() {
         frame_poses_fej: BTreeMap::new(),
         frame_states_fej: BTreeMap::new(),
         fej_complete: false,
+        measurement_poses: Vec::new(),
     };
     let pose_map: BTreeMap<u64, [f64; 7]> = data
         .frame_poses

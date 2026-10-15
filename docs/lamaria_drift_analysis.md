@@ -330,6 +330,16 @@ the pseudo-GT confirms (median distance error 0.08 m). With two factors
 per keyframe the relative-pose chain no longer holds the heading over the
 whole sequence, and short loops cannot replace it.
 
+`--mapper-vio-output-poses` takes the factor measurements from the VIO's
+per-frame output instead of the window estimates (the factor information is
+unchanged). With the default factors, on sequence_5_11 with the 0.5 px KLT
+threshold, the mapper then reproduces the VIO: 44.69 against 44.73, a
+constant 0.12 m apart. Its 198 loops move nothing, because the 30-fold
+relative-pose chain is too stiff for them. The default mapper's 52.99 on the
+same run therefore owes its gain over the VIO to the window estimates,
+which on sequence_5_11 chain up to a better trajectory than the VIO output,
+and not to its loops.
+
 All 13 accepted loops are short revisits that the pseudo-GT confirms: the
 two keyframes lie 0.1–7.7 m apart and the map distance matches within
 0.6 m. With the 2-neighbor limit the mapper's final optimization takes

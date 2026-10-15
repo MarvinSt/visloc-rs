@@ -8,7 +8,7 @@
 //!   --pairs-export <VISLOC-COLMAP-1 .bin> --out-colmap <dir> \
 //!   [--random-seed 0] [--num-threads N] [--pose-solver gp3p|dlt6pt]
 //!   [--local-ba-point-policy colmap|window|nopull]
-//!   [--init-image1 ID --init-image2 ID]
+//!   [--init-image1 ID --init-image2 ID] [--gpu-ba 1]
 //! ```
 //!
 //! Loads the same three inputs `DatabaseCache::from_generalized_rig_export`
@@ -21,6 +21,12 @@
 //! path A/B, inlier counts, `num_reg_frames`) and BA events — sourced from
 //! `pipeline::RunResult::log`, which is `IncrementalMapper::log` (this
 //! port's `mapper.rs`) threaded out through `pipeline::run`.
+//!
+//! `--gpu-ba 1` (or `--gpu-pcg 1`; a build with `--features gpu`) moves the
+//! point elimination's off-diagonal blocks and the conjugate gradients of
+//! the large bundle adjustments' reduced camera systems to the GPU
+//! (`visloc_ba_gpu::GpuReducedSolver`); the result then differs from the CPU
+//! solve at the f32 level instead of being bit-identical.
 //!
 //! `--num-threads` is accepted for CLI-surface parity with COLMAP's own
 //! `mapper` tool but is a no-op: this port's mapper is single-threaded (see
@@ -53,6 +59,7 @@ struct Args {
     pose_solver: String,
     local_ba_point_policy: String,
     forced_init_pair: Option<(u64, u64)>,
+    gpu_ba: bool,
 }
 
 fn parse_args() -> Args {
@@ -105,7 +112,29 @@ fn parse_args() -> Args {
             .cloned()
             .unwrap_or_else(|| "colmap".to_string()),
         forced_init_pair,
+        gpu_ba: ["gpu-ba", "gpu-pcg"]
+            .iter()
+            .any(|k| flags.get(*k).is_some_and(|v| v != "0")),
     }
+}
+
+/// Registers the GPU reduced-camera solve; exits when it is unavailable, so
+/// a GPU run never silently falls back to the CPU.
+#[cfg(feature = "gpu")]
+fn enable_gpu_ba() {
+    match visloc_ba_gpu::register_reduced_pcg() {
+        Ok(adapter) => eprintln!("gpu ba: reduced camera systems on {adapter}"),
+        Err(e) => {
+            eprintln!("gpu ba: no GPU ({e})");
+            std::process::exit(2);
+        }
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn enable_gpu_ba() {
+    eprintln!("gpu ba: this build lacks the `gpu` feature");
+    std::process::exit(2);
 }
 
 /// `; rss=… MB peak=… MB` from `/proc/self/status` (Linux), else empty: the
@@ -127,6 +156,9 @@ fn memory_note() -> String {
 
 fn main() {
     let args = parse_args();
+    if args.gpu_ba {
+        enable_gpu_ba();
+    }
     let start = Instant::now();
 
     eprintln!(

@@ -192,6 +192,137 @@ before the mapper. COLMAP's stages up to the stop:
 
 The logs are in `benchmarks/smallcity_glomap/`.
 
+## On a GPU: COLMAP with CUDA and Caspar
+
+The runs above are CPU-only. This pass repeats them on one GPU machine
+(RunPod: an NVIDIA L4 with 24 GB, 21 CPU threads) against COLMAP 4.2.1
+built from source with CUDA and Caspar, its GPU bundle adjuster:
+
+- **COLMAP:** SIFT extraction and exhaustive matching on the GPU; both
+  mappers with the Caspar backend (`BundleAdjustmentBackend.CASPAR`).
+  - By COLMAP's design, the global mapper's fixed-rotation stage of each
+    bundle adjustment stays on Ceres.
+  - Ubuntu's Ceres has no CUDA, so that stage and the global positioning
+    run on the CPU.
+- **visloc-rs:** matching on the GPU (wgpu), SIFT and the mapper on the CPU.
+  Its GPU bundle adjustment starts at 1,000 frames, so these scenes do not
+  use it.
+- **Everything else as above.** Commit `3dd9550`, 21 threads for every step.
+
+### ETH3D
+
+| Input | Mapper | Mean AUC@1° / 3° / 5° | Registered | Mapper time |
+|---|---|---|---|---|
+| COLMAP's GPU features | visloc-rs | **50.42** / **74.48** / **80.60** | 439 / 454 | **34.1 s** |
+| | COLMAP incremental, Caspar | 49.90 / 74.29 / 80.43 | 439 / 454 | 163.0 s |
+| | COLMAP global, Caspar | 48.96 / 73.53 / 80.25 | **454 / 454** | 158.6 s |
+| visloc-rs's features | visloc-rs | **53.09** / **78.85** / **85.69** | 448 / 454 | **37.4 s** |
+| | COLMAP incremental, Caspar | 50.45 / 76.07 / 83.31 | 447 / 454 | 163.8 s |
+| | COLMAP global, Caspar | 47.08 / 70.32 / 76.89 | **454 / 454** | 183.7 s |
+
+- **visloc-rs leads both GPU mappers** at every threshold in both modes, and
+  maps 4.4 to 4.9 times faster.
+- **visloc-rs's GPU matching** reconstructs every scene as its CPU
+  matching does: each score equals the CPU run's above.
+- **COLMAP with Ceres on the same machine** (visloc-rs's features):
+
+  | Mapper | Mean AUC@1° / 3° / 5° | Mapper time |
+  |---|---|---|
+  | visloc-rs | 53.09 / **78.85** / **85.69** | **38.0 s** |
+  | COLMAP incremental, Ceres | **53.50** / 78.80 / 85.53 | 223.6 s |
+  | COLMAP global, Ceres | 51.03 / 75.78 / 82.25 | 226.8 s |
+
+  - In this run COLMAP's incremental mapper is level with visloc-rs: 0.4
+    points ahead at 1°, 0.05 and 0.16 behind at 3° and 5°. Its three
+    earlier runs on these inputs averaged 50.23 / 75.12 / 81.96.
+  - **Caspar trades accuracy for speed.** It made COLMAP's mappers 27%
+    (incremental) and 19% (global) faster here. On delivery_area, COLMAP's
+    incremental mapper scored 53.5 to 53.7 AUC@1° in all five Ceres runs
+    (four above, one here) and 46.7 and 47.2 in the two Caspar runs.
+    Caspar solves in f32.
+- **Front ends**, 13 scenes, each on its own features:
+
+  | Step | COLMAP | visloc-rs |
+  |---|---|---|
+  | Feature extraction | **22.2 s** (GPU) | 132.4 s (CPU) |
+  | Matching and verification | 44.2 s | **25.9 s** |
+  | Mapper | 158.6 s (global) | **37.4 s** |
+  | Total | 225.0 s | **195.7 s** |
+
+  - visloc-rs's SIFT here is its VLFeat-compatible CPU extractor, the photo
+    pipeline's default; COLMAP extracts six times faster. visloc-rs's GPU
+    extractor is in the next point.
+  - COLMAP's extraction time includes decoding its images, resized to
+    1,600 px beforehand. visloc-rs's starts after decoding.
+- **visloc-rs's GPU SIFT** (`gsplat_photos --gpu-sift`), the same 13 scenes
+  with each extractor on another machine (RunPod: an RTX 3090, 13 CPU
+  threads, commit `f8ee5b5`):
+
+  | | CPU SIFT | GPU SIFT |
+  |---|---|---|
+  | Feature extraction | 92.4 s | **10.0 s** |
+  | Matching and verification | 19.4 s | 17.3 s |
+  | Mapper | 17.9 s | 18.8 s |
+  | Mean AUC@1° / 3° / 5° | 53.09 / 78.85 / 85.69 | 53.08 / 78.85 / 85.68 |
+  | Registered | 448 / 454 | 448 / 454 |
+
+  - The CPU extractor scores as on the L4 machine above, scene by scene.
+  - With the GPU extractor no scene's AUC moves by more than 0.5 points
+    (courtyard at 1°); at 1° it goes up in six scenes and down in seven.
+    The mean keypoint counts per image agree to within one in 12 scenes
+    and differ by 0.6% on facade.
+  - The RTX 3090 is a faster GPU than the L4, so its 10.0 s does not
+    compare directly with COLMAP's 22.2 s.
+  - The results are in `benchmarks/eth3d_auc_gpu/gpu_sift/`.
+
+### SmallCity
+
+The same machine and settings as the CPU run above: visloc-rs's matches of
+the 5,822 photos, 21 threads.
+
+| | visloc-rs | visloc-rs, `--gpu-ba 1` | COLMAP global, Caspar | COLMAP incremental, Caspar |
+|---|---|---|---|---|
+| Mapper wall time | **19.5 min** | 19.9 min | unfinished, stopped at 90 min | unfinished, stopped at 75 min |
+| Peak memory | 18.8 GiB | 16.9 GiB | 31.4 GiB up to the stop | **5.9 GiB** up to the stop |
+| Registered | 5,816 / 5,822 | 5,816 / 5,822 | — | 5,352 when stopped |
+| Camera-centre error, median / p90 | 0.281 m / 0.731 m | 0.577 m / 1.946 m | — | — |
+
+COLMAP's incremental mapper registered about 1,000 images every 14 minutes
+and would have needed about 80 minutes for all of them, before its last
+global bundle adjustment.
+
+COLMAP's stages up to the stop, against the CPU-only run above (32
+threads). The cap also covered its database (1.4 min) and re-verifying the
+matches (6.6 min):
+
+| Stage | GPU machine | CPU run |
+|---|---|---|
+| Rotation averaging | 2.8 min | 2.2 min |
+| Track establishment | 1.8 min | 1.9 min |
+| Global positioning (Ceres, CPU) | 54.3 min | 31.6 min |
+| Bundle adjustment, three rounds | 13.9 min (Caspar) | 36.3 min |
+| Retriangulation and refinement | stopped after 7 min | stopped after 19.3 min |
+
+- **Caspar** ran COLMAP's bundle adjustment 2.6 times faster than Ceres did
+  on 32 threads. Global positioning stays on Ceres, which Ubuntu builds
+  without CUDA, so it ran on the CPU: 54 minutes on 21 threads.
+- **visloc-rs's accuracy differs from the CPU run's** (0.15 m there). The
+  two runs register the same images in the same order up to the 1,187th
+  image; the 1,188th gets one inlier more (2,475 against 2,474) and from
+  there the reconstructions part. The cause is the platform's floating
+  point (Ubuntu 24.04 here, 22.04 before): a later run of the same code on
+  Ubuntu 22.04 (an RTX 3090 machine) wrote camera poses byte-identical to
+  the CPU run's. On this capture the incremental mapper's result spreads
+  like that across mapper seeds too (0.15 m to 0.65 m).
+- **The GPU bundle adjustment** is not faster on this GPU, and its run parts
+  from the CPU run after its first solve
+  ([GPU bundle adjustment](gpu_bundle_adjustment.md)).
+- **GPU SIFT** (`--gpu-sift`, an RTX 3090 machine with 23 CPU threads):
+  the 5,822 photos at 1,024 px take 43.8 s, against 201.9 s for the CPU
+  extractor on the same machine.
+- The ETH3D results are in `benchmarks/eth3d_auc_gpu/`, the SmallCity logs
+  in `benchmarks/smallcity_gpu/` (`sift_*.log` for the extractors).
+
 ## Caveats
 
 - **COLMAP is not deterministic.** COLMAP runs with its default random seed

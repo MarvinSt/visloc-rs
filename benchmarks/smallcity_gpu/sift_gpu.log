@@ -1,0 +1,4 @@
+5822 images at 1024x690 (0 resized from within 1%; others dropped: 0)
+focal 487.0 px (--focal)
+gpu sift: VLFeat-compatible extractor on NVIDIA GeForce RTX 3090
+sift: mean 5087 keypoints (43.8 s)

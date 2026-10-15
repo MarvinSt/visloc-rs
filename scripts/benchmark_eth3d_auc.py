@@ -4,6 +4,7 @@
 
     benchmark_eth3d_auc.py colmap-matches SCENE_DIR RUN_DIR WORK_DIR MAPPER
     benchmark_eth3d_auc.py visloc-matches SCENE_DIR RUN_DIR WORK_DIR MAPPER
+    benchmark_eth3d_auc.py visloc-only SCENE_DIR RUN_DIR WORK_DIR MAPPER
     benchmark_eth3d_auc.py table RESULTS.jsonl [--markdown]
 
 SCENE_DIR is an extracted ETH3D ``<scene>_dslr_undistorted`` scene (its
@@ -20,6 +21,8 @@ keypoints and two-view inliers written in its replay format.
 ``visloc-matches``: the run's own keypoints and verified matches feed all
 three. COLMAP re-verifies them (``verify_matches``) to build the two-view
 geometries its mappers need, so its inliers are a subset of the run's.
+``visloc-only`` scores just the visloc-rs mapper on them (no pycolmap
+needed), e.g. to compare front-end settings.
 
 Every method uses the run's single PINHOLE camera, held fixed. Each mode
 prints one JSON line per mapper: registered images, AUC at 1/3/5 degrees of the
@@ -28,6 +31,12 @@ translation-direction angle, over every pair of ground-truth images; a pair
 with an unregistered image counts as a failure), camera-centre RMSE and median
 after a Sim(3) fit (cm), and mapper wall time (s). Needs pycolmap >= 4.2,
 numpy and Pillow.
+
+GPU runs: ``VISLOC_BENCH_DEVICE=cuda`` runs COLMAP's SIFT extraction and
+matching on the GPU, and ``VISLOC_BENCH_BA_BACKEND=CASPAR`` gives both COLMAP
+mappers its GPU bundle adjuster (a pycolmap built from a COLMAP with
+``CASPAR_ENABLED``). ``VISLOC_BENCH_THREADS`` overrides the thread count
+(default: every CPU).
 """
 from __future__ import annotations
 
@@ -45,7 +54,9 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from score_smallcity_reference import sim3_errors
 
-THREADS = os.cpu_count()
+THREADS = int(os.environ.get("VISLOC_BENCH_THREADS", os.cpu_count()))
+DEVICE = os.environ.get("VISLOC_BENCH_DEVICE", "cpu")
+BA_BACKEND = os.environ.get("VISLOC_BENCH_BA_BACKEND", "CERES")
 MAPPERS = ["visloc-rs", "colmap-incremental", "colmap-global"]
 
 
@@ -89,7 +100,9 @@ def pose_auc(errors, thresholds):
         last = np.searchsorted(errors, t)
         r = np.r_[recall[:last], recall[last - 1]]
         e = np.r_[errors[:last], t]
-        aucs.append(float(np.trapezoid(r, x=e) / t))
+        # np.trapezoid is numpy >= 2.0's name for np.trapz.
+        trapezoid = getattr(np, "trapezoid", None) or np.trapz
+        aucs.append(float(trapezoid(r, x=e) / t))
     return aucs
 
 
@@ -151,13 +164,35 @@ def run_visloc(mapper, port, out, orig_of, log):
     return {orig_of[n]: v for n, v in best.items()}, seconds
 
 
-def colmap_mappers(pycolmap, db, image_dir, work, gt, name_map):
+def incremental_options(pycolmap, threads):
+    """COLMAP's incremental mapper with the camera held fixed."""
     inc = pycolmap.IncrementalPipelineOptions()
     inc.ba_refine_focal_length = False
     inc.ba_refine_principal_point = False
     inc.ba_refine_extra_params = False
-    inc.num_threads = THREADS
+    inc.num_threads = threads
     inc.extract_colors = False
+    if BA_BACKEND != "CERES":
+        inc.ba_local_backend = getattr(pycolmap.BundleAdjustmentBackend, BA_BACKEND)
+        inc.ba_global_backend = getattr(pycolmap.BundleAdjustmentBackend, BA_BACKEND)
+    return inc
+
+
+def global_options(pycolmap, threads):
+    """COLMAP's global mapper (GLOMAP) with the camera held fixed."""
+    glo = pycolmap.GlobalPipelineOptions()
+    glo.num_threads = threads
+    ba = glo.mapper.bundle_adjustment
+    ba.refine_focal_length = False
+    ba.refine_principal_point = False
+    ba.refine_extra_params = False
+    if BA_BACKEND != "CERES":
+        ba.backend = getattr(pycolmap.BundleAdjustmentBackend, BA_BACKEND)
+    return glo
+
+
+def colmap_mappers(pycolmap, db, image_dir, work, gt, name_map):
+    inc = incremental_options(pycolmap, THREADS)
     out = os.path.join(work, "colmap_incremental")
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
@@ -165,12 +200,7 @@ def colmap_mappers(pycolmap, db, image_dir, work, gt, name_map):
     recs = pycolmap.incremental_mapping(db, image_dir, out, inc)
     rows = [score(gt, from_recs(recs, name_map), time.time() - t0, "colmap-incremental")]
 
-    glo = pycolmap.GlobalPipelineOptions()
-    glo.num_threads = THREADS
-    ba = glo.mapper.bundle_adjustment
-    ba.refine_focal_length = False
-    ba.refine_principal_point = False
-    ba.refine_extra_params = False
+    glo = global_options(pycolmap, THREADS)
     out = os.path.join(work, "colmap_global")
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
@@ -259,6 +289,22 @@ def port_database(pycolmap, port, db, work, reader, frames, size):
     return image_dir, pairs_txt
 
 
+def visloc_only(scene, run, work, mapper):
+    """The visloc-rs mapper alone on the run's own matches."""
+    os.makedirs(work, exist_ok=True)
+    name = os.path.basename(os.path.normpath(scene))
+    gt = read_images_txt(os.path.join(scene, "dslr_calibration_undistorted", "images.txt"))
+    orig_of = {}
+    with open(os.path.join(run, "image_names.txt")) as f:
+        for line in f:
+            if line.strip():
+                fr, path = line.split()
+                orig_of[fr] = os.path.basename(path)
+    est, seconds = run_visloc(mapper, os.path.join(run, "port"), os.path.join(work, "visloc"),
+                              orig_of, os.path.join(work, "visloc.log"))
+    print(json.dumps({"scene": name, **score(gt, est, seconds, "visloc-rs")}), flush=True)
+
+
 def bench(mode, scene, run, work, mapper):
     import pycolmap
     from PIL import Image
@@ -315,12 +361,13 @@ def bench(mode, scene, run, work, mapper):
     t0 = time.time()
     pycolmap.extract_features(db, image_dir, camera_mode=pycolmap.CameraMode.SINGLE,
                               reader_options=reader, extraction_options=ext,
-                              device=pycolmap.Device.cpu)
+                              device=getattr(pycolmap.Device, DEVICE))
     t_extract = time.time() - t0
     matching = pycolmap.FeatureMatchingOptions()
     matching.num_threads = THREADS
     t0 = time.time()
-    pycolmap.match_exhaustive(db, matching_options=matching, device=pycolmap.Device.cpu)
+    pycolmap.match_exhaustive(db, matching_options=matching,
+                              device=getattr(pycolmap.Device, DEVICE))
     emit({"method": "colmap-features", "extract_s": round(t_extract, 1),
           "match_s": round(time.time() - t0, 1)})
     for row in colmap_mappers(pycolmap, db, image_dir, work, gt, lambda n: n):
@@ -393,6 +440,8 @@ def main():
         table(sys.argv[2], "--markdown" in sys.argv[3:])
     elif len(sys.argv) == 6 and sys.argv[1] in ("colmap-matches", "visloc-matches"):
         bench(*sys.argv[1:6])
+    elif len(sys.argv) == 6 and sys.argv[1] == "visloc-only":
+        visloc_only(*sys.argv[2:6])
     else:
         sys.exit(__doc__)
 

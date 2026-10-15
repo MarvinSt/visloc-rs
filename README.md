@@ -148,10 +148,12 @@ matches, the GLOMAP paper's setup, and the scoring follows that paper:
 On visloc-rs's own matches it leads both at every threshold: 53.1 / 78.9 /
 85.7, against COLMAP's three-run means of 50.2 / 75.1 / 82.0 (incremental)
 and 51.3 / 75.0 / 81.1 (global). The global mapper still registers more
-images. On a large capture, the 5,822 SmallCity photos, both mappers get
-visloc-rs's matches and 32 CPU threads: visloc-rs maps it in 21.7 min, and
-COLMAP's global mapper had not finished after 94 min, when a 100-minute cap
-stopped it.
+images. With `--gpu-sift`, visloc-rs extracts those features on the GPU at
+the same AUC (53.1 / 78.9 / 85.7): 10.0 s for the 13 scenes on an RTX 3090,
+against 92.4 s on 13 CPU threads of the same machine. On a large capture,
+the 5,822 SmallCity photos, both mappers get visloc-rs's matches and 32 CPU
+threads: visloc-rs maps it in 21.7 min, and COLMAP's global mapper had not
+finished after 94 min, when a 100-minute cap stopped it.
 Per-scene tables, the SmallCity stages, the run-to-run spread and the caveats
 are in the [ETH3D AUC benchmark](docs/eth3d_auc_benchmark.md).
 
@@ -284,11 +286,12 @@ python scripts/make_photos_demo_gif.py --run runs/sb --out photos_to_mesh.gif --
 
 The pipeline has three stages:
 
-1. **SfM.** Takes the focal length from EXIF, then runs GPU SIFT and
-   matching, two-view verification and the COLMAP-port mapper (the
-   configuration that beats COLMAP on EuRoC above). A final bundle
-   adjustment refines the intrinsics. A COLMAP text model is written to
-   `sparse/0`, so brush and Inria 3DGS can use the result too.
+1. **SfM.** Takes the focal length from EXIF, then runs SIFT (on the GPU
+   with `--gpu-sift`), GPU matching, two-view verification and the
+   COLMAP-port mapper (the configuration that beats COLMAP on EuRoC
+   above). A final bundle adjustment refines the intrinsics. A COLMAP text
+   model is written to `sparse/0`, so brush and Inria 3DGS can use the
+   result too.
 2. **Training.** brush's refine strategy on the hand-written wgpu forward
    and backward passes. On the same GPU, at 30k steps, it is faster than
    brush 0.3 on all five benchmark scenes (14–30%). PSNR is within

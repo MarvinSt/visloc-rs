@@ -348,6 +348,10 @@ threshold; VIO 73.79, default mapper 70.08):
 | 2 nearest | 45.87 | 66.60 |
 | 4 nearest | n/a | 69.71 |
 
+On sequence_4_10 (0.5 px threshold, VIO 39.00) the same two settings score
+38.77 and 39.07: within 0.35 m of the VIO everywhere, since its 13 loops
+change little.
+
 The VIO output removes most of the 2-neighbor heading loss, but neither
 version reaches the VIO. Both rotate the first 90 s by about 3° (2D error
 2.1–2.3 m there, against 1.15 m for the VIO) and follow the VIO elsewhere.

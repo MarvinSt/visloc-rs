@@ -5,7 +5,11 @@
 //!     --images <folder> --out <work dir> [--steps 30000] [--max-size 1600] [--focal PX] \
 //!     [--no-mesh] [--normal-weight 0.005] [--appearance] [--exhaustive-max 300] [--window 20]
 //!     [--retrieval 30] [--max-keypoints 8192] [--sift-opt key=value ...] [--match-f32] [--mask-black 12]
+//!     [--cpu] [--gpu-ba]
 //! ```
+//!
+//! `--gpu-ba` also solves the mapper's large bundle adjustments on the GPU
+//! (docs/gpu_bundle_adjustment.md); `--cpu` matches on the CPU.
 //!
 //! SfM from `visloc_gsplat_train::photos` (EXIF focal, GPU SIFT/matching,
 //! the COLMAP-port mapper, intrinsics refinement), brush-strategy training,
@@ -61,6 +65,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // domain_size_pooling=1` for strongly oblique / wide-baseline photos.
             "--sift-opt" => sfm.sift_overrides.push(next()?),
             "--cpu" => sfm.gpu = false,
+            // Large bundle adjustments' reduced camera systems on the GPU.
+            "--gpu-ba" => sfm.gpu_ba = true,
             "--no-mesh" => mesh = false,
             "--normal-weight" => normal_weight = next()?.parse()?,
             // Per-photo colour correction (varying exposure / white balance).

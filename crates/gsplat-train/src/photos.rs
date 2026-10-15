@@ -75,6 +75,10 @@ pub struct PhotoSfmConfig {
     /// datasets black out: the training images get alpha 0 there (grown by
     /// a few pixels over JPEG ringing), for `TrainConfig::alpha_mask`.
     pub mask_black: Option<u8>,
+    /// Solve the large bundle adjustments' reduced camera systems on the
+    /// GPU (`visloc_ba_gpu::GpuReducedSolver`; docs/gpu_bundle_adjustment.md):
+    /// the result then differs from the CPU solve at the f32 level.
+    pub gpu_ba: bool,
 }
 
 impl Default for PhotoSfmConfig {
@@ -98,6 +102,7 @@ impl Default for PhotoSfmConfig {
             sift_overrides: Vec::new(),
             match_u8: true,
             mask_black: None,
+            gpu_ba: false,
         }
     }
 }
@@ -488,6 +493,16 @@ pub fn build_photo_dataset(
             desc
         },
     };
+    #[cfg(not(feature = "gpu"))]
+    if cfg.gpu_ba {
+        return Err(EurocError::Sfm("gpu_ba needs the `gpu` feature".into()));
+    }
+    #[cfg(feature = "gpu")]
+    if cfg.gpu_ba {
+        let adapter = visloc_ba_gpu::register_reduced_pcg()
+            .map_err(|e| EurocError::Sfm(format!("gpu: {e}")))?;
+        log(&format!("gpu ba: reduced camera systems on {adapter}"));
+    }
     let t0 = std::time::Instant::now();
     #[cfg(feature = "gpu")]
     let mut gpu_sift = if cfg.gpu {

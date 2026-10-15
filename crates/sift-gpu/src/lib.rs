@@ -11,6 +11,12 @@
 //! the VLFeat-compatible detector/descriptor, scale-adaptive gradients,
 //! standard orientation peaks) are rejected by `SiftGpu::supports` so
 //! callers can fall back to the CPU extractor.
+//!
+//! `VlfeatSiftGpu` runs the VLFeat-compatible path `gsplat_photos` uses
+//! (`vlfeat_compatible_detector` + `vlfeat_compatible_descriptor`, COLMAP's
+//! byte descriptors), also as an f32 port: on SmallCity photos 99.96% of
+//! its keypoints pair up with the CPU extractor's and descriptor bytes
+//! differ by at most one (see `examples/sift_vlfeat_gpu_bench.rs`).
 
 #[cfg(feature = "gpu")]
 mod descriptor_matcher;

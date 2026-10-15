@@ -304,6 +304,15 @@ The VIO alone scores 34.49 (86.5 %).
   (9.7e3 and 1.9e3, against 3.0e5 and 3.9e4). This is the first mapper
   setting that beats the VIO on a track where the default mapper loses.
 
+The limit does not carry over to sequence_1_19 (with the 0.5 px KLT
+threshold of [`lamaria_klt_threshold.md`](lamaria_klt_threshold.md)): the
+mapper falls to 45.87, against 70.08 with the default factors and 73.79 for
+the VIO. Its heading drifts by up to 4° from the VIO's, which stays within
+±1° of the pseudo-GT. The 222 accepted loops are again short revisits that
+the pseudo-GT confirms (median distance error 0.08 m). With two factors
+per keyframe the relative-pose chain no longer holds the heading over the
+whole sequence, and short loops cannot replace it.
+
 All 13 accepted loops are short revisits that the pseudo-GT confirms: the
 two keyframes lie 0.1–7.7 m apart and the map distance matches within
 0.6 m. With the 2-neighbor limit the mapper's final optimization takes
@@ -361,11 +370,10 @@ so it stays off.
 1. **Mapper on the refined VIO.** The mapper now loses to the VIO on three
    of five tracks ([With the online mapper](#with-the-online-mapper)). On
    sequence_4_10, limiting the relative-pose factors to the 2 nearest
-   keyframes turns that into a small gain. It still has to be measured on
-   the other tracks, including the ones where the default mapper wins.
-   Without loops, the recovered relative poses still drift 3 m away from the
-   VIO; taking the factor measurements from the VIO trajectory itself is
-   the next candidate.
+   keyframes turns that into a small gain, but on sequence_1_19 it loses
+   the heading. Without loops, the recovered relative poses drift 3 m away
+   from the VIO; taking the factor measurements from the VIO trajectory
+   itself (`--mapper-vio-output-poses`) is being measured.
 2. **Calibration without the device table.** The refinement relies on
    both devices having training pseudo-GT. Estimating the gyro delay and the
    IMU-camera rotation online in the VIO would remove that dependency and

@@ -340,6 +340,22 @@ same run therefore owes its gain over the VIO to the window estimates,
 which on sequence_5_11 chain up to a better trajectory than the VIO output,
 and not to its loops.
 
+Softer chains with the VIO output as measurements, on sequence_1_19 (0.5 px
+threshold; VIO 73.79, default mapper 70.08):
+
+| Relative-pose factors per keyframe | Window estimates | VIO output |
+|---|---:|---:|
+| 2 nearest | 45.87 | 66.60 |
+| 4 nearest | n/a | 69.71 |
+
+The VIO output removes most of the 2-neighbor heading loss, but neither
+version reaches the VIO. Both rotate the first 90 s by about 3° (2D error
+2.1–2.3 m there, against 1.15 m for the VIO) and follow the VIO elsewhere.
+sequence_1_19 was recorded by 1WM09370081264, whose 0.73° IMU-camera
+rotation stays uncorrected (see [Per-device refinement](#per-device-refinement)).
+The VIO tolerates it, but the mapper's reprojection terms link keyframes
+seen from directions up to 90° apart, where it does not cancel.
+
 All 13 accepted loops are short revisits that the pseudo-GT confirms: the
 two keyframes lie 0.1–7.7 m apart and the map distance matches within
 0.6 m. With the 2-neighbor limit the mapper's final optimization takes

@@ -508,9 +508,13 @@ fn reconstruct_sub_model(
 /// the images `recon` left out, each round structure-based first and then
 /// structure-less over every image with enough 2D-2D correspondences. Each
 /// registration is followed by triangulation and the local refinement as
-/// in [`reconstruct_sub_model`]; once no candidate registers, a global
-/// refinement and one more round. Returns the number of frames registered;
-/// with none, `recon` is unchanged.
+/// in [`reconstruct_sub_model`]. An image that then sees fewer 3D points
+/// than `abs_pose_min_num_inliers` is undone (the model goes back to its
+/// state before the registration) and not tried again: on ETH3D's electro
+/// the one image placed metres off kept 24 points, the ones placed within
+/// centimetres 49 or more. Once no candidate registers, a global refinement
+/// and one more round. Returns the number of frames registered; with none,
+/// `recon` is unchanged.
 fn complete_model(
     options: &PipelineOptions,
     mapper_options: &MapperOptions,
@@ -522,13 +526,18 @@ fn complete_model(
     mapper.begin_reconstruction(recon, graph);
     let mut added = 0;
     let mut refined = false;
+    let mut rejected = std::collections::BTreeSet::new();
     loop {
+        let before = recon.clone();
         let mut registered = None;
         'rounds: for round in [
             CandidateRound::Structure,
             CandidateRound::StructureLessByCorrespondences,
         ] {
             for candidate in mapper.find_next_images(mapper_options, recon, round) {
+                if rejected.contains(&candidate) {
+                    continue;
+                }
                 let ok = if round == CandidateRound::Structure {
                     mapper.register_next_image(mapper_options, recon, graph, candidate)
                 } else {
@@ -562,6 +571,16 @@ fn complete_model(
                     graph,
                     image_id,
                 );
+                let seen = recon.image(image_id).num_points3d();
+                if seen < mapper_options.abs_pose_min_num_inliers {
+                    mapper.log.push(format!(
+                        "COMPLETE undo frame={frame_id} image={image_id} points3d={seen}"
+                    ));
+                    *recon = before;
+                    mapper.begin_reconstruction(recon, graph);
+                    rejected.insert(image_id);
+                    continue;
+                }
                 added += 1;
                 refined = false;
             }

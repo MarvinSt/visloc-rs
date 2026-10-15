@@ -459,6 +459,41 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **COLMAP-port mapper: cheaper triangulation, track completion and
+  large-BA setup.** Results are bit-identical: all 15 ETH3D models (13
+  scenes) and the SmallCity pass-1 model below match byte for byte
+  (`cameras.txt`, `images.txt` and `points3D.txt`).
+  - **Why:** a perf profile of a SmallCity replay (pass 1, 1,499 photos,
+    4 threads) ranked three costs first:
+    - the track-completion search, 15% of CPU time;
+    - the DLT triangulation's SVD, 13%;
+    - one part of a large global BA's setup, 8%: finding each point's
+      frame pairs in the edge rows of the reduced camera system.
+  - **DLT triangulation.** nalgebra's SVD gives the same `V` without `U`,
+    and on a fixed-size matrix as on a `DMatrix`. A check on 1,000,000
+    random systems of 2 to 8 views found them bit-identical. Systems of
+    up to four views now skip `U` and the heap. A 2-view SVD takes
+    1.33 µs instead of 1.96 µs.
+  - **Track completion.** The search now marks a 2D point visited only
+    after the registration and 3D-point checks. Those checks reject the
+    track and every triangulated 2D point on every visit, so the visited
+    set holds only the candidates.
+  - **Large global BA setup.** Up to 16,384 frames, the edge rows are
+    marked straight into a bitmap per row over the frame slots. They were
+    gathered, sorted and deduplicated. A frame pair's edge index is now
+    its row's offset plus a popcount rank, not a binary search of the row.
+  - **SmallCity pass 1, before and after** (two runs each; the machine
+    varies by about 10% between runs):
+    - mapper: 378.7 and 412.7 s before, 337.7 and 342.6 s after;
+    - setup of the 1,498-frame global BA: 1.19 to 1.24 s before, 0.27 to
+      0.31 s after;
+    - global BA: 132 to 151 s before, 108 s after;
+    - local track merging and completion: 73 to 78 s before, 65 to 66 s
+      after;
+    - triangulation: 24 to 26 s before, 20 s after.
+  - **ETH3D scenes** are small, and their times do not change measurably
+    (facade: 11.2 s before and after).
+
 - **COLMAP-port mapper: cheaper local refinement.** Results are
   bit-identical: all 15 ETH3D models match (`images.txt` and
   `points3D.txt`).

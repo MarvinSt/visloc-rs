@@ -148,7 +148,12 @@ matches, the GLOMAP paper's setup, and the scoring follows that paper:
 On visloc-rs's own matches it leads both at every threshold: 53.1 / 78.9 /
 85.7, against COLMAP's three-run means of 50.2 / 75.1 / 82.0 (incremental)
 and 51.3 / 75.0 / 81.1 (global). The global mapper still registers more
-images. With `--gpu-sift`, visloc-rs extracts those features on the GPU at
+images; `--complete-model` closes most of that gap. In a later run on
+COLMAP's matches, it took visloc-rs to 452 of 454 images and 53.7 / 79.9 /
+86.9, ahead of COLMAP's incremental mapper (51.3 / 76.3 / 82.9) and its
+global mapper. The global mapper failed on one scene in that run; without
+that scene the means are 53.7 / 79.7 / 86.7 against 52.7 / 76.3 / 82.7.
+With `--gpu-sift`, visloc-rs extracts those features on the GPU at
 the same AUC (53.1 / 78.9 / 85.7): 10.0 s for the 13 scenes on an RTX 3090,
 against 92.4 s on 13 CPU threads of the same machine. On a large capture,
 the 5,822 SmallCity photos, both mappers get visloc-rs's matches and 32 CPU

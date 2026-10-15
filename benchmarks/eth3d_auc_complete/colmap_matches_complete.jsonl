@@ -1,0 +1,13 @@
+{"scene": "electro", "method": "visloc-rs", "registered": 44, "images": 45, "auc1": 42.98, "auc3": 66.83, "auc5": 74.22, "rmse_cm": 14.126, "median_cm": 5.054, "seconds": 1.76}
+{"scene": "kicker", "method": "visloc-rs", "registered": 30, "images": 31, "auc1": 51.63, "auc3": 76.04, "auc5": 82.46, "rmse_cm": 2.091, "median_cm": 1.733, "seconds": 0.95}
+{"scene": "meadow", "method": "visloc-rs", "registered": 15, "images": 15, "auc1": 48.76, "auc3": 76.4, "auc5": 85.8, "rmse_cm": 5.73, "median_cm": 4.786, "seconds": 0.43}
+{"scene": "pipes", "method": "visloc-rs", "registered": 14, "images": 14, "auc1": 53.97, "auc3": 82.97, "auc5": 89.34, "rmse_cm": 0.794, "median_cm": 0.492, "seconds": 0.34}
+{"scene": "courtyard", "method": "visloc-rs", "registered": 38, "images": 38, "auc1": 53.91, "auc3": 82.48, "auc5": 89.49, "rmse_cm": 4.421, "median_cm": 3.784, "seconds": 2.96}
+{"scene": "delivery_area", "method": "visloc-rs", "registered": 44, "images": 44, "auc1": 53.75, "auc3": 82.57, "auc5": 89.39, "rmse_cm": 2.396, "median_cm": 1.881, "seconds": 1.67}
+{"scene": "facade", "method": "visloc-rs", "registered": 76, "images": 76, "auc1": 70.77, "auc3": 88.59, "auc5": 92.99, "rmse_cm": 6.611, "median_cm": 5.051, "seconds": 9.93}
+{"scene": "office", "method": "visloc-rs", "registered": 26, "images": 26, "auc1": 27.38, "auc3": 56.35, "auc5": 70.12, "rmse_cm": 1.077, "median_cm": 0.664, "seconds": 0.59}
+{"scene": "playground", "method": "visloc-rs", "registered": 38, "images": 38, "auc1": 64.69, "auc3": 87.25, "auc5": 92.28, "rmse_cm": 0.628, "median_cm": 0.578, "seconds": 1.72}
+{"scene": "relief", "method": "visloc-rs", "registered": 31, "images": 31, "auc1": 58.19, "auc3": 84.88, "auc5": 90.89, "rmse_cm": 0.782, "median_cm": 0.711, "seconds": 2.03}
+{"scene": "relief_2", "method": "visloc-rs", "registered": 31, "images": 31, "auc1": 57.69, "auc3": 85.13, "auc5": 90.98, "rmse_cm": 0.732, "median_cm": 0.686, "seconds": 1.21}
+{"scene": "terrace", "method": "visloc-rs", "registered": 23, "images": 23, "auc1": 54.38, "auc3": 83.88, "auc5": 90.32, "rmse_cm": 1.937, "median_cm": 1.631, "seconds": 0.73}
+{"scene": "terrains", "method": "visloc-rs", "registered": 42, "images": 42, "auc1": 59.81, "auc3": 85.81, "auc5": 91.37, "rmse_cm": 0.567, "median_cm": 0.512, "seconds": 1.19}

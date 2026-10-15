@@ -6,6 +6,12 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **COLMAP-port mapper: resuming a reconstruction with 3D points
+  panicked.** `ObservationManager::new` counted the existing observations
+  before the visibility pyramids were sized. The constructor now sizes
+  them, as COLMAP's `InitImageStat` does; on an empty reconstruction the
+  state is unchanged.
+
 - **COLMAP-port mapper: the converged final BA stalled on two of three
   SmallCity paths.** Two LM rules now apply to solves with the absolute
   gradient criterion. In production that means only the converged final BA
@@ -122,6 +128,30 @@ All notable changes to `visloc-rs` will be documented here.
   decline distorted cameras and fall back to the regular solver.
 
 ### Added
+
+- **COLMAP-port mapper: complete the largest model
+  (`gsplat_photos --complete-model`, `complete_largest_model=1`).** Off by
+  default.
+  - **When it runs:** once every model is built. It extends the largest
+    model with the images it left out.
+  - **Candidates:** images with at least `2 * abs_pose_min_num_inliers`
+    2D–2D correspondences to registered images.
+  - **Why COLMAP misses them:** its structure-less fallback asks the same
+    candidates for `abs_pose_min_num_inliers` 3D points. That filter keeps
+    out the images that see too few of them.
+  - **Each registration** is triangulated and locally refined. It is undone
+    if the image then sees fewer than `abs_pose_min_num_inliers` 3D points.
+  - **No other effect:** the pass cannot change which models are built, and
+    a model it does not extend stays bit-identical.
+  - **ETH3D, 13 DSLR training scenes:**
+    - On COLMAP's matches: mean AUC@1°/3°/5° 51.97 / 76.75 / 83.21 (445 of
+      454 registered) → 53.69 / 79.94 / 86.90 (452). That is ahead of
+      COLMAP 4.2.1's incremental mapper (51.34 / 76.25 / 82.88) and of its
+      global mapper (48.65 / 70.41 / 76.36), and ahead of the global mapper
+      without pipes too.
+    - On visloc-rs's matches: 53.09 / 78.85 / 85.69 (448) → 53.25 / 79.66 /
+      86.90 (452).
+    - Details: `docs/eth3d_auc_benchmark.md`.
 
 - **VLFeat-compatible SIFT on the GPU (`gsplat_photos --gpu-sift`).**
   `visloc_sift_gpu::VlfeatSiftGpu` ports the photo pipeline's SIFT (the

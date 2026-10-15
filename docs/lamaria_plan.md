@@ -171,8 +171,8 @@ before/after on training sequences.
    mean rises to 44.95 (+1.29; Medium +4.94, Long +1.03, Short +0.47, no
    track worse).
 10. **Remaining error: slow heading and scale drift.** Status: **cause found
-   and corrected per device (2026-10-14); mapper re-measurement in
-   progress.** Fitting each sequence's CP residuals with a yaw drift and a
+   and corrected per device (2026-10-14); measured with the mapper on one
+   training sequence per track (2026-10-15).** Fitting each sequence's CP residuals with a yaw drift and a
    scale drift linear in time brings the median CP error below 1 m on Short,
    Long and Moving. The heading drift comes from the factory IMU-camera
    calibration: the gyroscope lags the images by ~4.6 ms (factory 4.1 ms) and
@@ -184,6 +184,11 @@ before/after on training sequences.
    alignment only on that device, whose fitted rotation overshoots). The
    submission driver applies it by default
    ([`lamaria_drift_analysis.md`](lamaria_drift_analysis.md#imu-camera-calibration)).
+   Over one sequence per track it raises the VIO mean 38.21 → 49.87 and the
+   mapper mean 44.95 → 50.44, but the mapper now loses to the VIO on Short,
+   Long and Low light: it bends the long-range shape that the refined VIO
+   gets right
+   ([`lamaria_drift_analysis.md`](lamaria_drift_analysis.md#with-the-online-mapper)).
    Earth-rotation compensation and a VIO outlier filter did not help and stay
    opt-in.
 

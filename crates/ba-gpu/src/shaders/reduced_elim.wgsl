@@ -85,6 +85,21 @@ fn eliminate(@builtin(local_invocation_index) lid: u32,
         let k = sl.y;
         let po = point_off[p];
         let pn = point_off[p + 1u] - po;
+        // This point's partners j > k inside the task's edges: from the
+        // first node >= t_first (binary search), while node <= t_last.
+        var jlo = k + 1u;
+        var jhi = pn;
+        while (jlo < jhi) {
+            let mid = (jlo + jhi) / 2u;
+            if (point_nodes[po + mid] < t_first) {
+                jlo = mid + 1u;
+            } else {
+                jhi = mid;
+            }
+        }
+        if (jlo >= pn || point_nodes[po + jlo] > t_last) {
+            continue;
+        }
         // sk = W_sp V_p^-1 (6x3); a zero inverse marks a skipped point.
         var vi: array<f32, 9>;
         var nz = false;
@@ -108,11 +123,8 @@ fn eliminate(@builtin(local_invocation_index) lid: u32,
         for (var c = 0u; c < 6u; c = c + 1u) {
             sc_s[c] = scale[6u * s + c];
         }
-        for (var j = k + 1u; j < pn; j = j + 1u) {
+        for (var j = jlo; j < pn; j = j + 1u) {
             let t = point_nodes[po + j];
-            if (t < t_first) {
-                continue;
-            }
             if (t > t_last) {
                 break;
             }

@@ -10,7 +10,8 @@
 # ground-truth focal length held fixed), score both input modes, and delete the
 # images. Appends to WORK_DIR/{colmap,visloc}_matches.jsonl. Needs release
 # builds of gsplat_photos and colmap_incremental_mapper, and pycolmap >= 4.2,
-# numpy, Pillow and py7zr.
+# numpy, Pillow and py7zr. With VISLOC_BENCH_DEVICE=cuda (benchmark_eth3d_auc.py's
+# GPU settings) the front end also matches on the GPU.
 set -euo pipefail
 W=$1
 shift
@@ -21,6 +22,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PHOTOS=$ROOT/target/release/examples/gsplat_photos
 MAPPER=$ROOT/target/release/examples/colmap_incremental_mapper
 BENCH=$ROOT/scripts/benchmark_eth3d_auc.py
+front_cpu=--cpu
+[ "${VISLOC_BENCH_DEVICE:-cpu}" = cpu ] || front_cpu=
 mkdir -p "$W/dl"
 for s in "${scenes[@]}"; do
   D=$W/$s
@@ -39,7 +42,7 @@ for s in "${scenes[@]}"; do
       "$S/dslr_calibration_undistorted/cameras.txt")"
     f=$(python3 -c "print($focal * 1600 / max($width, $height))")
     "$PHOTOS" --images "$S/images/dslr_images_undistorted" --out "$R" --max-size 1600 \
-      --steps 0 --no-mesh --cpu --focal "$f" --no-refine-intrinsics --max-keypoints 8192 \
+      --steps 0 --no-mesh $front_cpu --focal "$f" --no-refine-intrinsics --max-keypoints 8192 \
       >"$D/photos.log" 2>&1
   fi
   python3 -I "$BENCH" colmap-matches "$S" "$R" "$D/colmap_matches" "$MAPPER" \

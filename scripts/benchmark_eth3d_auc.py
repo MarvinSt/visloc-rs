@@ -28,6 +28,12 @@ translation-direction angle, over every pair of ground-truth images; a pair
 with an unregistered image counts as a failure), camera-centre RMSE and median
 after a Sim(3) fit (cm), and mapper wall time (s). Needs pycolmap >= 4.2,
 numpy and Pillow.
+
+GPU runs: ``VISLOC_BENCH_DEVICE=cuda`` runs COLMAP's SIFT extraction and
+matching on the GPU, and ``VISLOC_BENCH_BA_BACKEND=CASPAR`` gives both COLMAP
+mappers its GPU bundle adjuster (a pycolmap built from a COLMAP with
+``CASPAR_ENABLED``). ``VISLOC_BENCH_THREADS`` overrides the thread count
+(default: every CPU).
 """
 from __future__ import annotations
 
@@ -45,7 +51,9 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from score_smallcity_reference import sim3_errors
 
-THREADS = os.cpu_count()
+THREADS = int(os.environ.get("VISLOC_BENCH_THREADS", os.cpu_count()))
+DEVICE = os.environ.get("VISLOC_BENCH_DEVICE", "cpu")
+BA_BACKEND = os.environ.get("VISLOC_BENCH_BA_BACKEND", "CERES")
 MAPPERS = ["visloc-rs", "colmap-incremental", "colmap-global"]
 
 
@@ -151,13 +159,35 @@ def run_visloc(mapper, port, out, orig_of, log):
     return {orig_of[n]: v for n, v in best.items()}, seconds
 
 
-def colmap_mappers(pycolmap, db, image_dir, work, gt, name_map):
+def incremental_options(pycolmap, threads):
+    """COLMAP's incremental mapper with the camera held fixed."""
     inc = pycolmap.IncrementalPipelineOptions()
     inc.ba_refine_focal_length = False
     inc.ba_refine_principal_point = False
     inc.ba_refine_extra_params = False
-    inc.num_threads = THREADS
+    inc.num_threads = threads
     inc.extract_colors = False
+    if BA_BACKEND != "CERES":
+        inc.ba_local_backend = getattr(pycolmap.BundleAdjustmentBackend, BA_BACKEND)
+        inc.ba_global_backend = getattr(pycolmap.BundleAdjustmentBackend, BA_BACKEND)
+    return inc
+
+
+def global_options(pycolmap, threads):
+    """COLMAP's global mapper (GLOMAP) with the camera held fixed."""
+    glo = pycolmap.GlobalPipelineOptions()
+    glo.num_threads = threads
+    ba = glo.mapper.bundle_adjustment
+    ba.refine_focal_length = False
+    ba.refine_principal_point = False
+    ba.refine_extra_params = False
+    if BA_BACKEND != "CERES":
+        ba.backend = getattr(pycolmap.BundleAdjustmentBackend, BA_BACKEND)
+    return glo
+
+
+def colmap_mappers(pycolmap, db, image_dir, work, gt, name_map):
+    inc = incremental_options(pycolmap, THREADS)
     out = os.path.join(work, "colmap_incremental")
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
@@ -165,12 +195,7 @@ def colmap_mappers(pycolmap, db, image_dir, work, gt, name_map):
     recs = pycolmap.incremental_mapping(db, image_dir, out, inc)
     rows = [score(gt, from_recs(recs, name_map), time.time() - t0, "colmap-incremental")]
 
-    glo = pycolmap.GlobalPipelineOptions()
-    glo.num_threads = THREADS
-    ba = glo.mapper.bundle_adjustment
-    ba.refine_focal_length = False
-    ba.refine_principal_point = False
-    ba.refine_extra_params = False
+    glo = global_options(pycolmap, THREADS)
     out = os.path.join(work, "colmap_global")
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
@@ -315,12 +340,13 @@ def bench(mode, scene, run, work, mapper):
     t0 = time.time()
     pycolmap.extract_features(db, image_dir, camera_mode=pycolmap.CameraMode.SINGLE,
                               reader_options=reader, extraction_options=ext,
-                              device=pycolmap.Device.cpu)
+                              device=getattr(pycolmap.Device, DEVICE))
     t_extract = time.time() - t0
     matching = pycolmap.FeatureMatchingOptions()
     matching.num_threads = THREADS
     t0 = time.time()
-    pycolmap.match_exhaustive(db, matching_options=matching, device=pycolmap.Device.cpu)
+    pycolmap.match_exhaustive(db, matching_options=matching,
+                              device=getattr(pycolmap.Device, DEVICE))
     emit({"method": "colmap-features", "extract_s": round(t_extract, 1),
           "match_s": round(time.time() - t0, 1)})
     for row in colmap_mappers(pycolmap, db, image_dir, work, gt, lambda n: n):

@@ -459,6 +459,19 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **COLMAP-port mapper: global track completion skips tracks it cannot
+  extend.** Results are bit-identical: all 13 local ETH3D scenes and the
+  SmallCity pass-1 model match byte for byte, at 4 threads and at 1.
+  - **Which tracks change:** a track can only gain a 2D point that one of
+    its observations corresponds to, of a registered image and without a
+    3D point. A completion pass only adds observations.
+  - **Change:** `CompleteAllTracks` now runs only on the tracks that have
+    such a correspondence. It finds them in one pass from those 2D
+    points, since the correspondence graph stores every match both ways.
+  - **SmallCity pass 1** (1,499 photos, 4 threads): 15% of the tracks
+    qualify. Global track completion takes 10.4 s instead of 19.4 s,
+    including the 3.3 s scan.
+
 - **COLMAP-port mapper: cheaper triangulation, track completion and
   large-BA setup.** Results are bit-identical: all 15 ETH3D models (13
   scenes) and the SmallCity pass-1 model below match byte for byte

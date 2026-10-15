@@ -115,6 +115,8 @@ struct Plan {
     grad: Vec<Vec<wgpu::Buffer>>,
     /// `vl_orient`'s indirect dispatch sizes, three words per octave.
     args: wgpu::Buffer,
+    /// Host-readable copy of the counters and candidates.
+    staging: wgpu::Buffer,
     // Kept alive for the bind groups.
     _levels: Vec<wgpu::Buffer>,
     _params: wgpu::Buffer,
@@ -136,6 +138,8 @@ struct DescBuffers {
     params: wgpu::Buffer,
     kps: wgpu::Buffer,
     out: wgpu::Buffer,
+    /// Host-readable copy of `out`.
+    staging: wgpu::Buffer,
     /// `binds[o * intervals + l - 1]`, with uniform slot of the same index.
     binds: Vec<wgpu::BindGroup>,
 }
@@ -309,34 +313,36 @@ fn dispatch_linear(threads: usize, per_group: usize) -> (u32, u32, u32) {
     }
 }
 
-/// Copy `(buffer, byte offset, length)` ranges into one host vector.
+fn staging_buffer(device: &wgpu::Device, bytes: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vl-staging"),
+        size: bytes.max(16).div_ceil(4) * 4,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Copy `(buffer, byte offset, length)` ranges through `staging` into one
+/// host vector, after the work in `encoder`.
 fn read_ranges(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    mut encoder: wgpu::CommandEncoder,
+    staging: &wgpu::Buffer,
     ranges: &[(&wgpu::Buffer, u64, u64)],
 ) -> Vec<u8> {
-    let total: u64 = ranges.iter().map(|&(_, _, len)| len).sum();
-    if total == 0 {
-        return Vec::new();
-    }
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("vl-staging"),
-        size: total,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("vl-readback"),
-    });
     let mut at = 0u64;
     for &(buffer, offset, len) in ranges {
         if len > 0 {
-            encoder.copy_buffer_to_buffer(buffer, offset, &staging, at, len);
+            encoder.copy_buffer_to_buffer(buffer, offset, staging, at, len);
             at += len;
         }
     }
     queue.submit(Some(encoder.finish()));
-    let slice = staging.slice(..);
+    if at == 0 {
+        return Vec::new();
+    }
+    let slice = staging.slice(..at);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
@@ -580,6 +586,7 @@ impl VlfeatSiftGpu {
             f32s(3 * n_det),
             wgpu::BufferUsages::INDIRECT,
         );
+        let staging = staging_buffer(dev, (n_det * cap * CAND_WORDS * 4) as u64);
 
         let mut slots = Slots::default();
         let mut ops: Vec<Op> = Vec::new();
@@ -790,6 +797,7 @@ impl VlfeatSiftGpu {
             cand,
             counters,
             args,
+            staging,
             grad,
             _levels: levels_kept,
             _params: params,
@@ -812,6 +820,11 @@ impl VlfeatSiftGpu {
         let mut encoder = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("vl-detect"),
         });
+        let new_encoder = || {
+            dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vl-readback"),
+            })
+        };
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("vl-detect"),
@@ -828,11 +841,11 @@ impl VlfeatSiftGpu {
                 }
             }
         }
-        queue.submit(Some(encoder.finish()));
-
         let counts: Vec<u32> = bytemuck::cast_slice(&read_ranges(
             dev,
             queue,
+            encoder,
+            &plan.staging,
             &[(&plan.counters, 0, (n_det * 4) as u64)],
         ))
         .to_vec();
@@ -847,7 +860,7 @@ impl VlfeatSiftGpu {
             .zip(&plan.cand)
             .map(|(&c, buffer)| (buffer, 0, (c as usize * CAND_WORDS * 4) as u64))
             .collect();
-        let bytes = read_ranges(dev, queue, &ranges);
+        let bytes = read_ranges(dev, queue, new_encoder(), &plan.staging, &ranges);
         let raw: &[u32] = bytemuck::cast_slice(&bytes);
         let mut candidates = Vec::with_capacity(raw.len() / CAND_WORDS);
         let mut chunks = raw.chunks_exact(CAND_WORDS);
@@ -918,6 +931,7 @@ impl VlfeatSiftGpu {
             });
             let kps = storage(dev, "vl-desc-kps", (capacity * KP_WORDS * 4) as u64, none);
             let out = storage(dev, "vl-desc-out", (capacity * 32 * 4) as u64, none);
+            let staging = staging_buffer(dev, (capacity * 128) as u64);
             let binds = (0..n_groups)
                 .map(|g| {
                     dev.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -953,6 +967,7 @@ impl VlfeatSiftGpu {
                 params,
                 kps,
                 out,
+                staging,
                 binds,
             });
         }
@@ -983,8 +998,13 @@ impl VlfeatSiftGpu {
                 pass.dispatch_workgroups(groups.0, groups.1, groups.2);
             }
         }
-        queue.submit(Some(encoder.finish()));
-        let bytes = read_ranges(dev, queue, &[(&desc.out, 0, (n * 128) as u64)]);
+        let bytes = read_ranges(
+            dev,
+            queue,
+            encoder,
+            &desc.staging,
+            &[(&desc.out, 0, (n * 128) as u64)],
+        );
         let mut descriptors = vec![Vec::new(); n];
         for (at, &i) in order.iter().enumerate() {
             descriptors[i] = bytes[at * 128..(at + 1) * 128]

@@ -300,7 +300,7 @@ The VIO alone scores 34.49 (86.5 %).
 - **Default with loops:** the 13 loops of sequence_4_10 change nothing,
   since the 30-fold relative-pose chain is too stiff to move.
 - **2 nearest keyframes with loops:** the loops pull the trajectory back. The
-  relative-pose and roll-pitch residuals at the optimum fall about 30-fold
+  relative-pose and roll-pitch residuals at the optimum fall 20- to 30-fold
   (9.7e3 and 1.9e3, against 3.0e5 and 3.9e4). This is the first mapper
   setting that beats the VIO on a track where the default mapper loses.
 

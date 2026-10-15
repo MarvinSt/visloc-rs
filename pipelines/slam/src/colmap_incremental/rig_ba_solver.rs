@@ -144,6 +144,7 @@ use rayon::prelude::*;
 
 use visloc_core::geometry::SE3;
 
+use crate::ba_accel::ReducedCameraSystem;
 use crate::block_cholesky::{solve_spd_blocks6_cached, BlockSymbolic};
 use crate::bundle::{BaError, BaIterationStats, BaResult, BaRigObservation, BundleAdjustment};
 
@@ -926,6 +927,21 @@ impl CoarseCorrection {
                 zi[k] += yc[g + k];
             }
         }
+    }
+
+    /// `(Pᵀ A P)⁻¹`, for an accelerator that applies the coarse level as a
+    /// dense product (column solves in parallel).
+    fn inverse(&self) -> DMatrix<f64> {
+        let m = self.chol.l_dirty().nrows();
+        let columns: Vec<DVector<f64>> = (0..m)
+            .into_par_iter()
+            .map(|j| {
+                let mut e = DVector::<f64>::zeros(m);
+                e[j] = 1.0;
+                self.chol.solve(&e)
+            })
+            .collect();
+        DMatrix::from_columns(&columns)
     }
 }
 
@@ -2411,6 +2427,46 @@ fn solve_step(
         let coarse = pcg_coarse_size()
             .filter(|_| mu <= PCG_COARSE_MAX_MU)
             .and_then(|g| coarse_correction(&frame_diag, edges, &flat_offdiag, first_extra, g));
+        // A registered accelerator (e.g. visloc-ba-gpu's) runs the same
+        // iteration; it may decline, and then the CPU solve below runs.
+        if let Some(accelerator) = crate::ba_accel::reduced_solve_accelerator() {
+            let mut offdiag = vec![0.0f32; flat_offdiag.len() * 36];
+            offdiag
+                .par_chunks_mut(36)
+                .zip(flat_offdiag.par_iter())
+                .for_each(|(out, blk)| {
+                    for (o, &v) in out.iter_mut().zip(blk.as_slice()) {
+                        *o = v as f32;
+                    }
+                });
+            let coarse_inverse = coarse.as_ref().map(CoarseCorrection::inverse);
+            let system = ReducedCameraSystem {
+                diag: &frame_diag,
+                edges,
+                offdiag: &offdiag,
+                rhs: &frame_bc,
+                clusters: clusters.as_deref(),
+                coarse: coarse
+                    .as_ref()
+                    .zip(coarse_inverse.as_ref())
+                    .map(|(c, inverse)| (c.group, c.n_frames, inverse)),
+                tol: pcg_relative_tolerance(),
+                max_iterations: PCG_MAX_ITERATIONS,
+            };
+            if let Some((dx_frames, iterations)) = accelerator.solve(&system) {
+                timings.pcg_iterations += iterations;
+                timings.linsolve += t.elapsed();
+                return Some(back_substitute(
+                    problem,
+                    lin,
+                    frame_diag_raw,
+                    frame_bc_raw,
+                    dx_frames,
+                    mu,
+                    timings,
+                ));
+            }
+        }
         let (solved, iterations) = pcg_core(
             &frame_diag,
             matvec,

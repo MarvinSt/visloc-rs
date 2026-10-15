@@ -123,6 +123,27 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **COLMAP-port mapper: large bundle adjustments on the GPU.**
+  `colmap_incremental_mapper --gpu-ba 1` and `gsplat_photos --gpu-ba` (both
+  `--features gpu` builds) solve the reduced camera system of large bundle
+  adjustments through wgpu (`visloc_ba_gpu::GpuReducedSolver`). Without the
+  flag nothing changes: the CPU path stays bit-identical.
+  - **What moves:** bundle adjustments with at least 1,000 free frames. The
+    GPU forms the reduced camera system's off-diagonal blocks and runs the
+    preconditioned conjugate gradients. The CPU keeps the linearization,
+    the diagonal blocks and right-hand side, the preconditioner's
+    factorization and the back-substitution, in f64.
+  - **Deterministic:** the blocks are exact sums (64-bit fixed point over
+    two 32-bit atomics) and the conjugate gradients reduce in a fixed
+    order, so a solve repeats exactly on a given device. It is not
+    bit-identical to the CPU path.
+  - **Validation:** on a SmallCity pass-1 replay (1,499 photos, llvmpipe)
+    the large bundle adjustments take the CPU's PCG iteration counts, and
+    the camera centres differ from the CPU model by a median of 5e-6 and at
+    most 0.015% of the scene extent.
+  - `visloc_slam::ReducedSolveAccelerator` is the hook another backend can
+    implement. Details: `docs/gpu_bundle_adjustment.md`.
+
 - **ETH3D benchmark against COLMAP 4.2 and GLOMAP.**
   - **What it runs:** `scripts/benchmark_eth3d_auc.sh` runs the visloc-rs
     mapper, COLMAP's incremental mapper and COLMAP's global mapper (GLOMAP,
@@ -458,6 +479,21 @@ All notable changes to `visloc-rs` will be documented here.
   fixed unless `refine_distortion` is set). Default off.
 
 ### Changed
+
+- **COLMAP-port BA: cheaper setup of large bundle adjustments.** Results
+  are bit-identical: the SmallCity pass-1 model matches byte for byte.
+  - **First linearization.** A solve's first linearization zeroed its
+    camera-point block array on one thread (2 GB on SmallCity's last
+    bundle adjustments). It is now zeroed in parallel, which also spreads
+    the first touch of its pages over the threads.
+  - **Slot index.** The reduced system's pattern and the elimination's
+    contribution index each built the same list of observing points per
+    frame. It is now built once, in parallel over chunks of points.
+  - **SmallCity pass 1** (1,499 photos, 4 threads, one run each; the
+    machine varies by about 10% between runs): the large bundle
+    adjustments' linearization takes 5.8 s instead of 13.5 s, all global
+    bundle adjustments 208 s instead of 258 s, and the mapper 364.4 s
+    instead of 391.6 s.
 
 - **COLMAP-port mapper: global track completion skips tracks it cannot
   extend.** Results are bit-identical: all 13 local ETH3D scenes and the

@@ -123,6 +123,25 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **VLFeat-compatible SIFT on the GPU (`gsplat_photos --gpu-sift`).**
+  `visloc_sift_gpu::VlfeatSiftGpu` ports the photo pipeline's SIFT (the
+  VLFeat-compatible detector and descriptor with COLMAP's byte
+  descriptors) to f32 WGSL. Off by default.
+  - **On the GPU:** both scale spaces, the DoG extrema with VLFeat's
+    five-step refinement, the orientation histograms, the descriptor
+    pyramid's gradients and the descriptors.
+  - **On the host, as the CPU path does:** the scan order, the per-locus
+    orientation cap, the per-level `max_keypoints` cap and each keypoint's
+    descriptor level, in f64.
+  - **Against the CPU extractor (f64):** on SmallCity photos 99.96% of the
+    keypoints pair up both ways and descriptor bytes differ by at most one.
+    On 40 SmallCity photos `gsplat_photos` verifies 700 of 780 pairs and
+    registers 40/40 either way.
+  - Each pyramid level is its own buffer, so no binding exceeds one level;
+    an image past the device's limit is extracted on the CPU.
+    `sift_vlfeat_gpu_bench` compares the two extractors on a directory of
+    images.
+
 - **COLMAP-port mapper: large bundle adjustments on the GPU.**
   `colmap_incremental_mapper --gpu-ba 1` and `gsplat_photos --gpu-ba` (both
   `--features gpu` builds) solve the reduced camera system of large bundle
@@ -141,6 +160,9 @@ All notable changes to `visloc-rs` will be documented here.
     the large bundle adjustments take the CPU's PCG iteration counts, and
     the camera centres differ from the CPU model by a median of 5e-6 and at
     most 0.015% of the scene extent.
+  - **Not faster yet:** on an NVIDIA L4 with 21 CPU threads, SmallCity's
+    mapper took 1,193 s with it and 1,168 s without; the GPU's block
+    product and elimination are the reasons.
   - `visloc_slam::ReducedSolveAccelerator` is the hook another backend can
     implement. Details: `docs/gpu_bundle_adjustment.md`.
 

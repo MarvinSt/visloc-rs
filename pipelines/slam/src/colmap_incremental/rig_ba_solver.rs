@@ -529,31 +529,49 @@ fn build_reduced_system_pattern(
             fill[s] += 1;
         }
     }
-    let rows: Vec<Vec<u32>> = (0..n_slots)
-        .into_par_iter()
-        .map(|a| {
-            let mut row: Vec<u32> = Vec::new();
+    // Up to `EDGE_RANK_MAX_SLOTS` frames the rows are bitmaps over the
+    // slots ([`EdgeRank`]): marking every pair's bit leaves each row sorted
+    // and unique without a sort, and a pair's edge index below is its row's
+    // offset plus one popcount. Past that, each row gathers and sorts its
+    // partners, and the pairs search their rows.
+    let (row_off, edges, rank) = if n_slots <= EDGE_RANK_MAX_SLOTS {
+        let rank = EdgeRank::new(n_slots, |a, bits| {
             for &[p, k] in &slot_points[slot_off[a]..slot_off[a + 1]] {
-                row.extend(
-                    point_free_frames[p as usize][k as usize + 1..]
-                        .iter()
-                        .map(|&f| free_frame_slot[f as usize].expect("free")),
-                );
+                for &f in &point_free_frames[p as usize][k as usize + 1..] {
+                    let b = free_frame_slot[f as usize].expect("free");
+                    bits[b as usize / 64] |= 1 << (b % 64);
+                }
             }
-            row.sort_unstable();
-            row.dedup();
-            row
-        })
-        .collect();
-    let mut row_off = vec![0usize; n_slots + 1];
-    for (a, row) in rows.iter().enumerate() {
-        row_off[a + 1] = row_off[a] + row.len();
-    }
-    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(row_off[n_slots]);
-    for (a, row) in rows.iter().enumerate() {
-        edges.extend(row.iter().map(|&b| (a as u32, b)));
-    }
-    drop(rows);
+        });
+        let (row_off, edges) = rank.edges();
+        (row_off, edges, Some(rank))
+    } else {
+        let rows: Vec<Vec<u32>> = (0..n_slots)
+            .into_par_iter()
+            .map(|a| {
+                let mut row: Vec<u32> = Vec::new();
+                for &[p, k] in &slot_points[slot_off[a]..slot_off[a + 1]] {
+                    row.extend(
+                        point_free_frames[p as usize][k as usize + 1..]
+                            .iter()
+                            .map(|&f| free_frame_slot[f as usize].expect("free")),
+                    );
+                }
+                row.sort_unstable();
+                row.dedup();
+                row
+            })
+            .collect();
+        let mut row_off = vec![0usize; n_slots + 1];
+        for (a, row) in rows.iter().enumerate() {
+            row_off[a + 1] = row_off[a] + row.len();
+        }
+        let mut edges: Vec<(u32, u32)> = Vec::with_capacity(row_off[n_slots]);
+        for (a, row) in rows.iter().enumerate() {
+            edges.extend(row.iter().map(|&b| (a as u32, b)));
+        }
+        (row_off, edges, None)
+    };
 
     let point_pair_edge_idx: Vec<Vec<u32>> = point_free_frames
         .par_iter()
@@ -568,6 +586,14 @@ fn build_reduced_system_pattern(
             let mut idxs = vec![0u32; n * (n - 1) / 2];
             for i in 0..n {
                 let a = slots[i] as usize;
+                if let Some(rank) = &rank {
+                    for j in i + 1..n {
+                        let e = row_off[a] + rank.position(a, slots[j]);
+                        debug_assert_eq!(edges[e], (slots[i], slots[j]), "pair is an edge");
+                        idxs[pair_slot(n, i, j)] = e as u32;
+                    }
+                    continue;
+                }
                 let row = &edges[row_off[a]..row_off[a + 1]];
                 let mut pos = 0usize;
                 for j in i + 1..n {
@@ -581,6 +607,88 @@ fn build_reduced_system_pattern(
         .collect();
 
     (point_free_frames, edges, point_pair_edge_idx)
+}
+
+/// Frame slots up to which [`EdgeRank`] indexes the edge rows: its bitmaps
+/// take `n² / 8` bytes and their counts half that again (6 MB at SmallCity's
+/// 5,800 frames, 48 MB here).
+const EDGE_RANK_MAX_SLOTS: usize = 16_384;
+
+/// The reduced camera system's edge rows as bitmaps over the frame slots,
+/// with each 64-bit word's count of the row's earlier columns, so a column's
+/// position in its row is one popcount. Building a point's pair -> edge
+/// indices by searching each row instead cost most of a large global BA's
+/// setup (tracks of tens of frames have hundreds of pairs each).
+struct EdgeRank {
+    words: usize,
+    bits: Vec<u64>,
+    before: Vec<u32>,
+}
+
+impl EdgeRank {
+    /// `mark(a, bits)` sets row `a`'s bits: the slots `b > a` sharing a
+    /// point with `a`.
+    fn new(n_slots: usize, mark: impl Fn(usize, &mut [u64]) + Sync) -> Self {
+        let words = n_slots.div_ceil(64).max(1);
+        let mut bits = vec![0u64; n_slots * words];
+        let mut before = vec![0u32; n_slots * words];
+        bits.par_chunks_mut(words)
+            .zip(before.par_chunks_mut(words))
+            .enumerate()
+            .for_each(|(a, (bits, before))| {
+                mark(a, bits);
+                let mut count = 0u32;
+                for (word, before) in bits.iter().zip(before.iter_mut()) {
+                    *before = count;
+                    count += word.count_ones();
+                }
+            });
+        Self {
+            words,
+            bits,
+            before,
+        }
+    }
+
+    /// The row offsets and the edges `(a, b)`, ascending.
+    fn edges(&self) -> (Vec<usize>, Vec<(u32, u32)>) {
+        let n_rows = self.bits.len() / self.words;
+        let mut row_off = vec![0usize; n_rows + 1];
+        for a in 0..n_rows {
+            let last = (a + 1) * self.words - 1;
+            row_off[a + 1] =
+                row_off[a] + self.before[last] as usize + self.bits[last].count_ones() as usize;
+        }
+        let mut edges = vec![(0u32, 0u32); row_off[n_rows]];
+        let mut rows: Vec<&mut [(u32, u32)]> = Vec::with_capacity(n_rows);
+        let mut rest = edges.as_mut_slice();
+        for a in 0..n_rows {
+            let (row, tail) = rest.split_at_mut(row_off[a + 1] - row_off[a]);
+            rows.push(row);
+            rest = tail;
+        }
+        rows.into_par_iter().enumerate().for_each(|(a, row)| {
+            let mut out = row.iter_mut();
+            let words = &self.bits[a * self.words..(a + 1) * self.words];
+            for (w, &word) in words.iter().enumerate() {
+                let mut word = word;
+                while word != 0 {
+                    let b = (w * 64) as u32 + word.trailing_zeros();
+                    *out.next().expect("counted") = (a as u32, b);
+                    word &= word - 1;
+                }
+            }
+        });
+        (row_off, edges)
+    }
+
+    /// The position of column `b` in row `a`: the row's columns below `b`.
+    #[inline]
+    fn position(&self, a: usize, b: u32) -> usize {
+        let w = a * self.words + b as usize / 64;
+        let below = self.bits[w] & ((1u64 << (b % 64)) - 1);
+        self.before[w] as usize + below.count_ones() as usize
+    }
 }
 
 /// Position of the pair `(i, j)`, `i < j < n`, among a point's `n (n - 1) / 2`

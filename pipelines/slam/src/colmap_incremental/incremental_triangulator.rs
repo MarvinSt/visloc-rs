@@ -651,6 +651,13 @@ impl IncrementalTriangulator {
     }
 
     /// Port of `CompleteAllTracks` (`.cc:264-276`).
+    ///
+    /// A track can only gain a 2D point that one of its observations
+    /// corresponds to, of a registered image and without a 3D point, and a
+    /// pass only adds observations. The tracks with no such correspondence
+    /// would each search their neighbourhood and add nothing, so they are
+    /// left out: found from those 2D points instead, through the
+    /// correspondences (which run both ways), in one pass over them.
     pub fn complete_all_tracks(
         &mut self,
         options: &Options,
@@ -658,7 +665,7 @@ impl IncrementalTriangulator {
         graph: &CorrespondenceGraph,
         obs: &mut ObservationManager,
     ) -> usize {
-        let ids = recon.point3d_ids();
+        let ids = points_reaching_free_2d_points(recon, graph);
         self.complete_tracks(options, recon, graph, obs, &ids)
     }
 
@@ -1131,6 +1138,43 @@ impl IncrementalTriangulator {
         }
         num_completed
     }
+}
+
+/// The points, ascending, with an observation corresponding to a 2D point of
+/// a registered image without a 3D point: the only tracks
+/// [`IncrementalTriangulator::complete_all_tracks`] can extend.
+fn points_reaching_free_2d_points(
+    recon: &Reconstruction,
+    graph: &CorrespondenceGraph,
+) -> Vec<Point3DT> {
+    use rayon::prelude::*;
+    let image_ids: Vec<ImageT> = recon
+        .images()
+        .keys()
+        .copied()
+        .filter(|&id| recon.is_image_registered(id) && graph.exists_image(id as usize))
+        .collect();
+    let mut ids: Vec<Point3DT> = image_ids
+        .par_iter()
+        .flat_map_iter(|&image_id| {
+            let mut found = Vec::new();
+            for (idx, point2d) in recon.image(image_id).points2d.iter().enumerate() {
+                if point2d.has_point3d() {
+                    continue;
+                }
+                for corr in graph.find_correspondences(image_id as usize, idx) {
+                    let corr_image = recon.image(corr.image_id as ImageT);
+                    if let Some(id) = corr_image.points2d[corr.point2d_idx].point3d_id {
+                        found.push(id);
+                    }
+                }
+            }
+            found
+        })
+        .collect();
+    ids.par_sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// Points per speculative planning wave of [`IncrementalTriangulator::complete_tracks`] /

@@ -8,9 +8,10 @@
 //!    renders one camera), and write it to `out_dir/images`.
 //! 2. Focal length from the EXIF 35 mm equivalent when present, else
 //!    COLMAP's prior of 1.2 x the long side; principal point at the centre.
-//! 3. SIFT (COLMAP's VLFeat detector and descriptor, RootSIFT), GPU matching,
-//!    two-view verification: exhaustive pairs for up to `exhaustive_max`
-//!    images, a sliding window over the sorted names beyond.
+//! 3. SIFT (COLMAP's VLFeat detector and descriptor, RootSIFT; on the GPU
+//!    with `gpu_sift`), GPU matching, two-view verification: exhaustive
+//!    pairs for up to `exhaustive_max` images, a sliding window over the
+//!    sorted names beyond.
 //! 4. The COLMAP incremental-mapper port, then one global bundle adjustment
 //!    that also refines the shared intrinsics (the port keeps them fixed).
 

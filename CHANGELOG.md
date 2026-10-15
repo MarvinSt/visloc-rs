@@ -142,6 +142,10 @@ All notable changes to `visloc-rs` will be documented here.
     43.8 s (7.5 ms a photo), against 201.9 s for the CPU extractor on 23
     threads. Images of one size are pipelined: the GPU detects the next
     image while the host orders and caps the current one's candidates.
+  - **ETH3D, the 13 DSLR training scenes** (an RTX 3090, 13 CPU threads):
+    extraction takes 10.0 s against 92.4 s, and the visloc-rs mapper
+    scores the same: mean AUC@1°/3°/5° 53.08 / 78.85 / 85.68 against
+    53.09 / 78.85 / 85.69, 448/454 registered either way.
   - Each pyramid level is its own buffer, so no binding exceeds one level;
     an image past the device's limit is extracted on the CPU.
     `sift_vlfeat_gpu_bench` compares the two extractors on a directory of

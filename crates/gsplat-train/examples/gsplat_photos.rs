@@ -13,7 +13,7 @@
 //! large bundle adjustments on the GPU (docs/gpu_bundle_adjustment.md);
 //! `--cpu` matches on the CPU.
 //!
-//! SfM from `visloc_gsplat_train::photos` (EXIF focal, GPU SIFT/matching,
+//! SfM from `visloc_gsplat_train::photos` (EXIF focal, SIFT, GPU matching,
 //! the COLMAP-port mapper, intrinsics refinement), brush-strategy training,
 //! then mesh extraction (`visloc_gsplat_train::mesh`). Writes
 //! `<out>/scene.ply` and `<out>/mesh.ply`; no COLMAP or Python involved.

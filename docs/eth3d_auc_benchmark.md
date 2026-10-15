@@ -249,13 +249,31 @@ built from source with CUDA and Caspar, its GPU bundle adjuster:
   | Mapper | 158.6 s (global) | **37.4 s** |
   | Total | 225.0 s | **195.7 s** |
 
-  - visloc-rs's SIFT is its VLFeat-compatible CPU extractor, the photo
-    pipeline's default. The GPU SIFT in `visloc-sift-gpu` does not
-    reproduce VLFeat's detector and descriptor, so the pipeline does not
-    use it with these settings. This is the largest gap left: COLMAP
-    extracts six times faster.
+  - visloc-rs's SIFT here is its VLFeat-compatible CPU extractor, the photo
+    pipeline's default; COLMAP extracts six times faster. visloc-rs's GPU
+    extractor is in the next point.
   - COLMAP's extraction time includes decoding its images, resized to
     1,600 px beforehand. visloc-rs's starts after decoding.
+- **visloc-rs's GPU SIFT** (`gsplat_photos --gpu-sift`), the same 13 scenes
+  with each extractor on another machine (RunPod: an RTX 3090, 13 CPU
+  threads, commit `f8ee5b5`):
+
+  | | CPU SIFT | GPU SIFT |
+  |---|---|---|
+  | Feature extraction | 92.4 s | **10.0 s** |
+  | Matching and verification | 19.4 s | 17.3 s |
+  | Mapper | 17.9 s | 18.8 s |
+  | Mean AUC@1° / 3° / 5° | 53.09 / 78.85 / 85.69 | 53.08 / 78.85 / 85.68 |
+  | Registered | 448 / 454 | 448 / 454 |
+
+  - The CPU extractor scores as on the L4 machine above, scene by scene.
+  - With the GPU extractor no scene's AUC moves by more than 0.5 points
+    (courtyard at 1°); at 1° it goes up in six scenes and down in seven.
+    The mean keypoint counts per image agree to within one in 12 scenes
+    and differ by 0.6% on facade.
+  - The RTX 3090 is a faster GPU than the L4, so its 10.0 s does not
+    compare directly with COLMAP's 22.2 s.
+  - The results are in `benchmarks/eth3d_auc_gpu/gpu_sift/`.
 
 ### SmallCity
 
@@ -299,8 +317,11 @@ matches (6.6 min):
 - **The GPU bundle adjustment** is not faster on this GPU, and its run parts
   from the CPU run after its first solve
   ([GPU bundle adjustment](gpu_bundle_adjustment.md)).
+- **GPU SIFT** (`--gpu-sift`, an RTX 3090 machine with 23 CPU threads):
+  the 5,822 photos at 1,024 px take 43.8 s, against 201.9 s for the CPU
+  extractor on the same machine.
 - The ETH3D results are in `benchmarks/eth3d_auc_gpu/`, the SmallCity logs
-  in `benchmarks/smallcity_gpu/`.
+  in `benchmarks/smallcity_gpu/` (`sift_*.log` for the extractors).
 
 ## Caveats
 

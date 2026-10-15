@@ -52,4 +52,41 @@ deterministic on a given device, but it is not bit-identical to the CPU path.
   scene extent. Forming the blocks on the GPU instead of the CPU changed the
   final camera centres by at most 5e-15.
 
-Speed on a real GPU: pending a pod benchmark.
+## Speed on a GPU: not faster yet
+
+On an NVIDIA L4 (24 GB, 300 GB/s) with 21 CPU threads, the GPU path is
+slower than the CPU's. SmallCity, all 5,822 photos, mapper seed 0, commit
+`3dd9550`, the same matches for both runs:
+
+| | CPU | `--gpu-ba 1` |
+|---|---|---|
+| Mapper | **1,168 s** | 1,193 s |
+| Peak memory | 18.8 GiB | **16.9 GiB** |
+| Elimination, per LM trial (5,000+ frames) | **1.58 s** | 1.87 s |
+| PCG, per iteration (5,000+ frames) | **7.9 ms** | 14.9 ms |
+
+- **Products.** The GPU's matrix-vector product reads every off-diagonal
+  block twice, once per triangle: 980 MB per product at SmallCity's size,
+  at about 65 GB/s, a fifth of the L4's bandwidth. The CPU reads each block
+  once and applies it both ways.
+- **Elimination.** It loses at every size from 1,000 frames up (0.52 s
+  against 0.30 s a trial at 1,000 to 2,000 frames). The likely cause is the
+  fixed-point atomics: consecutive frames share most of their points, so a
+  workgroup's threads keep adding into the same few counters.
+- **The two runs part** after the first bundle adjustment the GPU solves
+  (1,005 frames: one 3D point fewer), as any last-bit difference makes the
+  incremental mapper do. They end at a median camera-centre error of
+  0.281 m (CPU) and 0.577 m (GPU) against the release's own model. The GPU
+  run's final bundle adjustment rejected 7 of its 16 trials, the CPU run's
+  none of 14. One run each, so this does not show that the GPU path is
+  less accurate; it does not show the opposite either.
+
+What it would take to win:
+
+- a block product that reads each block once, in contiguous runs per
+  workgroup, writing the transposed half per edge and gathering it in a
+  second pass;
+- the elimination back on the CPU, which already forms the blocks faster;
+  the off-diagonal blocks then go up once per trial (490 MB in f32);
+- a GPU with more bandwidth: the CPU here is 21 threads of a large server
+  part.

@@ -664,6 +664,39 @@ def mode_vectors(modes, kf_s, r_wi, t_wi, vel, pts, lm_first):
     return np.array(out_x), np.array(out_l)
 
 
+def deform(mode, beta, kf_s, r_wi, t_wi, vel, bias, pts, lm_first):
+    """The finite deformation whose tangent mode_vectors gives, applied with amplitude beta.
+
+    Applied exactly instead of through the pose retraction: GTSAM's Pose3 retraction couples
+    rotation and translation, and a heading turn of 0.05 rad would move far keyframes by decimetres.
+    """
+    dur = max(kf_s[-1] - kf_s[0], 1e-9)
+    s = (kf_s - kf_s[0]) / dur
+    s_mid = 0.5 * (s[1:] + s[:-1])
+    dp = np.diff(t_wi, axis=0)
+    k = lm_first
+    bias = bias.copy()
+    if mode == "yaw":
+        def rz(angle):
+            c, sn, zero, one = np.cos(angle), np.sin(angle), np.zeros_like(angle), np.ones_like(angle)
+            return np.stack([np.stack([c, -sn, zero], -1), np.stack([sn, c, zero], -1),
+                             np.stack([zero, zero, one], -1)], -2)
+        turn, turn_mid = rz(beta * s), rz(beta * s_mid)
+        t_new = np.vstack([t_wi[:1], t_wi[:1] + np.cumsum(np.einsum("nij,nj->ni", turn_mid, dp), axis=0)])
+        r_new = np.einsum("nij,njk->nik", turn, r_wi)
+        vel_new = np.einsum("nij,nj->ni", turn, vel)
+        bias[:, 3:6] -= beta * r_wi[:, 2, :].mean(0) / dur  # R^T z: the body-frame vertical
+        pts_new = t_new[k] + np.einsum("nij,nj->ni", turn[k], pts - t_wi[k])
+    elif mode == "scale":
+        t_new = np.vstack([t_wi[:1], t_wi[:1] + np.cumsum(dp * (1 + beta * s_mid[:, None]), axis=0)])
+        r_new = r_wi
+        vel_new = vel * (1 + beta * s[:, None])
+        pts_new = t_new[k] + (1 + beta * s[k, None]) * (pts - t_wi[k])
+    else:
+        raise ValueError(f"unknown mode {mode}")
+    return r_new, t_new, vel_new, bias, pts_new
+
+
 def _band_matvec(ab, x):
     """Symmetric banded matrix (lower storage) times a vector."""
     nb = len(x)
@@ -742,6 +775,7 @@ def cmd_solve(a):
     cost = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[0] + graph.error(values)
     print(f"initial cost {cost:.6g}", flush=True)
     lam = a.lambda0
+    mu = 0.0  # damping of the modes relative to their own curvature: none until a step with them fails
     for it in range(a.iterations):
         ti = time.time()
         if a.outlier_px > 0 and it >= a.outlier_start:
@@ -867,7 +901,7 @@ def cmd_solve(a):
                         ce[:, sl * 3:sl * 3 + 3] -= pe[:, rp.ext_slot[rp.cam[has]] == sl].sum(1)
                     corner[:ne, ne:], corner[ne:, :ne] = ce.T, ce
                 cmm = vhv - np.einsum("mlk,nlk->mn", hv_l, q)
-                corner[ne:, ne:] = cmm + np.diag(1e-12 * np.abs(np.diag(cmm)) + 1e-12)
+                corner[ne:, ne:] = cmm + np.diag((mu + 1e-12) * np.abs(np.diag(cmm)) + 1e-12)
                 rhs[nb + ne:] = b_v + np.einsum("mlk,lk->m", hv_l, np.einsum("lij,lj->li", h_ll_inv, g_l))
             try:
                 cfac = cholesky_banded(ab, lower=True)
@@ -876,7 +910,20 @@ def cmd_solve(a):
                 continue
             if nz:  # block elimination of the border
                 yb = cho_solve_banded((cfac, True), border)
-                s_inv = np.linalg.inv(corner - border.T @ yb)
+                schur = corner - border.T @ yb
+                s_inv = np.linalg.inv(schur)
+                if modes_on and len(rp.off_keys) == 0:
+                    # trust region: damp the modes further until each step is within its cap
+                    rz = rhs[nb:] - border.T @ cho_solve_banded((cfac, True), rhs[:nb])
+                    cap = np.array([a.mode_cap_yaw if m_ == "yaw" else a.mode_cap_scale for m_ in modes])
+                    extra = 0.0
+                    for _ in range(30):
+                        if np.all(np.abs((s_inv @ rz)[ne:]) <= cap):
+                            break
+                        extra = 4 * extra if extra else 1e-3
+                        damped = schur.copy()
+                        damped[ne:, ne:] += np.diag(extra * np.abs(np.diag(cmm)))
+                        s_inv = np.linalg.inv(damped)
 
             def precond(r_):
                 y0 = cho_solve_banded((cfac, True), r_[:nb])
@@ -897,9 +944,6 @@ def cmd_solve(a):
             if modes_on:
                 back += np.einsum("mlk,m->lk", hv_l, dk)
             dl = -np.einsum("nij,nj->ni", h_ll_inv, g_l + back)
-            if modes_on:  # every state also moves along the modes
-                dx = dx + vxf.T @ dk
-                dl = dl + np.einsum("mlk,m->lk", v_l, dk)
             vv = gtsam.VectorValues()
             for key, (col, dim) in index.items():
                 vv.insert(key, dx[col:col + dim])
@@ -909,14 +953,29 @@ def cmd_solve(a):
                 new_ric[c] = r_ic[c] @ so3_exp(de[rp.ext_slot[c] * 3:rp.ext_slot[c] * 3 + 3])
             new_pts = pts + dl
             nr, nt = poses(new_values)
+            if modes_on:  # the modes' share of the step, as exact deformations
+                st = (nr, nt, np.array([new_values.atVector(V(k)) for k in range(n)]),
+                      np.array([np.r_[new_values.atConstantBias(B(k)).accelerometer(),
+                                      new_values.atConstantBias(B(k)).gyroscope()] for k in range(n)]), new_pts)
+                for mo, be in zip(modes, dk):
+                    st = deform(mo, be, kf_s, *st, lm_first)
+                new_values = gtsam.Values()
+                for k in range(n):
+                    new_values.insert(X(k), gtsam.Pose3(gtsam.Rot3(st[0][k]), st[1][k]))
+                    new_values.insert(V(k), st[2][k])
+                    new_values.insert(B(k), gtsam.imuBias.ConstantBias(st[3][k, 0:3], st[3][k, 3:6]))
+                nr, nt, new_pts = st[0], st[1], st[4]
             new_cost = rp.cost(nr, nt, new_ric, t_ic, new_pts)[0] + graph.error(new_values)
             if new_cost < cost:
                 rel = (cost - new_cost) / cost
                 values, r_ic, pts, r_wi, t_wi, cost = new_values, new_ric, new_pts, nr, nt, new_cost
                 lam = max(lam / 3, 1e-10)
+                mu = mu / 10 if mu > 1e-4 else 0.0
                 accepted = True
                 break
             lam *= 5
+            if modes_on:  # a rejected step also shrinks the modes' share
+                mu = max(mu * 10, 1e-3)
         msg = f"iter {it:2d}: cost {cost:.6g} lambda {lam:.1e} {time.time() - ti:.0f} s"
         if modes_on and accepted:
             msg += " | " + " ".join(f"{mo} {d_:+.2e}" for mo, d_ in zip(modes, dk))
@@ -1085,6 +1144,8 @@ def main():
     s.add_argument("--modes", default="", help="undamped deformation modes of the whole solution: yaw, scale "
                    "(comma-separated); they let LM move along slow drifts the damped steps cannot follow")
     s.add_argument("--modes-start", type=int, default=3, help="first iteration that uses the modes")
+    s.add_argument("--mode-cap-yaw", type=float, default=0.01, help="largest yaw-mode step per iteration (rad)")
+    s.add_argument("--mode-cap-scale", type=float, default=0.01, help="largest scale-mode step per iteration")
     a = p.parse_args()
     {"features": cmd_features, "match": cmd_match, "loops": cmd_loops, "solve": cmd_solve}[a.cmd](a)
 

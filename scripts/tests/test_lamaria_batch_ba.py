@@ -132,6 +132,17 @@ class ModeVectorTest(unittest.TestCase):
             for j, k in enumerate(lm_first):
                 moved = t2[k] + turn(s[k]) @ (pts[j] - t_wi[k])
                 np.testing.assert_allclose((moved - pts[j]) / k_, vl[m, j], atol=1e-4)
+        # deform applies the same drifts exactly: to first order it moves every state along the modes
+        bias = rng.normal(size=(n, 6)) * 1e-3
+        for m, mode in enumerate(("yaw", "scale")):
+            r2, t2, v2, b2, p2 = lb.deform(mode, k_, kf_s, r_wi, t_wi, vel, bias, pts, lm_first)
+            for k in range(n):
+                w = np.radians(lb.so3_log_deg(r_wi[k].T @ r2[k])) / k_
+                np.testing.assert_allclose(w, vx[m, k, 0:3], atol=1e-4)
+                np.testing.assert_allclose(r_wi[k].T @ (t2[k] - t_wi[k]) / k_, vx[m, k, 3:6], atol=1e-4)
+            np.testing.assert_allclose((v2 - vel) / k_, vx[m, :, 6:9], atol=1e-4)
+            np.testing.assert_allclose((b2 - bias) / k_, vx[m, :, 9:15], atol=1e-6)
+            np.testing.assert_allclose((p2 - pts) / k_, vl[m], atol=1e-4)
         # the yaw mode shifts the gyro bias by one offset: the mean body vertical per unit heading rate
         up_body = np.einsum("nji,j->ni", r_wi, [0.0, 0.0, 1.0])
         np.testing.assert_allclose(vx[0, :, 12:15], -up_body.mean(0)[None].repeat(n, 0) / (kf_s[-1] - kf_s[0]))

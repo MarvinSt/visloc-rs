@@ -306,6 +306,23 @@ loses 7 points:
 
 It stays off by default as well.
 
+### Starting from the online mapper
+
+On Medium and Moving platform the online mapper's trajectory beats the VIO
+([`lamaria_plan.md`](lamaria_plan.md), lever 11). Starting the BA from it
+(the observations still selected with the VIO) gives:
+
+| Sequence | Start: VIO | Start: mapper | Final cost VIO / mapper start | Fitted heading drift VIO / mapper start |
+|---|---:|---:|---:|---:|
+| sequence_2_11 | **61.03** | 54.41 | 240,741 / 228,230 | −0.34° / +0.67° |
+| sequence_5_11 | 59.06 | **62.84** | 294,609 / 293,437 | |
+
+On sequence_2_11 the mapper start ends better by every measure but the
+Score: a lower cost, half the IMU cost (11,300 against 20,600), the same
+Sim(3) RMSE against the pseudo-GT (1.50 m) and a lower 60 s segment RMSE
+(0.199 m against 0.206 m). It keeps the mapper's heading drift, though, and
+that is what the CPs see. The lowest cost does not pick the better start.
+
 ## Usage
 
 ```bash

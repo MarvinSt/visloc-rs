@@ -129,6 +129,25 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **Multi-view stereo: `visloc-mvs`.** Dense point clouds from a COLMAP
+  sparse model with undistorted images: PatchMatch depth and normal maps
+  (ACMH, with ACMM's geometric consistency and multi-scale scheme), fused
+  into `fused.ply`, on the CPU or on the GPU through wgpu
+  (`--features gpu`). Details and scores in `docs/mvs.md`.
+  - **ETH3D high-res training, all 13 scenes at 3200 px, one NVIDIA L4:**
+    F1 79.4% at 2 cm on average (accuracy 85.9%, completeness 74.8%) with
+    the example's defaults (one scale, two geometric passes). ACMM reports
+    78.86% and COLMAP 67.66% on the same scenes. ACMM's multi-scale scheme
+    (`--scales 3`) scores 78.0%: it helps weakly textured scenes and costs
+    accuracy on detailed ones.
+  - **Time:** 65 minutes for all 13 scenes, 1:42 to 11:40 per scene,
+    loading and fusion included.
+  - **Fusion:** one agreeing source view within 15° keeps a point by
+    default (ACMM asks for two views within 10°): over the 13 scenes,
+    79.4% against 77.3% with two views at 30°.
+  - **Run it:** `cargo run --release -p visloc-mvs --features gpu
+    --example mvs -- --sparse <model> --images <dir> --out <dir> --gpu`.
+
 - **COLMAP-port mapper: complete the largest model
   (`complete_largest_model=1`).** Off by default in the mapper; on in
   `gsplat_photos` (`--no-complete-model` turns it off, see Changed).
@@ -577,6 +596,85 @@ All notable changes to `visloc-rs` will be documented here.
 - **`gsplat_photos` logs how long decoding the photos took**, on its
   `N images at WxH` line. COLMAP's extraction times include decoding;
   `gsplat_photos`' SIFT times do not.
+
+- **COLMAP-port mapper: faster loading and model export, byte-identical.**
+  - **Loading:** the replay export's feature files are parsed in
+    parallel, and the correspondence graph looks up a pair's two images
+    once instead of per match and flattens images in parallel.
+  - **Export:** the COLMAP text writer
+    (`write_colmap_reconstruction_for_3dgs_with_cameras`) appends numbers
+    to its buffers instead of allocating a string each, keeps keypoint ids
+    in dense arrays instead of maps, and formats `points3D.txt` and
+    `images.txt` in parallel chunks joined in order.
+  - **SmallCity pass 1** (1,499 photos, 4 threads): loading 6.3 s instead
+    of 8.8 s, export 3.1 s instead of 8.4 s, and the model files are
+    byte-identical.
+  - `colmap_incremental_mapper` now logs both times.
+
+- **COLMAP-port mapper: about half the memory, byte-identical.** SmallCity
+  pass 1 (1,499 photos, 4 threads) writes the same model files as before:
+
+  | | before | now |
+  |---|---|---|
+  | Peak memory | 4.90 GB | **2.60 GB** |
+  | Memory after loading | 2.94 GB | **0.70 GB** |
+  | Loading | 6.5 s | **0.9 s** |
+  | Mapper wall time | 5:03 | **4:25** |
+
+  - **All of SmallCity** (5,822 photos, one run on an NVIDIA L4 pod with
+    13 CPU threads): peak memory **9.0 GiB** instead of 18.9 GiB (the run
+    in `docs/gpu_bundle_adjustment.md`, an L4 pod with 15 threads), and
+    2.7 GiB instead of 11.3 GiB after loading.
+    - **Accuracy:** the model registers 5,816 photos with a median
+      camera-centre error of 0.184 m (p90 0.276 m) against the release's
+      model.
+    - **Why the models differ:** the two runs' VLAD retrieval picked
+      slightly different candidate pairs (242,917 against 242,592), so the
+      mapper's input differed. The earlier model scored 0.297 m. Both lie
+      within the 0.15 to 0.65 m that mapper seeds alone give on this
+      capture.
+    - **Wall time:** the newer pod ran the unchanged stages 1.6 to 2.0
+      times slower, so the wall times (1,380 s against 847 s) do not
+      compare. The pass-1 replay above times both versions on one machine.
+    - **What remains:** the largest working sets are the last global
+      bundle adjustments', on 15.1M observations: 2.1 GiB of per-point
+      linearizations and 0.9 GiB for the reduced camera system.
+  - **Correspondence graph.** The replay export's graph is built in one
+    pass (`CorrespondenceGraph::finalized_from_pairs`), equal field for
+    field to `add_image`, `add_two_view_geometry` and `finalize`, without
+    the per-keypoint lists the incremental path keeps until `finalize`. The
+    export's matches stay in one `u32` buffer. Correspondences and each
+    image's offsets are 32-bit, as COLMAP stores them: `Correspondence`'s
+    fields are now `u32`, and `add_image` panics on an id or a keypoint
+    count past `u32::MAX`.
+  - **Bundle adjustment:**
+    - The elimination finds each pair's block through a per-row table of
+      partner positions instead of an index over every point's pairs
+      (1.9 GB on SmallCity's last bundle adjustment).
+    - Observations name their camera in a table instead of carrying its
+      intrinsics and sensor pose: 24 bytes each instead of 112 (1.3 GB
+      there).
+    - Systems from 20,000 off-diagonal blocks are eliminated by output, as
+      those from 1,000 frames already were. The sharded loop kept 8 copies
+      of every block: 825 MB at 358k blocks, pass 1's peak. By output, pass
+      1's eliminations from 20k to 400k blocks took 0.59 to 0.90 of the
+      time.
+    - Each row of the reduced system is written into the block array in
+      place, instead of into its own buffer and then concatenated.
+
+- **`gsplat_photos` loads large photos faster, with the same pixels.** Its
+  photos go to the working size through a Triangle resize that performs
+  `image::imageops::resize`'s arithmetic in the same order, so the working
+  images are byte-identical. It sums blocks of source rows in registers and
+  reads the intermediate row by row, where the `image` crate reads one
+  pixel at a time and walks its intermediate down columns.
+  - **Other changes:** the decoded RGB image is moved, not copied, and
+    each file is read once for both the decoder and the EXIF focal.
+  - **One 24-megapixel ETH3D photo to 1,600 px, one thread:** the resize
+    takes 108 ms instead of 261 ms, and decoding plus resizing 325 ms
+    instead of 552 ms.
+  - **ETH3D pipes on 4 threads:** loading takes 1.3 s instead of 2.0 s, and
+    every output file is byte-identical.
 
 - **COLMAP-port BA: cheaper setup of large bundle adjustments.** Results
   are bit-identical: the SmallCity pass-1 model matches byte for byte.

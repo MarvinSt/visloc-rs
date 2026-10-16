@@ -61,6 +61,7 @@ pub use colmap_verification::{
 };
 pub use correspondence_graph::{
     Correspondence, CorrespondenceGraph, CorrespondenceGraphError, EdgeMetadata, IngestStats,
+    PairMatches,
 };
 pub use fundamental::{
     estimate_fundamental_dlt, fundamental_ransac, fundamental_squared_sampson_error,

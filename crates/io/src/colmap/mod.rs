@@ -799,19 +799,15 @@ where
     }
     fs::write(out_dir.join("cameras.txt"), cameras_text)?;
 
-    let mut frame_kp_to_point: Vec<BTreeMap<usize, u64>> = vec![BTreeMap::new(); poses.len()];
+    // Each keypoint's landmark id (0: none; ids start at 1), checked in
+    // landmark order so the first bad observation is the one reported.
+    let mut frame_kp_to_point: Vec<Vec<u64>> = left_features
+        .iter()
+        .map(|features| vec![0; features.keypoints.len()])
+        .collect();
     let mut observation_count = 0usize;
-    let mut points3d_text =
-        String::from("# POINT3D_ID X Y Z R G B ERROR TRACK[] as IMAGE_ID POINT2D_IDX\n");
-    for (landmark_index, (position, observations)) in landmarks.iter().enumerate() {
+    for (landmark_index, (_, observations)) in landmarks.iter().enumerate() {
         let point_id = landmark_index as u64 + 1;
-        points3d_text.push_str(&format!(
-            "{} {} {} {} 255 255 255 0",
-            point_id,
-            format_f64(position.x),
-            format_f64(position.y),
-            format_f64(position.z),
-        ));
         for &(frame, keypoint, _) in observations {
             if frame >= poses.len() || keypoint >= left_features[frame].keypoints.len() {
                 return Err(ColmapError::InvalidExportInput(format!(
@@ -819,64 +815,79 @@ where
                     point_id, frame, keypoint
                 )));
             }
-            if frame_kp_to_point[frame]
-                .insert(keypoint, point_id)
-                .is_some()
-            {
+            let slot = &mut frame_kp_to_point[frame][keypoint];
+            if *slot != 0 {
                 return Err(ColmapError::InvalidExportInput(format!(
                     "keypoint ({}, {}) belongs to multiple exported landmarks",
                     frame, keypoint
                 )));
             }
-            points3d_text.push_str(&format!(" {} {}", frame, keypoint));
+            *slot = point_id;
             observation_count += 1;
         }
-        points3d_text.push('\n');
     }
+    let names: Vec<String> = (0..poses.len()).map(&image_name).collect();
+    for (frame, name) in names.iter().enumerate() {
+        validate_colmap_image_name(name, frame)?;
+    }
+
+    // The two large files, formatted in parallel chunks and joined in order.
+    let mut points3d_text =
+        String::from("# POINT3D_ID X Y Z R G B ERROR TRACK[] as IMAGE_ID POINT2D_IDX\n");
+    points3d_text.push_str(&format_in_chunks(landmarks.len(), |range, out| {
+        for landmark_index in range {
+            let (position, observations) = &landmarks[landmark_index];
+            push_display(out, landmark_index as u64 + 1);
+            for v in [position.x, position.y, position.z] {
+                out.push(' ');
+                push_f64(out, v);
+            }
+            out.push_str(" 255 255 255 0");
+            for &(frame, keypoint, _) in observations {
+                out.push(' ');
+                push_display(out, frame);
+                out.push(' ');
+                push_display(out, keypoint);
+            }
+            out.push('\n');
+        }
+    }));
     fs::write(out_dir.join("points3D.txt"), points3d_text)?;
 
     let mut images_text = String::from(
         "# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n# POINTS2D[] as X Y POINT3D_ID\n",
     );
-    for (frame, ((pose, features), camera)) in
-        poses.iter().zip(left_features).zip(cameras).enumerate()
-    {
-        let q = pose.world_to_camera.rotation.quaternion();
-        let t = pose.world_to_camera.translation;
-        let name = image_name(frame);
-        validate_colmap_image_name(&name, frame)?;
-        images_text.push_str(&format!(
-            "{} {} {} {} {} {} {} {} {} {}\n",
-            frame,
-            format_f64(q.w),
-            format_f64(q.i),
-            format_f64(q.j),
-            format_f64(q.k),
-            format_f64(t.x),
-            format_f64(t.y),
-            format_f64(t.z),
-            camera.id,
-            name,
-        ));
-        let point_ids = &frame_kp_to_point[frame];
-        let points = features
-            .keypoints
-            .iter()
-            .enumerate()
-            .map(|(keypoint, pixel)| {
-                format!(
-                    "{} {} {}",
-                    format_f64(pixel.x),
-                    format_f64(pixel.y),
-                    point_ids
-                        .get(&keypoint)
-                        .map_or_else(|| "-1".to_owned(), ToString::to_string)
-                )
-            })
-            .collect::<Vec<_>>();
-        images_text.push_str(&points.join(" "));
-        images_text.push('\n');
-    }
+    images_text.push_str(&format_in_chunks(poses.len(), |range, out| {
+        for frame in range {
+            let q = poses[frame].world_to_camera.rotation.quaternion();
+            let t = poses[frame].world_to_camera.translation;
+            push_display(out, frame);
+            for v in [q.w, q.i, q.j, q.k, t.x, t.y, t.z] {
+                out.push(' ');
+                push_f64(out, v);
+            }
+            out.push(' ');
+            push_display(out, cameras[frame].id);
+            out.push(' ');
+            out.push_str(&names[frame]);
+            out.push('\n');
+            let point_ids = &frame_kp_to_point[frame];
+            for (keypoint, pixel) in left_features[frame].keypoints.iter().enumerate() {
+                if keypoint > 0 {
+                    out.push(' ');
+                }
+                push_f64(out, pixel.x);
+                out.push(' ');
+                push_f64(out, pixel.y);
+                out.push(' ');
+                match point_ids[keypoint] {
+                    0 => out.push_str("-1"),
+                    id => push_display(out, id),
+                }
+            }
+            out.push('\n');
+        }
+    }));
     fs::write(out_dir.join("images.txt"), images_text)?;
 
     Ok(ColmapExportSummary {
@@ -1330,6 +1341,61 @@ fn format_f64(value: f64) -> String {
         .trim_end_matches('0')
         .trim_end_matches('.')
         .to_owned()
+}
+
+/// Appends [`format_f64`]'s text without allocating.
+fn push_f64(out: &mut String, value: f64) {
+    use std::fmt::Write;
+    let start = out.len();
+    write!(out, "{value:.12}").expect("writing to a String cannot fail");
+    let trimmed = out[start..]
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .len();
+    out.truncate(start + trimmed);
+}
+
+fn push_display(out: &mut String, value: impl std::fmt::Display) {
+    use std::fmt::Write;
+    write!(out, "{value}").expect("writing to a String cannot fail");
+}
+
+/// `format(0..count)` split into contiguous ranges formatted on scoped
+/// threads, the pieces joined in order: the same text as one sequential
+/// call.
+fn format_in_chunks(
+    count: usize,
+    format: impl Fn(std::ops::Range<usize>, &mut String) + Sync,
+) -> String {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(count.div_ceil(256).max(1));
+    if threads <= 1 {
+        let mut out = String::new();
+        format(0..count, &mut out);
+        return out;
+    }
+    let format = &format;
+    let pieces: Vec<String> = std::thread::scope(|scope| {
+        (0..threads)
+            .map(|k| {
+                let range = k * count / threads..(k + 1) * count / threads;
+                scope.spawn(move || {
+                    let mut out = String::new();
+                    format(range, &mut out);
+                    out
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("formatting thread panicked"))
+            .collect()
+    });
+    let mut out = String::with_capacity(pieces.iter().map(String::len).sum());
+    for piece in pieces {
+        out.push_str(&piece);
+    }
+    out
 }
 
 /// Reject image NAME characters that would corrupt either writer surface.

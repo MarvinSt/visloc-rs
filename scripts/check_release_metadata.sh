@@ -22,6 +22,7 @@ visloc-gsplat-core
 visloc-gsplat-render
 visloc-sift-gpu
 visloc-ba-gpu
+visloc-mvs
 visloc-gsplat-train
 visloc-rs
 "
@@ -37,6 +38,7 @@ crates/gsplat-render/Cargo.toml
 crates/gsplat-train/Cargo.toml
 crates/sift-gpu/Cargo.toml
 crates/ba-gpu/Cargo.toml
+crates/mvs/Cargo.toml
 pipelines/localization/Cargo.toml
 pipelines/tracking/Cargo.toml
 pipelines/mapping/Cargo.toml

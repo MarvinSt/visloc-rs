@@ -174,11 +174,12 @@ fn main() {
     )
     .unwrap_or_else(|e| panic!("failed to load database cache: {e}"));
     eprintln!(
-        "loaded: {} rigs, {} cameras, {} frames, {} images{}",
+        "loaded: {} rigs, {} cameras, {} frames, {} images in {:.1} s{}",
         db.num_rigs(),
         db.num_cameras(),
         db.num_frames(),
         db.num_images(),
+        start.elapsed().as_secs_f64(),
         memory_note()
     );
 
@@ -270,6 +271,7 @@ fn main() {
     // and BA events, in chronological order, from `IncrementalMapper::log`.
     log_lines.extend(result.log);
 
+    let t_export = Instant::now();
     for (k, model) in models.iter().enumerate() {
         let recon = &model.reconstruction;
         let model_dir = args.out_colmap.join("model").join(k.to_string());
@@ -289,6 +291,7 @@ fn main() {
             model_dir.display()
         ));
     }
+    eprintln!("exported in {:.1} s", t_export.elapsed().as_secs_f64());
     log_lines.push(format!("wall_time_s={:.3}", elapsed.as_secs_f64()));
 
     let log_path = args.out_colmap.join("mapper.log");

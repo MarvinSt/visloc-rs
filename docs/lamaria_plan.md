@@ -213,7 +213,22 @@ before/after on training sequences.
 13. **Remaining scale error on Moving platform.** sequence_5_11's VIO
    measures the route about 6 % short, with or without the funicular ride.
    Removing its fitted scale drift alone would be worth about +15 there, the
-   largest gain left on any track; the cause is still open.
+   largest gain left on any track; the cause is still open. The batch BA
+   (lever 14) halves the fitted scale drift (−5.4 % → −2.5 % without PB2).
+14. **Offline batch VI bundle adjustment.** Status: **measured on one
+   training sequence per track and on sequence_1_20 (2026-10-16).**
+   `scripts/lamaria_batch_ba.py` refines the VIO trajectory afterwards: SIFT
+   on 2 Hz keyframes, matches up to 32 s apart under the VIO's epipolar
+   geometry, and one Levenberg-Marquardt solve over every keyframe (pose,
+   velocity and IMU biases with GTSAM's preintegrated factors), every
+   landmark and each camera's IMU-camera rotation, with no ground truth. It
+   raises the mean over the five tracks to **59.81**, against 50.77 for the
+   refined VIO and 53.27 for the per-track VIO or mapper. It keeps the slow
+   heading drift of its starting trajectory; `--modes yaw` corrects a start
+   that drifts by degrees (sequence_1_20: 43.4 → 74.8) but costs points
+   where the start is already good, so it stays opt-in. The G1276 sequences
+   keep 2–4 % of scale drift
+   ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).
 
 ## 5. Test-set operational pipeline
 
@@ -223,7 +238,9 @@ before/after on training sequences.
    ~12 GB RSS).
 3. Propagate corrections (`scripts/propagate_basalt_mapper_corrections.py`) and
    convert to the submission format
-   (`scripts/basalt_tum_to_lamaria_estimate.py`).
+   (`scripts/basalt_tum_to_lamaria_estimate.py`). For the batch BA (lever
+   14), run `scripts/lamaria_batch_ba.py` `features`, `match` and `solve` on
+   the VIO trajectory first (about 15 + 3 + 9–20 min per sequence on 4 cores).
 4. Delete the sequence data; add `slam/<seq>.txt` to the submission zip.
 5. Submit via <https://lamaria.ethz.ch/login> (24 h rate limit).
 
@@ -251,6 +268,8 @@ before/after on training sequences.
   the rectified IMU, per-track results and cost (lever 9).
 - [`lamaria_drift_analysis.md`](lamaria_drift_analysis.md) — CP error
   analysis: funicular ride, heading and scale drift (lever 10).
+- [`lamaria_batch_ba.md`](lamaria_batch_ba.md) — offline batch VI bundle
+  adjustment, per-camera rotations, slow heading drift (lever 14).
 - [`vi_slam_benchmarks.md`](vi_slam_benchmarks.md) — EuRoC VI-SLAM results.
 - [`vi_slam_global_consistency_plan.md`](vi_slam_global_consistency_plan.md) —
   global-consistency evidence and staged plan.

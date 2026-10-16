@@ -8,9 +8,11 @@ whole per-sequence loop for a track:
     download ASL zip + pinhole calibration
       -> verify + extract -> rename `aria/` to `mav0/`
       -> apply Aria's factory IMU calibration to `imu0/data.csv` (read from
-         the first 4 MiB of the raw `.vrs`; `--no-imu-rectify` skips it)
+         the first 4 MiB of the raw `.vrs`; `--no-imu-rectify` skips it),
+         plus the per-device time alignment (`--no-device-refinement` skips it)
       -> pinhole -> Basalt Double-Sphere calibration (variant A noise,
-         gyro bias random walk tightened to --gyro-bias-std)
+         gyro bias random walk tightened to --gyro-bias-std; camera rig
+         rotated by the per-device refinement)
       -> run the Basalt VIO, or with `--slam-exe` the VIO plus the online
          mapper (`basalt_euroc_online_slam_demo`)
       -> convert the trajectory to the submission estimate
@@ -50,13 +52,34 @@ training sequence per non-Short track it raises the score by +4.35 on average
 27.64 -> 32.56). If the `.vrs` header cannot be fetched or parsed the sequence
 falls back to the raw IMU with a WARN line rather than being dropped.
 
+The per-device IMU-camera refinement (scripts/aria_device_refinement.py,
+docs/lamaria_drift_analysis.md) is on by default. LaMAria was recorded with two
+Aria devices; for each, training pseudo-GT shows the gyroscope lagging the
+images by ~4.6 ms and, on 1WM093701G1276, a 0.35 deg IMU-to-camera rotation
+error. Correcting them raises the VIO-only Score on sequence_2_11 38.36 ->
+49.68 and on the held-out sequence_5_11 32.27 -> 43.14 and sequence_1_20
+33.18 -> 38.10. An unknown device serial falls back to the factory calibration
+with a WARN line.
+
 `--slam-exe` (the online-mapper build, docs/lamaria_online_mapper.md) is the
-recommended estimator: on one training sequence per track it adds +5.44 Score
-on average over the VIO alone (Short +1.66, Medium +13.05, Long +4.82, Low
-light +3.77, Moving +3.93) for about 1.1-1.2x the run time. Its full-frame
-`trajectory_online.tum` is submitted; if a run produces only the uncorrected
+recommended estimator. It writes the full-frame mapper trajectory
+`trajectory_online.tum` and the VIO's own `trajectory_vio.tum`, and the driver
+picks one per track. With the per-device refinement the VIO beats the mapper
+on Short, Long and Low light, while the mapper still wins on Medium and Moving
+platform (one training sequence per track; VIO / mapper: Short 71.96 / 68.54,
+Medium 49.68 / 55.51, Long 50.06 / 46.68, Low light 34.49 / 31.62, Moving
+43.14 / 49.84; docs/lamaria_drift_analysis.md#with-the-online-mapper). So by
+default the VIO trajectory is submitted for tracks 1, 3 and 4 (`--vio-tracks`;
+pass it without values to submit the mapper everywhere). With `--vio-exe` as
+well, those tracks run the faster VIO-only build. If a mapper run produces only
 `trajectory_vio.tum`, that is used with a WARN line. `--vio-exe` alone runs the
-VIO only, as before.
+VIO only on every track.
+
+Low light (track 4) sequences use `--low-light-config`, the multicam config
+with a 0.5 px instead of 0.2 px KLT round-trip threshold: it raises the VIO on
+sequence_4_10 from 34.49 to 39.00 but costs 11 points on the Medium sequence,
+so it is limited to that track (docs/lamaria_klt_threshold.md). Pass
+`--low-light-config none` to use `--config` there too.
 """
 
 import argparse
@@ -71,9 +94,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aria_factory_imu_rectify import VRS_HEAD_BYTES, extract_record, rectify_csv  # noqa: E402
+from aria_device_refinement import lookup as device_refinement, rotate_rig  # noqa: E402
 
 LOOP_MATCH_MAX_ROT_ERROR_DEG = 5
 TRACK_COUNTS = {1: 18, 2: 10, 3: 16, 4: 9, 5: 10}
+# Tracks whose VIO trajectory is submitted even with --slam-exe (Short, Long, Low light).
+DEFAULT_VIO_TRACKS = (1, 3, 4)
+LOW_LIGHT_TRACK = 4
+DEFAULT_LOW_LIGHT_CONFIG = Path(
+    "configs/basalt/variants/lamaria/euroc_config_big_window_multicam_lowlight.json")
 BASE_URL = "https://cvg-data.inf.ethz.ch/lamaria"
 DEFAULT_VARIANT_A_NOISE = {
     "accel_noise_std": [0.016] * 3,
@@ -124,34 +153,59 @@ def download_head(url: str, dest: Path, nbytes: int) -> None:
         dest.write_bytes(response.read(nbytes))
 
 
-def rectify_imu(seq: str, inner: Path, work: Path, calib_dir: Path) -> None:
-    """Replace inner/mav0/imu0/data.csv with the factory-rectified IMU."""
+def rectify_imu(seq: str, inner: Path, work: Path, calib_dir: Path,
+                refine: bool = False):
+    """Replace inner/mav0/imu0/data.csv with the factory-rectified IMU.
+
+    With `refine`, a known device's IMU is also re-aligned in time, and its
+    refinement (see aria_device_refinement.py) is returned for the camera rig.
+    """
     head = work / "vrs_head.bin"
     download_head(f"{BASE_URL}/raw_data/test/{seq}.vrs", head, VRS_HEAD_BYTES)
     factory = extract_record(head.read_bytes())
     (calib_dir / f"{seq}_factory_calib.json").write_text(json.dumps(factory, indent=1))
+    refinement = device_refinement(factory) if refine else None
+    if refine and refinement is None:
+        log(f"{seq}: WARN no device refinement for serial {factory.get('Serial')}")
+    delays = ({"gyro_delay_ns": refinement["gyro_delay_ns"],
+               "accel_delay_ns": refinement["accel_delay_ns"]} if refinement else {})
     imu_csv = inner / "mav0" / "imu0" / "data.csv"
     rectified = imu_csv.with_name("data_rectified.csv")
-    samples, gyro_bias, accel_bias = rectify_csv(factory, imu_csv, rectified)
+    samples, gyro_bias, accel_bias = rectify_csv(factory, imu_csv, rectified, **delays)
     rectified.replace(imu_csv)
     log(f"{seq}: rectified {samples} IMU samples (serial {factory.get('Serial')}, "
-        f"gyro bias {gyro_bias.round(5).tolist()}, accel bias {accel_bias.round(4).tolist()})")
+        f"gyro bias {gyro_bias.round(5).tolist()}, accel bias {accel_bias.round(4).tolist()}"
+        + (f", delays gyro {delays['gyro_delay_ns']} ns accel {delays['accel_delay_ns']} ns"
+           if refinement else "") + ")")
+    return refinement
 
 
-def estimator_command(args, inner: Path, calibration: Path, out_dir: Path):
-    """Return (command, trajectories to try in order) for the configured estimator."""
-    common = ["--euroc-dir", inner, "--calibration", calibration, "--config", args.config,
-              "--out-dir", out_dir, "--threads", args.threads]
-    if args.slam_exe:
+def sequence_track(seq: str) -> int:
+    """The leaderboard track of `sequence_<track>_<n>`."""
+    return int(seq.split("_")[1])
+
+
+def estimator_command(args, inner: Path, calibration: Path, out_dir: Path,
+                      config: Path | None = None, submit_vio: bool = False):
+    """Return (command, trajectories to try in order) for the configured estimator.
+
+    `submit_vio` submits the VIO trajectory: through the VIO-only build when
+    there is one, otherwise from the online demo's `trajectory_vio.tum`.
+    """
+    common = ["--euroc-dir", inner, "--calibration", calibration,
+              "--config", config or args.config, "--out-dir", out_dir,
+              "--threads", args.threads]
+    if args.slam_exe and not (submit_vio and args.vio_exe):
         # Same VIO as basalt_euroc_vio_demo (bit-identical trajectory_vio.tum)
         # plus the online mapper; trajectory_online.tum has every frame.
         # 5 deg loop rotation gate: with the camera-frame comparison, genuine
         # loops disagree with the map by ~1 deg (median on sequence_1_19), so
         # 5 deg drops only broken two-view estimates
         # (docs/lamaria_online_mapper.md#loop-rotation-gate).
+        trajectories = [out_dir / "trajectory_online.tum", out_dir / "trajectory_vio.tum"]
         return ([args.slam_exe, *common, "--no-urgent-keyframes",
                  "--loop-match-max-rot-error", LOOP_MATCH_MAX_ROT_ERROR_DEG],
-                [out_dir / "trajectory_online.tum", out_dir / "trajectory_vio.tum"])
+                trajectories[1:] if submit_vio else trajectories)
     return ([args.vio_exe, *common, "--pipeline", "--no-trace", "--no-marg-data"],
             [out_dir / "trajectory.tum"])
 
@@ -197,9 +251,15 @@ def main() -> int:
                         help="basalt_euroc_vio_demo: VIO only")
     parser.add_argument("--slam-exe", type=Path,
                         help="basalt_euroc_online_slam_demo: VIO + online mapper (recommended; "
-                             "takes precedence over --vio-exe)")
+                             "takes precedence over --vio-exe except on --vio-tracks)")
     parser.add_argument("--config", type=Path,
                         default=Path("configs/basalt/variants/lamaria/euroc_config_big_window_multicam.json"))
+    parser.add_argument("--vio-tracks", type=int, nargs="*", default=list(DEFAULT_VIO_TRACKS),
+                        choices=sorted(TRACK_COUNTS),
+                        help="tracks whose VIO trajectory is submitted instead of the online "
+                             "mapper's (default: 1 3 4; no values: the mapper everywhere)")
+    parser.add_argument("--low-light-config", default=str(DEFAULT_LOW_LIGHT_CONFIG),
+                        help="config for Low light (track 4) sequences; 'none' uses --config")
     parser.add_argument("--gyro-bias-std", type=float, default=1e-7,
                         help="gyro bias random walk written into the calibration "
                              "(Basalt default 1e-4; 1e-7 measured best on LaMAria "
@@ -207,6 +267,11 @@ def main() -> int:
     parser.add_argument("--imu-rectify", action=argparse.BooleanOptionalAction, default=True,
                         help="apply Aria's factory IMU calibration from the .vrs header "
                              "(default on; docs/lamaria_imu_rectification.md)")
+    parser.add_argument("--device-refinement", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="re-align the IMU in time and rotate the camera rig by the "
+                             "per-device refinement learned on training data (default on; "
+                             "needs --imu-rectify; docs/lamaria_drift_analysis.md)")
     parser.add_argument("--threads", type=int, default=12)
     parser.add_argument("--work-dir", type=Path, default=Path("lamaria_submission/work"))
     parser.add_argument("--slam-dir", type=Path, default=Path("lamaria_submission/slam"))
@@ -217,6 +282,8 @@ def main() -> int:
     if not (args.slam_exe or args.vio_exe):
         parser.error("one of --slam-exe or --vio-exe is required")
 
+    low_light_config = (None if args.low_light_config.lower() == "none"
+                        else Path(args.low_light_config))
     sequences = args.sequences or track_sequences(args.tracks)
     args.slam_dir.mkdir(parents=True, exist_ok=True)
     calib_dir = args.work_dir / "calibrations"
@@ -249,10 +316,12 @@ def main() -> int:
                 download(f"{BASE_URL}/asl_folder/test/{seq}.zip", zip_path)
                 inner = verify_and_extract(zip_path, extract_dir)
 
+            refinement = None
             if args.imu_rectify:
                 log(f"{seq}: IMU rectification")
                 try:
-                    rectify_imu(seq, inner, work, calib_dir)
+                    refinement = rectify_imu(seq, inner, work, calib_dir,
+                                             refine=args.device_refinement)
                 except Exception as error:
                     log(f"{seq}: WARN IMU rectification failed ({error!r}); using raw IMU")
 
@@ -262,11 +331,22 @@ def main() -> int:
                 check=True)
             variant_a = calib_dir / f"{seq}_calib_variantA_default_noise.json"
             write_variant_a_calib(base_calib, variant_a, args.gyro_bias_std)
+            if refinement:
+                variant_a.write_text(json.dumps(
+                    rotate_rig(json.loads(variant_a.read_text()),
+                               refinement["rig_rotation_deg"]), indent=4))
+                log(f"{seq}: camera rig rotated by {refinement['rig_rotation_deg']} deg")
 
-            log(f"{seq}: {'VIO + online mapper' if args.slam_exe else 'VIO'}")
+            track = sequence_track(seq)
+            config = (low_light_config if track == LOW_LIGHT_TRACK and low_light_config
+                      else args.config)
+            submit_vio = track in args.vio_tracks
+            log(f"{seq}: {'VIO' if submit_vio or not args.slam_exe else 'VIO + online mapper'}"
+                f", config {config.name}")
             vio_out = work / "vio"
             vio_out.mkdir(exist_ok=True)
-            command, candidates = estimator_command(args, inner, variant_a, vio_out)
+            command, candidates = estimator_command(args, inner, variant_a, vio_out,
+                                                    config, submit_vio)
             run(command, check=True)
             trajectory = next((t for t in candidates if t.is_file()), None)
             if trajectory is None:

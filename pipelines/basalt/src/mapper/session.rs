@@ -2797,6 +2797,7 @@ mod tests {
             frame_poses_fej: Default::default(),
             frame_states_fej: Default::default(),
             fej_complete: false,
+            measurement_poses: Vec::new(),
             used_imu: true,
             provenance_version: "basalt-0f3b2b52-m8f-fixture".into(),
         }

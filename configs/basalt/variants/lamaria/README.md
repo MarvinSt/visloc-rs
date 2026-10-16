@@ -31,6 +31,12 @@ Per-sequence calibration/config variants for the Project Aria LaMAria benchmark
   LaMAria**; see [`docs/lamaria_multicam.md`](../../../docs/lamaria_multicam.md)
   for the diagnosis, synthetic results and the A/B commands. The detection
   grid is unchanged (50 px; 15×11 cells on 758×572).
+- `euroc_config_big_window_multicam_lowlight.json`: the multicam config with
+  a 0.5 px instead of 0.2 px KLT forward-backward threshold
+  (`optical_flow_max_recovered_dist2` 0.04 → 0.25). For the Low light track
+  only: it raises the VIO on sequence_4_10 from 34.49 to 39.00 but costs 11
+  points on sequence_2_11 (Medium); see
+  [`docs/lamaria_klt_threshold.md`](../../../docs/lamaria_klt_threshold.md).
 
 ## Why the big window
 

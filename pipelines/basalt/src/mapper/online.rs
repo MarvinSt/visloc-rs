@@ -2589,6 +2589,7 @@ mod tests {
             frame_poses_fej: Default::default(),
             frame_states_fej: Default::default(),
             fej_complete: false,
+            measurement_poses: Vec::new(),
             used_imu: input["use_imu"].as_bool().expect("use_imu"),
             provenance_version: "basalt-0f3b2b52-online-mapper-test-fixture".into(),
         }

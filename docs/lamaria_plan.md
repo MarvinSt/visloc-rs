@@ -170,6 +170,50 @@ before/after on training sequences.
    rotation check (IMU vs camera frame) was fixed; with a 5° gate the mapper
    mean rises to 44.95 (+1.29; Medium +4.94, Long +1.03, Short +0.47, no
    track worse).
+10. **Remaining error: slow heading and scale drift.** Status: **cause found
+   and corrected per device (2026-10-14); measured with the mapper on one
+   training sequence per track (2026-10-15).** Fitting each sequence's CP residuals with a yaw drift and a
+   scale drift linear in time brings the median CP error below 1 m on Short,
+   Long and Moving. The heading drift comes from the factory IMU-camera
+   calibration: the gyroscope lags the images by ~4.6 ms (factory 4.1 ms) and
+   the IMU-to-camera rotation is off by 0.3-0.7 deg; the two errors partly
+   cancel, so correcting one alone is worse. A per-device refinement fitted on
+   training pseudo-GT only (both devices of the test set are covered) raises
+   the VIO-only Score on sequence_2_11 38.36 -> 49.68 and on the held-out
+   sequence_5_11 32.27 -> 43.14 and sequence_1_20 33.18 -> 38.10 (time
+   alignment only on that device, whose fitted rotation overshoots). The
+   submission driver applies it by default
+   ([`lamaria_drift_analysis.md`](lamaria_drift_analysis.md#imu-camera-calibration)).
+   Over one sequence per track it raises the VIO mean 38.21 → 49.87 and the
+   mapper mean 44.95 → 50.44, but the mapper now loses to the VIO on Short,
+   Long and Low light: it bends the long-range shape that the refined VIO
+   gets right
+   ([`lamaria_drift_analysis.md`](lamaria_drift_analysis.md#with-the-online-mapper)).
+   Earth-rotation compensation and a VIO outlier filter did not help and stay
+   opt-in.
+11. **Online mapper on the refined VIO.** Status: **studied on four tracks
+   (2026-10-15); the submission driver now picks VIO or mapper per track.**
+   The mapper's relative-pose factors come from the window estimates at
+   marginalization, and with the big window each keyframe gets about 30 of
+   them. Without loops they chain up to a trajectory up to 3 m from the
+   VIO's. That chain is better than the VIO output on Medium and Moving
+   platform and worse on Short, Long and Low light. The loops are short
+   revisits that change little. Neither a higher relative-pose weight, fewer
+   factors per keyframe, nor factors measured on the VIO output
+   (`--relative-pose-max-neighbors`, `--mapper-vio-output-poses`, both
+   opt-in) beats the VIO on every track
+   ([`lamaria_drift_analysis.md`](lamaria_drift_analysis.md#with-the-online-mapper)).
+   The driver therefore submits the VIO on Short, Long and Low light and the
+   mapper on Medium and Moving platform: 53.27 on one training sequence per
+   track, against 51.44 with the mapper everywhere.
+12. **KLT round-trip threshold in low light.** Status: **measured on four
+   tracks (2026-10-16); Low light only.** 0.5 px instead of 0.2 px raises
+   the low-light VIO from 34.49 to 39.00 but costs 11 points on Medium
+   ([`lamaria_klt_threshold.md`](lamaria_klt_threshold.md)).
+13. **Remaining scale error on Moving platform.** sequence_5_11's VIO
+   measures the route about 6 % short, with or without the funicular ride.
+   Removing its fitted scale drift alone would be worth about +15 there, the
+   largest gain left on any track; the cause is still open.
 
 ## 5. Test-set operational pipeline
 
@@ -205,6 +249,8 @@ before/after on training sequences.
   factory IMU rectification and per-category results (lever 8).
 - [`lamaria_online_mapper.md`](lamaria_online_mapper.md) — online mapper on
   the rectified IMU, per-track results and cost (lever 9).
+- [`lamaria_drift_analysis.md`](lamaria_drift_analysis.md) — CP error
+  analysis: funicular ride, heading and scale drift (lever 10).
 - [`vi_slam_benchmarks.md`](vi_slam_benchmarks.md) — EuRoC VI-SLAM results.
 - [`vi_slam_global_consistency_plan.md`](vi_slam_global_consistency_plan.md) —
   global-consistency evidence and staged plan.

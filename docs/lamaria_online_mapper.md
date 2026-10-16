@@ -124,6 +124,16 @@ The submission driver passes `--loop-match-max-rot-error 5` with
 `--slam-exe`. The library default stays 30° until EuRoC is re-checked with
 the fix.
 
+## With the per-device IMU-camera refinement
+
+The per-device time and rotation refinement
+([`lamaria_drift_analysis.md`](lamaria_drift_analysis.md#with-the-online-mapper))
+raises the VIO mean from 38.21 to 49.87, and the mapper mean only from 44.95
+to 50.44. The mapper still wins on Medium (+5.83 over the VIO) and Moving
+platform (+6.70), but now loses on Short (−3.42), Long (−3.38) and Low light
+(−2.87). Locally it remains more accurate than the VIO; it loses on the
+long-range shape.
+
 ## Use in the submission driver
 
 `scripts/run_lamaria_test_submission.py --slam-exe

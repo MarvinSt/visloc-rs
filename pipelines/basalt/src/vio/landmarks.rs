@@ -1039,6 +1039,23 @@ impl ObservationDb {
         removed_ids.len()
     }
 
+    /// Remove the given landmarks and their observations, as Basalt's
+    /// `LandmarkDatabase::removeLandmark` does for an outlier landmark.
+    pub fn remove_landmarks(&mut self, ids: &[u64]) -> usize {
+        let before = self.landmarks.len();
+        for id in ids {
+            if self.landmarks.remove(id).is_some() {
+                self.landmark_order.remove(*id);
+            }
+        }
+        let removed = before - self.landmarks.len();
+        if removed > 0 {
+            self.observations
+                .retain(|observation| self.landmarks.contains_key(&observation.landmark_id));
+        }
+        removed
+    }
+
     /// Remove observations whose target frame left the active VIO window.
     /// Basalt's `LandmarkDatabase::removeKeyframes` performs this cleanup for
     /// dropped poses and full states while retaining observations of a state

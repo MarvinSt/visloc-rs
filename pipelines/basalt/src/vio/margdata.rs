@@ -506,6 +506,13 @@ pub struct MargData {
     /// retained upstream sidecars.  Schema-3 defaults to false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub fej_complete: bool,
+    /// Optional poses, keyed by frame id, that the mapper uses instead of
+    /// `frame_poses` and `frame_states` as the measurements of the factors it
+    /// recovers from this packet. Outside the FEJ contract: the factor
+    /// information still comes from the packet's own linearization. Empty
+    /// keeps the packet poses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub measurement_poses: Vec<FramePoseData>,
     pub used_imu: bool,
     pub provenance_version: String,
 }
@@ -623,6 +630,7 @@ impl MargData {
             frame_poses_fej: BTreeMap::new(),
             frame_states_fej: BTreeMap::new(),
             fej_complete: false,
+            measurement_poses: Vec::new(),
             used_imu: false,
             provenance_version: "basalt-disabled".into(),
         }
@@ -1675,6 +1683,7 @@ mod tests {
             frame_poses_fej: BTreeMap::new(),
             frame_states_fej: BTreeMap::new(),
             fej_complete: false,
+            measurement_poses: Vec::new(),
             used_imu: true,
             provenance_version: "basalt-0f3b2b52".into(),
         }

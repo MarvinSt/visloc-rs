@@ -72,6 +72,26 @@ class ReprojectionJacobianTest(unittest.TestCase):
                 np.testing.assert_allclose(jl[o, :, d], num, rtol=1e-4, atol=1e-3)
 
 
+class OutlierMaskTest(unittest.TestCase):
+    def test_inactive_observations_carry_no_weight_or_cost(self):
+        cams = two_cameras()
+        r_wi, t_wi = np.eye(3)[None].repeat(2, 0), np.array([[0.0, 0, 0], [0.5, 0, 0]])
+        r_ic = np.array([c["R_ic"] for c in cams])
+        t_ic = np.array([c["t_ic"] for c in cams])
+        pts = np.array([r_ic[0] @ np.array([0.1, 0.2, 5.0]) + t_ic[0]])
+        z = np.array([[0.0, 0.0], [0.0, 0.0]])  # far off: both observations are Huber-weighted outliers
+        rp = lb.Reprojection(np.array([0, 1]), np.array([0, 0]), np.array([0, 0]), z, 1, cams, [0], 1.0, 2.0, 64)
+        cost_all, _ = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)
+        rp.active[1] = False
+        cost_one, err = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)
+        _, _, _, w = rp.linearize(r_wi, t_wi, r_ic, t_ic, pts)
+        self.assertGreater(cost_all, cost_one)
+        self.assertGreater(cost_one, 0.0)
+        self.assertEqual(w[1], 0.0)
+        self.assertGreater(w[0], 0.0)
+        self.assertGreater(err[1], 2.0)  # the error is still reported for an inactive observation
+
+
 class MatchingTest(unittest.TestCase):
     def test_best_two(self):
         keys = np.array([0, 0, 1, 0, 1])

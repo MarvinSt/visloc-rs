@@ -494,6 +494,7 @@ class Reprojection:
         order = np.lexsort((obs_kf, obs_lm))
         self.kf, self.cam, self.lm, self.z = obs_kf[order], obs_cam[order], obs_lm[order], obs_z[order]
         self.n_lm, self.sigma, self.huber, self.chunk = n_lm, sigma, huber, chunk
+        self.active = np.ones(len(self.kf), bool)  # observations not rejected as outliers
         for name, i, j in (("fx", 0, 0), ("fy", 1, 1), ("cx", 0, 2), ("cy", 1, 2)):
             setattr(self, name, np.array([c["K"][i, j] for c in cams])[self.cam])
         self.est = np.array([c in est_cams for c in range(2)])
@@ -552,6 +553,7 @@ class Reprojection:
     def _robust(self, res, valid):
         e = np.linalg.norm(res, axis=1)
         k = self.huber
+        valid = valid & self.active
         w = np.where(valid, np.where(e <= k, 1.0, k / np.maximum(e, 1e-12)), 0.0)
         cost = np.where(valid, np.where(e <= k, 0.5 * e * e, k * (e - 0.5 * k)), 0.0)
         return e, w, cost
@@ -689,6 +691,16 @@ def cmd_solve(a):
     lam = a.lambda0
     for it in range(a.iterations):
         ti = time.time()
+        if a.outlier_px > 0 and it >= a.outlier_start:
+            # drop observations that moved far off, then landmarks left with a single observation
+            bad = rp.active & (rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[1] * a.pixel_sigma > a.outlier_px)
+            if bad.any():
+                rp.active &= ~bad
+                lone = rp.active & (np.bincount(rp.lm[rp.active], minlength=rp.n_lm)[rp.lm] < 2)
+                rp.active &= ~lone
+                cost = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[0] + graph.error(values)
+                print(f"  outliers: {bad.sum()} observations over {a.outlier_px} px (+{lone.sum()} left alone), "
+                      f"{rp.active.sum()} active, cost {cost:.6g}", flush=True)
         res, jx, jl, w = rp.linearize(r_wi, t_wi, r_ic, t_ic, pts)
         wjx, wjl = jx * w[:, None, None], jl * w[:, None, None]
         h_xx = np.einsum("nki,nkj->nij", wjx, jx)
@@ -711,8 +723,12 @@ def cmd_solve(a):
             np.add.at(rhs_imu, cols, A.T @ b)
         direct = np.add.reduceat(h_xx[rp.obs_sort][:, 0:6, 0:6], rp.obs_starts, axis=0)
         accepted = False
+        # landmark damping: the diagonal, floored relative to the landmark's largest entry, so that a
+        # landmark with a poorly observed direction (low parallax) cannot take a huge step
+        d_l = np.diagonal(h_ll, axis1=1, axis2=2)
+        d_l = np.maximum(d_l, a.lm_damp_floor * d_l.max(axis=1, keepdims=True))[:, :, None] * np.eye(3)[None]
         for _ in range(8):
-            h_ll_inv = np.linalg.inv(h_ll + lam * h_ll * np.eye(3)[None] + 1e-9 * np.eye(3)[None])
+            h_ll_inv = np.linalg.inv(h_ll + lam * d_l + 1e-9 * np.eye(3)[None])
             m_o = np.einsum("nij,njk->nik", h_xl, h_ll_inv[rp.lm])
             ab, rhs = ab_imu.copy(), np.zeros(nb + ne)
             rhs[:nb] = rhs_imu
@@ -809,6 +825,7 @@ def cmd_solve(a):
         if not accepted or rel < a.rel_tol:
             break
     reproj, err = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)
+    err_px = err[rp.active] * a.pixel_sigma
     comp = np.zeros(5)
     for fct in imu_factors:  # whitened IMU residual per component: rotation, position, velocity, biases
         ew = fct.whitenedError(values)
@@ -816,8 +833,10 @@ def cmd_solve(a):
     comp /= max(len(imu_factors), 1)
     summary = {
         "keyframes": n, "landmarks": int(rp.n_lm), "observations": int(len(rp.kf)),
+        "active_observations": int(rp.active.sum()),
         "final_cost": cost, "reprojection_cost": reproj, "imu_prior_cost": graph.error(values),
-        "median_reprojection_px": float(np.median(err) * a.pixel_sigma),
+        "median_reprojection_px": float(np.median(err_px)),
+        "reprojection_over_4px_percent": float(np.mean(err_px > 4) * 100),
         "imu_residual_per_factor": dict(zip(("rotation", "position", "velocity", "accel_bias", "gyro_bias"),
                                             comp.round(3).tolist())),
         "camera_rotation_change_deg": {f"cam{c}": so3_log_deg(cams[c]["R_ic"].T @ r_ic[c]).tolist()
@@ -951,6 +970,11 @@ def main():
     s.add_argument("--iterations", type=int, default=30)
     s.add_argument("--rel-tol", type=float, default=1e-5)
     s.add_argument("--lambda0", type=float, default=1e-4)
+    s.add_argument("--outlier-px", type=float, default=10.0,
+                   help="each iteration drops observations whose error exceeds this (0: keep all)")
+    s.add_argument("--outlier-start", type=int, default=0, help="first iteration that drops outliers")
+    s.add_argument("--lm-damp-floor", type=float, default=0.01,
+                   help="landmark damping floor, relative to the landmark's largest diagonal entry")
     s.add_argument("--kf-range", default="", help="START:END keyframe window (default: all)")
     s.add_argument("--imu-noise-scale", type=float, default=1.0,
                    help="multiplies the calibration's accelerometer and gyroscope noise densities")

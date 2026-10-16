@@ -68,7 +68,7 @@ the docs record open gaps.
 | --- | --- | --- | --- | --- |
 | Monocular, unordered photos | SfM, 3DGS, mesh | **Benchmarked** | ETH3D Electro 1,200: 3.46× faster than COLMAP CPU, 3.50 vs 4.68 cm | `unordered_sfm_demo`, `gsplat_photos` |
 | Monocular video | SfM | **Benchmarked** | EuRoC: faster than COLMAP 4.1 CUDA on 8/8 sequences, more accurate on 4/8 | `gsplat_euroc` |
-| Posed photos (a COLMAP sparse model) | Dense MVS | Experimental | ETH3D high-res training at 3200 px on one L4: F1 78.5% at 2 cm over 12 of 13 scenes (ACMM 78.86% and COLMAP 67.66% over all 13) | `visloc-mvs` example `mvs` ([notes](docs/mvs.md)) |
+| Posed photos (a COLMAP sparse model) | Dense MVS | Experimental | ETH3D high-res training, all 13 scenes at 3200 px on one L4: F1 78.0% at 2 cm in 76 min (ACMM 78.86%, COLMAP 67.66%) | `visloc-mvs` example `mvs` ([notes](docs/mvs.md)) |
 | Monocular video | VO (DPVO port) | Experimental | MH_01 prefix 0.16 m, about 2× DPVO's published error; CPU only | `euroc_dpvo_vo_demo` |
 | Monocular + IMU | VIO (Basalt port) | Experimental | Runs end to end; synthetic tests recover metric scale within 0.3% at 5–9 mm RMS over 5–7 m paths; no EuRoC result yet | `basalt_euroc_vio_demo --mono` ([notes](docs/mono_inertial_vio.md)) |
 | Stereo | VO / SLAM | **Benchmarked** | KITTI seq00 1.23 m and seq09 2.07 m, vs 1.3 m and 3.2 m for ORB-SLAM2 | `deep_stereo_slam`, `online_slam_stereo_vo_kitti_demo` |

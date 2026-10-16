@@ -50,6 +50,8 @@ from the paper:
   scale are upsampled (joint bilateral, the best-weighted neighbour's plane)
   and kept where a photometric pass at the finer scale does not beat them
   by more than 0.1 (the detail restorer), then refined by geometric passes.
+  On ETH3D it helps weakly textured scenes and costs accuracy on detailed
+  ones (below); the example runs one scale by default.
 - **Source views and depth ranges.** Up to 10 source views per image by
   MVSNet's score over the shared sparse points (a Gaussian in the
   triangulation angle around 5°). The depth range comes from the image's
@@ -75,15 +77,59 @@ Scores come from the official ETH3D multi-view evaluator
 scenes, at the benchmark's 2 cm tolerance, with the scenes' ground-truth
 camera poses (`dslr_calibration_undistorted`).
 
-### Full resolution on a GPU
+### All 13 training scenes on a GPU
+
+One run on an NVIDIA L4 pod at commit `33b7418`: images at 3200 px, 10
+source views, three iterations per pass, ACMM's three scales with two
+geometric passes each (`--scales 3 --geom-passes 2`), the depth maps fused
+four ways. F1, accuracy and completeness are for the current default (one
+agreeing source view within 15°); the other columns are the F1 of the same
+maps fused with 30°, without the normal check, and with ACMM's two views
+at 30°. Times cover the whole `mvs` run: loading, depth maps, the default
+fusion and writing the cloud.
+
+| Scene | Images | F1 | Accuracy | Completeness | F1, 30° | F1, any angle | F1, two views | Time |
+|---|---|---|---|---|---|---|---|---|
+| pipes | 14 | 79.7% | 91.2% | 70.7% | 78.6% | 77.1% | 71.9% | 1:59 |
+| meadow | 15 | 68.4% | 81.9% | 58.8% | 68.4% | 68.6% | 63.1% | 2:39 |
+| terrace | 23 | 88.7% | 92.7% | 84.9% | 88.1% | 88.1% | 88.3% | 3:50 |
+| office | 26 | 65.7% | 64.5% | 67.0% | 63.4% | 58.4% | 65.7% | 4:01 |
+| kicker | 31 | 80.0% | 82.3% | 77.8% | 79.3% | 78.5% | 77.4% | 5:29 |
+| relief | 31 | 83.9% | 87.8% | 80.3% | 82.7% | 81.8% | 83.6% | 5:21 |
+| relief 2 | 31 | 81.9% | 84.7% | 79.2% | 80.8% | 80.4% | 80.5% | 5:24 |
+| courtyard | 38 | 86.4% | 87.2% | 85.6% | 86.0% | 85.5% | 83.6% | 6:01 |
+| playground | 38 | 66.0% | 73.4% | 59.9% | 65.3% | 64.4% | 64.8% | 6:32 |
+| terrains | 42 | 84.2% | 83.8% | 84.5% | 83.8% | 84.2% | 83.6% | 7:19 |
+| delivery area | 44 | 81.3% | 79.3% | 83.3% | 80.4% | 80.0% | 79.5% | 7:00 |
+| electro | 45 | 86.4% | 93.4% | 80.5% | 85.9% | 84.9% | 85.5% | 7:10 |
+| facade | 76 | 62.1% | 71.0% | 55.1% | 61.6% | 61.0% | 60.4% | 13:19 |
+
+- **Mean over the 13 scenes:** F1 78.0%, accuracy 82.6%, completeness
+  74.4%. With 30°, 77.3%; without the normal check, 76.4%; with ACMM's two
+  views, 76.0% (accuracy 85.2%, completeness 69.2%). Over the same 13
+  scenes at 2 cm, ACMM reports F1 78.86% (accuracy 90.67%, completeness
+  70.42%) and COLMAP 67.66% (91.85%, 55.13%) (arXiv 2303.09758,
+  2210.07582).
+- **15° was the best or tied on 12 of the 13 scenes,** hence the default.
+- **Multi-scale does not pay on average.** Against the single-scale run
+  below (both with two-view fusion), it gains on meadow (+5.7), kicker
+  (+5.1) and pipes (+1.3), loses on delivery area (−6.4), terrains (−5.3),
+  relief 2 (−4.5), office (−4.1) and relief (−3.3): 77.3% against 78.5%
+  over their 12 shared scenes. It helps weakly textured scenes and costs
+  accuracy on detailed ones.
+- **Time:** 76 minutes for all 13 scenes, from 1:59 (14 images) to 13:19
+  (76 images). On pipes, meadow and terrace, multi-scale ran 2.2 to 2.7
+  times faster than in the earlier run, through the texture sampling, the
+  skipped unweighted views and the GPU detail scores. Peak memory
+  28.7 GiB (facade).
+
+### Single-scale, before the fixes
 
 One run on an NVIDIA L4 pod at commit `cf329e2`, before the NaN fix, the
 skipped unweighted views and the texture sampling. Settings: images at
 3200 px, 10 source views, three iterations per pass, two geometric passes,
 and the fusion default of the time (2 px, 1% depth, 30°, two agreeing
-source views). The
-times cover the whole `mvs` run: loading, depth maps, fusion and writing
-the cloud.
+source views). The times cover the whole `mvs` run.
 
 | Scene | Images | F1 | Accuracy | Completeness | Time | F1, multi-scale | Time, multi-scale |
 |---|---|---|---|---|---|---|---|
@@ -101,17 +147,10 @@ the cloud.
 | electro | 45 | 85.2% | 96.0% | 76.7% | 11:23 | | |
 
 - **Mean over these 12 scenes** (single-scale): F1 78.5%, accuracy
-  90.6%, completeness 70.4%. Over all 13 training scenes at 2 cm, ACMM
-  reports F1 78.86% (accuracy 90.67%, completeness 70.42%) and COLMAP
-  67.66% (91.85%, 55.13%) (arXiv 2303.09758, 2210.07582). The scene sets
-  differ, so those means only bracket ours.
-- **Multi-scale** (`--scales 3 --geom-passes 2`) raised F1 on all three
-  scenes it ran on, by 1.3, 5.3 and 0.5 points, mostly through
-  completeness.
-- **Not scored:** facade (76 images; the pod's time limit).
+  90.6%, completeness 70.4%; facade did not fit the pod's time limit.
 - **Peak memory:** 15.5 GB (electro).
-- **What falls short is completeness.** Accuracy is at ACMM's level;
-  completeness is lower, most on meadow and playground.
+- Single-scale with one-view fusion has not been run at full resolution
+  yet.
 
 ### Fusion settings
 
@@ -128,8 +167,8 @@ two adds far more completeness than it costs accuracy:
 On pipes at 1600 px, one view takes completeness from 51.1% to 65.4% and
 accuracy from 96.9% to 90.7%. On pipes at 800 px, a stricter depth
 (0.5%) or reprojection (1 px) check, or dropping pixels by matching cost,
-only lowered F1. The full-resolution runs above predate this default and
-use two views.
+only lowered F1. At 3200 px (the 13-scene table above) a tighter normal
+check pays: 15° beats 30°.
 
 ### Local runs on pipes (CPU)
 

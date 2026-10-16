@@ -134,14 +134,16 @@ All notable changes to `visloc-rs` will be documented here.
   (ACMH, with ACMM's geometric consistency and multi-scale scheme), fused
   into `fused.ply`, on the CPU or on the GPU through wgpu
   (`--features gpu`). Details and scores in `docs/mvs.md`.
-  - **ETH3D high-res training, 3200 px, one NVIDIA L4:** F1 78.5% at
-    2 cm on average over 12 of the 13 scenes (accuracy 90.6%, completeness
-    70.4%), single-scale, with two-view fusion; facade was not run.
-    Over all 13, ACMM reports 78.86% and COLMAP 67.66%.
-  - **Time:** 2:45 (pipes, 14 images) to 11:23 (electro, 45) per scene
-    on the L4, loading and fusion included.
-  - **Fusion:** one agreeing source view keeps a point by default (ACMM
-    asks for two): on pipes at 1600 px, F1 66.9% -> 76.0%.
+  - **ETH3D high-res training, all 13 scenes at 3200 px, one NVIDIA L4:**
+    F1 78.0% at 2 cm on average (accuracy 82.6%, completeness 74.4%),
+    multi-scale with the default fusion. ACMM reports 78.86% and COLMAP
+    67.66% on the same scenes. An earlier single-scale run with two-view
+    fusion scored 78.5% over 12 of them.
+  - **Time:** 76 minutes for all 13 scenes (multi-scale), 1:59 to 13:19
+    per scene, loading and fusion included.
+  - **Fusion:** one agreeing source view within 15° keeps a point by
+    default (ACMM asks for two views within 10°): over the 13 scenes,
+    78.0% against 76.0% with two views.
   - **Run it:** `cargo run --release -p visloc-mvs --features gpu
     --example mvs -- --sparse <model> --images <dir> --out <dir> --gpu`.
 

@@ -10,9 +10,9 @@ use crate::workspace::Workspace;
 /// When a source view's depth agrees with a pixel's, and how many must.
 ///
 /// By default one agreeing source view within 15° of normal angle keeps a
-/// point; ACMM's code asks for two (and 10°). Over 12 ETH3D training
-/// scenes at 3200 px (multi-scale), F1 at 2 cm is 79.4% with these
-/// defaults, 78.6% at 30°, 77.7% without the normal check and 77.3% with
+/// point; ACMM's code asks for two (and 10°). Over the 13 ETH3D training
+/// scenes at 3200 px (multi-scale), F1 at 2 cm is 78.0% with these
+/// defaults, 77.3% at 30°, 76.4% without the normal check and 76.0% with
 /// two views at 30°. On pipes at 1600 px, one view instead of two raises F1
 /// from 66.9% to 76.0%.
 #[derive(Debug, Clone)]

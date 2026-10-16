@@ -1,0 +1,52 @@
+{"scene": "pipes", "method": "colmap-features", "extract_s": 0.9, "match_s": 0.3}
+{"scene": "pipes", "method": "colmap-incremental", "registered": 11, "images": 14, "auc1": 29.78, "auc3": 48.98, "auc5": 53.57, "rmse_cm": 0.859, "median_cm": 0.506, "seconds": 2.4}
+{"scene": "pipes", "method": "colmap-global", "registered": 14, "images": 14, "auc1": 51.23, "auc3": 81.58, "auc5": 88.65, "rmse_cm": 0.851, "median_cm": 0.489, "seconds": 1.06}
+{"scene": "pipes", "method": "visloc-rs", "registered": 11, "images": 14, "auc1": 32.49, "auc3": 50.62, "auc5": 54.55, "rmse_cm": 0.789, "median_cm": 0.419, "seconds": 0.39}
+{"scene": "courtyard", "method": "colmap-features", "extract_s": 1.9, "match_s": 4.2}
+{"scene": "courtyard", "method": "colmap-incremental", "registered": 38, "images": 38, "auc1": 54.11, "auc3": 82.66, "auc5": 89.6, "rmse_cm": 4.447, "median_cm": 3.624, "seconds": 9.84}
+{"scene": "courtyard", "method": "colmap-global", "registered": 38, "images": 38, "auc1": 49.49, "auc3": 77.7, "auc5": 86.04, "rmse_cm": 6.257, "median_cm": 3.608, "seconds": 19.46}
+{"scene": "courtyard", "method": "visloc-rs", "registered": 38, "images": 38, "auc1": 54.67, "auc3": 82.12, "auc5": 89.27, "rmse_cm": 4.686, "median_cm": 3.373, "seconds": 3.64}
+{"scene": "delivery_area", "method": "colmap-features", "extract_s": 1.9, "match_s": 2.6}
+{"scene": "delivery_area", "method": "colmap-incremental", "registered": 44, "images": 44, "auc1": 47.21, "auc3": 79.44, "auc5": 87.46, "rmse_cm": 2.534, "median_cm": 1.655, "seconds": 12.87}
+{"scene": "delivery_area", "method": "colmap-global", "registered": 44, "images": 44, "auc1": 49.62, "auc3": 80.8, "auc5": 88.33, "rmse_cm": 2.335, "median_cm": 1.691, "seconds": 13.31}
+{"scene": "delivery_area", "method": "visloc-rs", "registered": 44, "images": 44, "auc1": 53.61, "auc3": 82.54, "auc5": 89.37, "rmse_cm": 2.391, "median_cm": 1.889, "seconds": 2.36}
+{"scene": "electro", "method": "colmap-features", "extract_s": 2.0, "match_s": 1.8}
+{"scene": "electro", "method": "colmap-incremental", "registered": 41, "images": 45, "auc1": 42.9, "auc3": 64.95, "auc5": 70.8, "rmse_cm": 3.474, "median_cm": 3.008, "seconds": 9.62}
+{"scene": "electro", "method": "colmap-global", "registered": 45, "images": 45, "auc1": 47.82, "auc3": 72.04, "auc5": 78.38, "rmse_cm": 234.491, "median_cm": 204.736, "seconds": 9.02}
+{"scene": "electro", "method": "visloc-rs", "registered": 41, "images": 45, "auc1": 42.89, "auc3": 64.95, "auc5": 70.76, "rmse_cm": 3.468, "median_cm": 2.992, "seconds": 2.36}
+{"scene": "facade", "method": "colmap-features", "extract_s": 3.3, "match_s": 22.4}
+{"scene": "facade", "method": "colmap-incremental", "registered": 76, "images": 76, "auc1": 71.66, "auc3": 88.65, "auc5": 93.02, "rmse_cm": 6.846, "median_cm": 5.175, "seconds": 26.35}
+{"scene": "facade", "method": "colmap-global", "registered": 76, "images": 76, "auc1": 58.73, "auc3": 71.94, "auc5": 75.2, "rmse_cm": 709.345, "median_cm": 353.592, "seconds": 61.19}
+{"scene": "facade", "method": "visloc-rs", "registered": 76, "images": 76, "auc1": 71.5, "auc3": 88.57, "auc5": 92.97, "rmse_cm": 6.869, "median_cm": 5.203, "seconds": 10.84}
+{"scene": "kicker", "method": "colmap-features", "extract_s": 1.6, "match_s": 1.8}
+{"scene": "kicker", "method": "colmap-incremental", "registered": 30, "images": 31, "auc1": 48.1, "auc3": 74.24, "auc5": 81.2, "rmse_cm": 2.057, "median_cm": 1.76, "seconds": 7.41}
+{"scene": "kicker", "method": "colmap-global", "registered": 31, "images": 31, "auc1": 49.26, "auc3": 74.63, "auc5": 81.51, "rmse_cm": 54.553, "median_cm": 13.859, "seconds": 5.2}
+{"scene": "kicker", "method": "visloc-rs", "registered": 30, "images": 31, "auc1": 49.59, "auc3": 74.76, "auc5": 81.55, "rmse_cm": 2.081, "median_cm": 1.821, "seconds": 1.55}
+{"scene": "meadow", "method": "colmap-features", "extract_s": 1.0, "match_s": 0.8}
+{"scene": "meadow", "method": "colmap-incremental", "registered": 14, "images": 15, "auc1": 45.4, "auc3": 68.46, "auc5": 75.51, "rmse_cm": 4.879, "median_cm": 3.637, "seconds": 32.83}
+{"scene": "meadow", "method": "colmap-global", "registered": 15, "images": 15, "auc1": 27.81, "auc3": 56.36, "auc5": 67.69, "rmse_cm": 88.076, "median_cm": 33.466, "seconds": 3.37}
+{"scene": "meadow", "method": "visloc-rs", "registered": 14, "images": 15, "auc1": 41.31, "auc3": 65.97, "auc5": 74.16, "rmse_cm": 5.193, "median_cm": 4.421, "seconds": 0.42}
+{"scene": "office", "method": "colmap-features", "extract_s": 1.2, "match_s": 0.3}
+{"scene": "office", "method": "colmap-incremental", "registered": 20, "images": 26, "auc1": 19.91, "auc3": 34.06, "auc5": 40.19, "rmse_cm": 2.019, "median_cm": 0.779, "seconds": 6.92}
+{"scene": "office", "method": "colmap-global", "registered": 26, "images": 26, "auc1": 26.81, "auc3": 54.1, "auc5": 65.97, "rmse_cm": 50.147, "median_cm": 28.852, "seconds": 1.98}
+{"scene": "office", "method": "visloc-rs", "registered": 20, "images": 26, "auc1": 19.45, "auc3": 33.97, "auc5": 40.6, "rmse_cm": 1.558, "median_cm": 0.667, "seconds": 1.95}
+{"scene": "playground", "method": "colmap-features", "extract_s": 2.0, "match_s": 4.5}
+{"scene": "playground", "method": "colmap-incremental", "registered": 38, "images": 38, "auc1": 65.66, "auc3": 87.7, "auc5": 92.6, "rmse_cm": 0.625, "median_cm": 0.602, "seconds": 26.07}
+{"scene": "playground", "method": "colmap-global", "registered": 38, "images": 38, "auc1": 63.58, "auc3": 86.74, "auc5": 92.01, "rmse_cm": 0.687, "median_cm": 0.657, "seconds": 10.61}
+{"scene": "playground", "method": "visloc-rs", "registered": 38, "images": 38, "auc1": 65.44, "auc3": 87.55, "auc5": 92.5, "rmse_cm": 0.608, "median_cm": 0.577, "seconds": 2.24}
+{"scene": "relief", "method": "colmap-features", "extract_s": 1.7, "match_s": 1.6}
+{"scene": "relief", "method": "colmap-incremental", "registered": 31, "images": 31, "auc1": 55.72, "auc3": 83.59, "auc5": 89.98, "rmse_cm": 0.92, "median_cm": 0.835, "seconds": 6.91}
+{"scene": "relief", "method": "colmap-global", "registered": 31, "images": 31, "auc1": 52.12, "auc3": 70.51, "auc5": 74.78, "rmse_cm": 177.228, "median_cm": 173.314, "seconds": 12.06}
+{"scene": "relief", "method": "visloc-rs", "registered": 31, "images": 31, "auc1": 56.52, "auc3": 84.15, "auc5": 90.41, "rmse_cm": 0.826, "median_cm": 0.686, "seconds": 3.09}
+{"scene": "relief_2", "method": "colmap-features", "extract_s": 1.5, "match_s": 0.9}
+{"scene": "relief_2", "method": "colmap-incremental", "registered": 31, "images": 31, "auc1": 57.91, "auc3": 85.02, "auc5": 90.91, "rmse_cm": 0.813, "median_cm": 0.728, "seconds": 6.77}
+{"scene": "relief_2", "method": "colmap-global", "registered": 31, "images": 31, "auc1": 45.62, "auc3": 59.94, "auc5": 63.07, "rmse_cm": 67.966, "median_cm": 40.857, "seconds": 8.06}
+{"scene": "relief_2", "method": "visloc-rs", "registered": 31, "images": 31, "auc1": 58.25, "auc3": 85.18, "auc5": 91.02, "rmse_cm": 0.799, "median_cm": 0.698, "seconds": 2.04}
+{"scene": "terrace", "method": "colmap-features", "extract_s": 1.4, "match_s": 1.1}
+{"scene": "terrace", "method": "colmap-incremental", "registered": 23, "images": 23, "auc1": 51.41, "auc3": 82.77, "auc5": 89.68, "rmse_cm": 1.946, "median_cm": 1.588, "seconds": 8.21}
+{"scene": "terrace", "method": "colmap-global", "registered": 23, "images": 23, "auc1": 52.43, "auc3": 83.14, "auc5": 89.91, "rmse_cm": 1.928, "median_cm": 1.595, "seconds": 4.01}
+{"scene": "terrace", "method": "visloc-rs", "registered": 23, "images": 23, "auc1": 51.29, "auc3": 82.66, "auc5": 89.61, "rmse_cm": 1.992, "median_cm": 1.728, "seconds": 1.57}
+{"scene": "terrains", "method": "colmap-features", "extract_s": 1.8, "match_s": 1.9}
+{"scene": "terrains", "method": "colmap-incremental", "registered": 42, "images": 42, "auc1": 58.94, "auc3": 85.3, "auc5": 91.02, "rmse_cm": 0.596, "median_cm": 0.525, "seconds": 6.77}
+{"scene": "terrains", "method": "colmap-global", "registered": 42, "images": 42, "auc1": 61.99, "auc3": 86.38, "auc5": 91.67, "rmse_cm": 0.588, "median_cm": 0.532, "seconds": 9.25}
+{"scene": "terrains", "method": "visloc-rs", "registered": 42, "images": 42, "auc1": 58.51, "auc3": 85.23, "auc5": 90.99, "rmse_cm": 0.597, "median_cm": 0.548, "seconds": 1.67}

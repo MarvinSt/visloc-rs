@@ -1,0 +1,17 @@
+# COLMAP 4.2.1 (CUDA, Caspar) incremental mapper on the same verified matches, under a 75-minute timeout:
+# every 500th registration and the last one.
+I20261015 13:32:45.447336 130407 incremental_pipeline.cc:620] Registering image #4428 (num_reg_frames=2)
+I20261015 13:40:45.271576 130407 incremental_pipeline.cc:620] Registering image #3191 (num_reg_frames=501)
+I20261015 13:47:19.997124 130407 incremental_pipeline.cc:620] Registering image #5657 (num_reg_frames=1001)
+I20261015 13:55:10.214444 130407 incremental_pipeline.cc:620] Registering image #3522 (num_reg_frames=1501)
+I20261015 14:01:45.865965 130407 incremental_pipeline.cc:620] Registering image #1697 (num_reg_frames=2001)
+I20261015 14:08:43.061514 130407 incremental_pipeline.cc:620] Registering image #2587 (num_reg_frames=2501)
+I20261015 14:16:49.976828 130407 incremental_pipeline.cc:620] Registering image #1448 (num_reg_frames=3001)
+I20261015 14:22:40.728116 130407 incremental_pipeline.cc:620] Registering image #2655 (num_reg_frames=3501)
+I20261015 14:30:07.647655 130407 incremental_pipeline.cc:620] Registering image #35 (num_reg_frames=4001)
+I20261015 14:35:11.277338 130407 incremental_pipeline.cc:620] Registering image #3830 (num_reg_frames=4501)
+I20261015 14:42:45.779350 130407 incremental_pipeline.cc:620] Registering image #5069 (num_reg_frames=5001)
+I20261015 14:45:09.566356 130407 incremental_pipeline.cc:620] Registering image #4714 (num_reg_frames=5352)
+# stopped by the timeout (exit 124)
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:15:00
+	Maximum resident set size (kbytes): 6150864

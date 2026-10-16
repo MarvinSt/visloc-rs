@@ -6,6 +6,52 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **COLMAP-port mapper: resuming a reconstruction with 3D points
+  panicked.** `ObservationManager::new` counted the existing observations
+  before the visibility pyramids were sized. The constructor now sizes
+  them, as COLMAP's `InitImageStat` does; on an empty reconstruction the
+  state is unchanged.
+
+- **COLMAP-port mapper: the converged final BA stalled on two of three
+  SmallCity paths.** Two LM rules now apply to solves with the absolute
+  gradient criterion. In production that means only the converged final BA
+  (under Added).
+  - **A trial is judged the way the model sees it.** The trial cost now
+    leaves out observations whose point is behind its camera at the
+    current state, as the linearization already does. Before, a point that
+    one step had carried behind a camera came back in front on a later
+    trial with a residual of hundreds of pixels. On mapper seed 1 a single
+    two-view point at a camera centre did this to 7 of the 18 trials.
+    Each one raised the cost by 14k to 869k and was rejected, so the trust
+    radius never grew past about 6e6 and the drift stayed.
+  - **A small decrease ends the solve only if the model predicted a small
+    one too.** On seed 2 the final BA stopped after a step that lowered the
+    cost by 4% of its predicted decrease (rho 0.04).
+  - **SmallCity** (RTX 3090 pod replays with the same matches; every model
+    before the final BA is byte-identical to the earlier replays). Median
+    centre error:
+
+    | seed | before the final BA | final BA before | now |
+    |---|---|---|---|
+    | 0 | 0.611 m | 0.146 m | 0.147 m |
+    | 1 | 0.496 m | 0.366 m | 0.161 m |
+    | 2 | 0.840 m | 0.711 m | 0.648 m |
+
+    - Seed 1's p90 goes from 1.29 m to 0.35 m. The fitted scales of its
+      four passes go from 3.29–3.43 to 3.31–3.33. Its final BA accepts all
+      16 steps (97 s), and the trust radius reaches 1.3e8.
+    - Seed 2's remaining drift (3.9% between passes) is in the BA optimum
+      itself. Run with no function tolerance, the same solve also ends at
+      0.650 m.
+    - Seed 0 is unchanged within 1 mm (p90 0.281 m to 0.283 m).
+  - **What did not help:** more refinement rounds (BA, merge, filter) after
+    the converged BA. Restarted at the initial trust radius, each round
+    stops after one or two steps. Started from the previous round's
+    radius, four more rounds took seed 0 from 0.147 m to 0.328 m and seed
+    1 from 0.161 m to 0.352 m, worse with every round.
+  - **Unchanged:** the one- or two-step incremental BAs keep the plain
+    evaluation. All 16 ETH3D models are byte-identical.
+
 - **`colmap_incremental_mapper` replays a `gsplat_photos`/`gsplat_euroc`
   export with the options it ran with.** Those pipelines use COLMAP's
   single-camera `abs_pose_min_num_inliers=30`, but a replay of their
@@ -82,6 +128,228 @@ All notable changes to `visloc-rs` will be documented here.
   decline distorted cameras and fall back to the regular solver.
 
 ### Added
+
+- **COLMAP-port mapper: complete the largest model
+  (`complete_largest_model=1`).** Off by default in the mapper; on in
+  `gsplat_photos` (`--no-complete-model` turns it off, see Changed).
+  - **When it runs:** once every model is built. It extends the largest
+    model with the images it left out.
+  - **Candidates:** images with at least `2 * abs_pose_min_num_inliers`
+    2D–2D correspondences to registered images.
+  - **Why COLMAP misses them:** its structure-less fallback asks the same
+    candidates for `abs_pose_min_num_inliers` 3D points. That filter keeps
+    out the images that see too few of them.
+  - **Each registration** is triangulated and locally refined. It is undone
+    if the image then sees fewer than `abs_pose_min_num_inliers` 3D points.
+  - **No other effect:** the pass cannot change which models are built, and
+    a model it does not extend stays bit-identical.
+  - **ETH3D, 13 DSLR training scenes:**
+    - On COLMAP's matches: mean AUC@1°/3°/5° 51.97 / 76.75 / 83.21 (445 of
+      454 registered) → 53.69 / 79.94 / 86.90 (452). That is ahead of
+      COLMAP 4.2.1's incremental mapper (51.34 / 76.25 / 82.88) and of its
+      global mapper (48.65 / 70.41 / 76.36), and ahead of the global mapper
+      without pipes too.
+    - On visloc-rs's matches: 53.09 / 78.85 / 85.69 (448) → 53.25 / 79.66 /
+      86.90 (452).
+    - Details: `docs/eth3d_auc_benchmark.md`.
+
+- **VLFeat-compatible SIFT on the GPU (`gsplat_photos`).**
+  `visloc_sift_gpu::VlfeatSiftGpu` ports the photo pipeline's SIFT (the
+  VLFeat-compatible detector and descriptor with COLMAP's byte
+  descriptors) to f32 WGSL. `gsplat_photos` uses it by default
+  (`--cpu-sift` for the CPU extractor, see Changed).
+  - **On the GPU:** both scale spaces, the DoG extrema with VLFeat's
+    five-step refinement, the orientation histograms, the descriptor
+    pyramid's gradients and the descriptors.
+  - **On the host, as the CPU path does:** the scan order, the per-locus
+    orientation cap, the per-level `max_keypoints` cap and each keypoint's
+    descriptor level, in f64.
+  - **Against the CPU extractor (f64):** on 50 SmallCity photos and an RTX
+    3090, 99.97% of the keypoints pair up both ways; descriptor bytes
+    differ by 0.0007 on average and by at most 35 (at most one on
+    llvmpipe). On 40 SmallCity photos `gsplat_photos` verifies 700 of 780
+    pairs and registers 40/40 either way.
+  - **Speed:** on an RTX 3090, SmallCity's 5,822 photos at 1,024 px take
+    43.8 s (7.5 ms a photo), against 201.9 s for the CPU extractor on 23
+    threads. Images of one size are pipelined: the GPU detects the next
+    image while the host orders and caps the current one's candidates.
+  - **ETH3D, the 13 DSLR training scenes** (an RTX 3090, 13 CPU threads):
+    extraction takes 10.0 s against 92.4 s, and the visloc-rs mapper
+    scores the same: mean AUC@1°/3°/5° 53.08 / 78.85 / 85.68 against
+    53.09 / 78.85 / 85.69, 448/454 registered either way.
+  - Each pyramid level is its own buffer, so no binding exceeds one level;
+    an image past the device's limit is extracted on the CPU.
+    `sift_vlfeat_gpu_bench` compares the two extractors on a directory of
+    images.
+
+- **COLMAP-port mapper: large bundle adjustments on the GPU.**
+  `colmap_incremental_mapper --gpu-ba 1` and `gsplat_photos --gpu-ba` (both
+  `--features gpu` builds) solve the reduced camera system of large bundle
+  adjustments through wgpu (`visloc_ba_gpu::GpuReducedSolver`). Without the
+  flag nothing changes: the CPU path stays bit-identical.
+  - **What moves:** bundle adjustments with at least 1,000 free frames. The
+    GPU forms the reduced camera system's off-diagonal blocks and runs the
+    preconditioned conjugate gradients. The CPU keeps the linearization,
+    the diagonal blocks and right-hand side, the preconditioner's
+    factorization and the back-substitution, in f64.
+  - **Deterministic:** the blocks are exact sums (64-bit fixed point over
+    two 32-bit atomics) and the conjugate gradients reduce in a fixed
+    order, so a solve repeats exactly on a given device. It is not
+    bit-identical to the CPU path.
+  - **Validation:** on a SmallCity pass-1 replay (1,499 photos, llvmpipe)
+    the large bundle adjustments take the CPU's PCG iteration counts, and
+    the camera centres differ from the CPU model by a median of 5e-6 and at
+    most 0.015% of the scene extent.
+  - **Not faster yet:** on an NVIDIA L4 with 21 CPU threads, SmallCity's
+    mapper took 1,193 s with it and 1,168 s without; the GPU's block
+    product and elimination are the reasons.
+  - `visloc_slam::ReducedSolveAccelerator` is the hook another backend can
+    implement. Details: `docs/gpu_bundle_adjustment.md`.
+
+- **ETH3D benchmark against COLMAP 4.2 and GLOMAP.**
+  - **What it runs:** `scripts/benchmark_eth3d_auc.sh` runs the visloc-rs
+    mapper, COLMAP's incremental mapper and COLMAP's global mapper (GLOMAP,
+    via pycolmap 4.2.1) on the 13 ETH3D DSLR training scenes.
+  - **Inputs:** the same inputs for all three, either COLMAP's SIFT and
+    exhaustive matches (the GLOMAP paper's setup) or visloc-rs's own.
+  - **Scoring:** as in the GLOMAP paper, AUC at 1°, 3° and 5° of the pairwise
+    relative pose error.
+  - **Result on COLMAP's matches (mean AUC@1°/3°/5°):**
+
+    | Mapper | AUC | Mapper time |
+    |---|---|---|
+    | visloc-rs | 50.9 / 75.5 / 82.1 | 28.4 s |
+    | COLMAP incremental | 50.4 / 75.2 / 81.7 | 200.7 s |
+    | COLMAP global | 51.6 / 75.5 / 81.7 | 184.4 s |
+
+  - **On visloc-rs's own matches** it leads both at every threshold: 53.1 /
+    78.9 / 85.7, against COLMAP's three-run means of 50.2 / 75.1 / 82.0 and
+    51.3 / 75.0 / 81.1.
+  - **Mapper options:** visloc-rs runs as `gsplat_photos` configures it, with
+    COLMAP 4's structure-less fallback on. On the port's default, which
+    leaves it off, it registers 7 and 3 fewer images and scores 50.7 / 74.5
+    / 80.5 and 51.7 / 76.5 / 83.1.
+  - **SmallCity:** on the 5,822-photo capture, both mappers get visloc-rs's
+    matches and 32 CPU threads. visloc-rs maps it in 21.7 min. COLMAP's
+    global mapper had not finished when a 100-minute cap stopped it, 94 min
+    into mapping.
+    `scripts/benchmark_smallcity_glomap.py` runs COLMAP's side.
+  - Tables and caveats: `docs/eth3d_auc_benchmark.md`. Raw results:
+    `benchmarks/eth3d_auc/` and `benchmarks/smallcity_glomap/`.
+
+- **COLMAP-port BA: two-level PCG preconditioner for converging
+  solves.** Once a large global BA (1,000+ free frames) is past its first
+  three LM steps, its iterative solve adds a coarse correction to the
+  run-of-frames preconditioner. In practice that means the converged
+  final BA.
+  - **What it does:** one shared 6-vector step per aggregate of 32
+    consecutive frames, solved densely (`P (PᵀAP)⁻¹ Pᵀ r`). A frame's step
+    is a world-frame motion, so a shared step moves the aggregate rigidly.
+  - **Why it helps:** smooth deformations of a long capture, such as scale
+    drifting along a street, are close to rigid at that scale. They are
+    the low-curvature modes conjugate gradients converge on slowest, and
+    the run-of-frames level cannot see them. Under heavy LM damping the
+    damping holds them down, so the correction waits until the damping is
+    at most 1e-5 (trust radius 1e5 or more). From the first step on, it
+    made SmallCity's one-step incremental BAs run up to 13 steps and
+    changed the reconstruction's path.
+  - **Cost:** at most 256 aggregates. SmallCity's coarse factor (1,092
+    rows) takes 55 ms a solve and 0.5 ms a PCG iteration, against about
+    26 ms for one PCG product. `VISLOC_PORT_PCG_COARSE=0` turns it off.
+  - **PCG iterations, 4-thread benches:**
+
+    | Bench | without | with |
+    |---|---|---|
+    | 1,500-frame drift test, converged solve | 3,620 (5.6 s) | 1,165 (2.1 s) |
+    | `large_global_ba`, 1,200 frames, one pass | 803 | 256 |
+    | `large_global_ba`, 1,200 frames, four passes (3 steps) | 149 | 149 (identical) |
+
+    The final costs match.
+  - **SmallCity** (one RTX 3090 pod replay). The model before the final
+    BA is byte-identical to the replay without the coarse level:
+
+    | | without | with |
+    |---|---|---|
+    | Final BA LM steps | 41 | 14 |
+    | Final BA PCG iterations | 20,102 | 6,425 |
+    | Final BA time | 661 s | 204 s |
+    | Mapper wall time | 30:26 | 23:20 |
+    | Median centre error | 0.178 m | 0.146 m |
+    | p90 centre error | 0.354 m | 0.281 m |
+    | Max centre error | 1.12 m | 0.76 m |
+
+    Applying the coarse level from the first step instead changed the
+    path: the mapper took 27:46 and ended at 0.524 m, with a 2% scale step
+    between passes 2 and 3 left in place.
+  - **Smaller problems are unchanged:** all 15 ETH3D models are
+    byte-identical, since none reaches the iterative solve.
+
+- **COLMAP-port mapper: a converged final BA on large models.** This is
+  not in COLMAP.
+  - **What it does:** each model of 1,000 or more registered frames ends
+    with one more global refinement. Its BA runs to convergence (absolute
+    gradient stop, up to 50 LM steps).
+  - **When it runs:** 1,000 frames is where global BAs switch to the
+    iterative solver. Smaller models, such as the ETH3D scenes and
+    Courthouse, are unchanged.
+  - **Setting it:** `ba_global_final_converge_min_frames=N` sets the
+    threshold. Pass it as `gsplat_euroc --mapper-opt`, or as a line in a
+    replay's `mapper_options.txt`. `0` runs it on every model, and a
+    number above any model's size turns it off.
+  - **Why it is needed:** COLMAP's global BAs stop on the relative
+    `gradient_tolerance=1.0` after one or two steps. Each restarts from
+    Ceres' initial trust radius, whose damping holds back smooth,
+    low-curvature modes. Scale drift along a street is such a mode, so no
+    global BA of the incremental loop corrects it.
+  - **Synthetic test** (`global_ba_drift_needs_a_converged_solve`): a
+    1,500-frame street with an 8% scale drift.
+    - One step leaves 6.7% of the drift.
+    - The converged solve leaves 0.01%.
+  - **SmallCity:** its four passes are the four sides of the block, an
+    open path that ends about 26 m from its start. Its scale drifts
+    smoothly along the path, by about ±4% against the reference. One
+    replay on an RTX 3090 pod (32 vCPUs) compared the model before and
+    after the final converged BA (`VISLOC_SNAPSHOT_BEFORE_FINAL`):
+
+    | | before | after |
+    |---|---|---|
+    | Median centre error | 0.611 m | 0.178 m |
+    | p90 centre error | 2.10 m | 0.354 m |
+    | Max centre error | 2.92 m | 1.12 m |
+    | Scale drift along the path | ±4% | about ±1% |
+    | Per-pass fitted scales | 3.92 to 4.19 | 3.92 to 3.98 |
+
+    - The "before" model matches the earlier replay without this BA byte
+      for byte.
+    - The final BA ran 41 LM steps (20,102 PCG iterations) and stopped on
+      the function tolerance. It took 11 minutes, so the mapper's wall
+      time went from 21:00 to 30:26.
+    - With the two-level PCG preconditioner (the entry above), the same
+      final BA takes 14 steps and 204 s and reaches 0.146 m. The mapper
+      then takes 23:20.
+    - **Follow-up: the gain depends on the reconstruction path.** Three
+      replays with the same matches and `--random-seed` 0, 1 and 2 give
+      these median centre errors:
+
+      | seed | before the final BA | after |
+      |---|---|---|
+      | 0 | 0.611 m | 0.146 m |
+      | 1 | 0.496 m | 0.366 m |
+      | 2 | 0.840 m | 0.711 m |
+
+      The final BA improves every path, but it removes the scale drift
+      (about ±4% along the path) only on seed 0. Seed 2's BA stops after
+      seven accepted steps on the function tolerance, while its trust
+      radius is still small. In seed 1's BA, 7 of 18 trials are
+      rejected. Both causes are fixed (under Fixed: "the converged final
+      BA stalled"): seeds 0, 1 and 2 now reach 0.147 m, 0.161 m and
+      0.648 m.
+  - **ETH3D, 13 scenes, forced on with a threshold of 0:** the change is
+    within noise. Meadow goes from 5.73 to 4.94 cm and facade from 1.67
+    to 1.77 cm. That is why small models are left out. At the default
+    threshold, all 15 ETH3D models are byte-identical to before.
+  - `VISLOC_SNAPSHOT_BEFORE_FINAL=<dir>` writes the model as the
+    incremental loop left it, so one run gives both models.
 
 - **`visloc_web`: run the photo pipeline from a web browser.**
   `cargo run --release --example visloc_web` serves a page on
@@ -274,6 +542,134 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **`gsplat_photos` extracts SIFT on the GPU and completes the largest
+  model by default.** `--cpu-sift` and `--no-complete-model` restore the
+  previous behaviour; `--cpu` also extracts on the CPU.
+  - **Why:** on ETH3D the mapper scores the same with GPU SIFT (mean
+    AUC@1°/3°/5° 53.08 / 78.85 / 85.68 against 53.09 / 78.85 / 85.69), and
+    completion raises it (452 of 454 images registered instead of 448).
+  - **SmallCity, one RTX 3090 run with 23 CPU threads:**
+    - The CPU-SIFT model reproduced the earlier run byte for byte
+      (5,816 / 5,822 registered, median centre error 0.147 m).
+    - Completion adds nothing there: its six left-out photos do not
+      register. The mapper took 1% longer.
+    - With GPU SIFT, extraction took 40.2 s instead of 331.2 s, and the
+      model registers 5,816 photos with a median of 0.184 m (p90 0.276 m,
+      against 0.283 m). That is within the spread of mapper seeds on this
+      capture, 0.15 to 0.65 m.
+  - The ETH3D and SmallCity numbers documented before this change were
+    measured with CPU SIFT and without completion, unless noted.
+
+- **COLMAP-port BA: cheaper setup of large bundle adjustments.** Results
+  are bit-identical: the SmallCity pass-1 model matches byte for byte.
+  - **First linearization.** A solve's first linearization zeroed its
+    camera-point block array on one thread (2 GB on SmallCity's last
+    bundle adjustments). It is now zeroed in parallel, which also spreads
+    the first touch of its pages over the threads.
+  - **Slot index.** The reduced system's pattern and the elimination's
+    contribution index each built the same list of observing points per
+    frame. It is now built once, in parallel over chunks of points.
+  - **SmallCity pass 1** (1,499 photos, 4 threads, one run each; the
+    machine varies by about 10% between runs): the large bundle
+    adjustments' linearization takes 5.8 s instead of 13.5 s, all global
+    bundle adjustments 208 s instead of 258 s, and the mapper 364.4 s
+    instead of 391.6 s.
+
+- **COLMAP-port mapper: global track completion skips tracks it cannot
+  extend.** Results are bit-identical: all 13 local ETH3D scenes and the
+  SmallCity pass-1 model match byte for byte, at 4 threads and at 1.
+  - **Which tracks change:** a track can only gain a 2D point that one of
+    its observations corresponds to, of a registered image and without a
+    3D point. A completion pass only adds observations.
+  - **Change:** `CompleteAllTracks` now runs only on the tracks that have
+    such a correspondence. It finds them in one pass from those 2D
+    points, since the correspondence graph stores every match both ways.
+  - **SmallCity pass 1** (1,499 photos, 4 threads): 15% of the tracks
+    qualify. Global track completion takes 10.4 s instead of 19.4 s,
+    including the 3.3 s scan.
+
+- **COLMAP-port mapper: cheaper triangulation, track completion and
+  large-BA setup.** Results are bit-identical: all 15 ETH3D models (13
+  scenes) and the SmallCity pass-1 model below match byte for byte
+  (`cameras.txt`, `images.txt` and `points3D.txt`).
+  - **Why:** a perf profile of a SmallCity replay (pass 1, 1,499 photos,
+    4 threads) ranked three costs first:
+    - the track-completion search, 15% of CPU time;
+    - the DLT triangulation's SVD, 13%;
+    - one part of a large global BA's setup, 8%: finding each point's
+      frame pairs in the edge rows of the reduced camera system.
+  - **DLT triangulation.** nalgebra's SVD gives the same `V` without `U`,
+    and on a fixed-size matrix as on a `DMatrix`. A check on 1,000,000
+    random systems of 2 to 8 views found them bit-identical. Systems of
+    up to four views now skip `U` and the heap. A 2-view SVD takes
+    1.33 µs instead of 1.96 µs.
+  - **Track completion.** The search now marks a 2D point visited only
+    after the registration and 3D-point checks. Those checks reject the
+    track and every triangulated 2D point on every visit, so the visited
+    set holds only the candidates.
+  - **Large global BA setup.** Up to 16,384 frames, the edge rows are
+    marked straight into a bitmap per row over the frame slots. They were
+    gathered, sorted and deduplicated. A frame pair's edge index is now
+    its row's offset plus a popcount rank, not a binary search of the row.
+  - **SmallCity pass 1, before and after** (two runs each; the machine
+    varies by about 10% between runs):
+    - mapper: 378.7 and 412.7 s before, 337.7 and 342.6 s after;
+    - setup of the 1,498-frame global BA: 1.19 to 1.24 s before, 0.27 to
+      0.31 s after;
+    - global BA: 132 to 151 s before, 108 s after;
+    - local track merging and completion: 73 to 78 s before, 65 to 66 s
+      after;
+    - triangulation: 24 to 26 s before, 20 s after.
+  - **ETH3D scenes** are small, and their times do not change measurably
+    (facade: 11.2 s before and after).
+
+- **COLMAP-port mapper: cheaper local refinement.** Results are
+  bit-identical: all 15 ETH3D models match (`images.txt` and
+  `points3D.txt`).
+  - **Why:** on SmallCity, local refinement is a third of the mapper's
+    time (465 s of 23:20):
+    - local BA 177 s;
+    - track merging and completion 124 s;
+    - point filtering 112 s.
+
+    A callgrind profile of ETH3D facade put the track-completion search
+    (`plan_complete`) first, at 10% of all instructions.
+  - **Track completion.**
+    - `CompleteTracks` and `CompleteImage` run back to back. The second
+      searched again from most of the new image's 3D points, which the
+      first had just searched.
+    - A search that added nothing, and examined no 2D point the first
+      pass then gave a 3D point, would add nothing again. The image pass
+      now reuses it. On facade, 88% of these searches are reused.
+    - A completion plan now records only the 2D points that can still
+      gain a 3D point during the pass: those of registered images
+      without one. These are the only ones that can make the plan stale.
+      The search also checks a 2D point's 3D point before its image's
+      registration.
+    - A 2D point without a 3D point builds its correspondences' data (a
+      camera copy and a pose each) only when it is about to be
+      triangulated. Most stop earlier, because a correspondence already
+      has a 3D point.
+  - **Point filtering.**
+    - `AdjustLocalBundle` filters the points of the window images, then
+      the modified points, and most of the second set is in the first.
+    - A point the first filter left untouched would be untouched again,
+      because filtering changes no other point and moves nothing. The
+      second filter now skips those points: on facade it checks 38
+      points instead of 4,197.
+    - The filters' pose table holds a 4-byte slot per image id instead
+      of the poses themselves.
+  - **Local BA setup.** A window's points are deduplicated with a bitmap
+    over point ids before sorting, instead of sorting every sighting.
+  - **ETH3D, before and after:**
+    - On facade (76 images), local refinement takes 3.63 s instead of
+      4.05 s, global refinement 3.99 s instead of 4.26 s, and the mapper
+      11.6 s instead of 12.5 s.
+    - The smaller scenes change only within noise.
+    - Per facade local refinement: track completion takes 3.7 ms instead
+      of 5.8 ms, filtering 4.6 ms instead of 6.2 ms, and local BA setup
+      2.7 ms instead of 3.3 ms.
+
 - **COLMAP-port BA: cheaper gradient stop and PCG product.**
   - **Gradient stop.** After an accepted step, nearly every solve stops
     on the gradient tolerance at the top of the next iteration. That
@@ -299,6 +695,17 @@ All notable changes to `visloc-rs` will be documented here.
       (p90 2.19 m → 0.75 m). The previous binary reproduced 0.640 m
       exactly, so the mapper is deterministic and the change comes from
       the code. A single run cannot say whether the gain is systematic.
+    - **Follow-up: the gain was not systematic.** The same replay
+      with this release (#280) gives 0.611 m (p90 2.10 m) in 21:00. Each
+      of the four passes alone fits the reference to about 0.1 m, but
+      their fitted scales differ by up to 7% (3.92 to 4.19). So the
+      centre error is the drift between passes, not BA precision, and
+      it moves with the reconstruction path.
+    - **PCG tolerance 0.1 tried and rejected** (`VISLOC_PORT_PCG_TOL`,
+      same pod). The looser solves made the large BAs take 143 LM steps
+      instead of 77, and their PCG iterations went from 10,249 to
+      22,972. Wall time rose from 21:00 to 24:03. The median error was
+      0.522 m, inside the run-to-run spread. The default stays 1e-2.
 
 - **COLMAP-port mapper: fewer allocations and cheaper scoring.** All
   three changes are bit-identical; ETH3D outputs match the previous

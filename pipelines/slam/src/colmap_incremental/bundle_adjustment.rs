@@ -579,6 +579,10 @@ fn point_policy(
     (variable, pull_in)
 }
 
+/// Windows of at most this many images (every local BA) collect their
+/// points through a bitmap ([`solve_native`]); larger ones in parallel.
+const DEDUP_BITMAP_MAX_IMAGES: usize = 64;
+
 /// [`solve`] for the native solver: the same problem as [`solve_legacy`]
 /// (frames, points, gauge, and every observation in the same order), built
 /// point by point from the tracks instead of image by image.
@@ -612,32 +616,67 @@ fn solve_native(
     let in_window = |image_id: ImageT| in_window.get(image_id as usize).copied().unwrap_or(false);
 
     // Every point observed in the window, plus the configured ones
-    // (`AddPointToProblem` for `config.VariablePoints()`/`ConstantPoints()`).
-    let image_ids: Vec<ImageT> = config.image_ids.iter().copied().collect();
-    let per_image: Vec<Vec<Point3DT>> = image_ids
-        .par_iter()
-        .map(|&image_id| {
-            recon
-                .image(image_id)
-                .points2d
-                .iter()
-                .filter_map(|point2d| point2d.point3d_id)
-                .collect()
-        })
-        .collect();
-    let mut added_points: Vec<Point3DT> = Vec::with_capacity(
-        per_image.iter().map(Vec::len).sum::<usize>()
-            + config.variable_point3d_ids.len()
-            + config.constant_point3d_ids.len(),
-    );
-    for ids in &per_image {
-        added_points.extend_from_slice(ids);
+    // (`AddPointToProblem` for `config.VariablePoints()`/`ConstantPoints()`),
+    // ascending and distinct.
+    let mut added_points: Vec<Point3DT>;
+    if config.image_ids.len() <= DEDUP_BITMAP_MAX_IMAGES {
+        // A local BA's window sees each point about three times: a bitmap
+        // over point ids keeps the first sighting, so only the distinct
+        // points are sorted.
+        let mut seen_point: Vec<u64> = Vec::new();
+        added_points = Vec::new();
+        let mut add_point = |id: Point3DT| {
+            let (word, bit) = ((id / 64) as usize, id % 64);
+            if word >= seen_point.len() {
+                seen_point.resize(word + 1, 0);
+            }
+            if seen_point[word] & (1 << bit) == 0 {
+                seen_point[word] |= 1 << bit;
+                added_points.push(id);
+            }
+        };
+        for &image_id in &config.image_ids {
+            for point2d in &recon.image(image_id).points2d {
+                if let Some(id) = point2d.point3d_id {
+                    add_point(id);
+                }
+            }
+        }
+        for &id in config
+            .variable_point3d_ids
+            .iter()
+            .chain(&config.constant_point3d_ids)
+        {
+            add_point(id);
+        }
+        added_points.par_sort_unstable();
+    } else {
+        let image_ids: Vec<ImageT> = config.image_ids.iter().copied().collect();
+        let per_image: Vec<Vec<Point3DT>> = image_ids
+            .par_iter()
+            .map(|&image_id| {
+                recon
+                    .image(image_id)
+                    .points2d
+                    .iter()
+                    .filter_map(|point2d| point2d.point3d_id)
+                    .collect()
+            })
+            .collect();
+        added_points = Vec::with_capacity(
+            per_image.iter().map(Vec::len).sum::<usize>()
+                + config.variable_point3d_ids.len()
+                + config.constant_point3d_ids.len(),
+        );
+        for ids in &per_image {
+            added_points.extend_from_slice(ids);
+        }
+        added_points.extend(&config.variable_point3d_ids);
+        added_points.extend(&config.constant_point3d_ids);
+        drop(per_image);
+        added_points.par_sort_unstable();
+        added_points.dedup();
     }
-    added_points.extend(&config.variable_point3d_ids);
-    added_points.extend(&config.constant_point3d_ids);
-    drop(per_image);
-    added_points.par_sort_unstable();
-    added_points.dedup();
 
     struct PointPlan {
         xyz: Point3<f64>,

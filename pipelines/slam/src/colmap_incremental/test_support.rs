@@ -177,6 +177,68 @@ pub(crate) fn point2_dist(a: Point2<f64>, b: Point2<f64>) -> f64 {
     (a - b).norm()
 }
 
+/// Three single-camera frames seeing the same 60 points, every pair matched
+/// point for point: the database, each frame's true `rig_from_world` and
+/// the point count. Tests register frames 0 and 1 at their true poses and
+/// no structure, so frame 2 sees no 3D point and only 2D-2D
+/// correspondences (60 to each registered frame).
+pub(crate) fn build_three_view_scene() -> (DatabaseCache, [SE3; 3], usize) {
+    let mut rig = Rig::new();
+    rig.set_rig_id(0);
+    rig.add_ref_sensor(SensorT::camera(1));
+    let camera = Camera::pinhole(1, 640, 480, 500.0, 500.0, 320.0, 240.0);
+    let points: Vec<Point3<f64>> = (0..60)
+        .map(|i| {
+            let i = i as f64;
+            Point3::new(
+                (i * 0.37).sin() * 1.2,
+                (i * 0.71).cos() * 0.8,
+                4.0 + (i * 0.53).sin(),
+            )
+        })
+        .collect();
+    let poses = [
+        SE3::new(UnitQuaternion::identity(), Vector3::zeros()),
+        SE3::new(
+            UnitQuaternion::from_euler_angles(0.0, 0.05, 0.0),
+            Vector3::new(-0.6, 0.0, 0.1),
+        ),
+        SE3::new(
+            UnitQuaternion::from_euler_angles(0.02, -0.06, 0.01),
+            Vector3::new(0.5, 0.15, -0.05),
+        ),
+    ];
+    let mut frames = BTreeMap::new();
+    let mut images = BTreeMap::new();
+    for (k, pose) in poses.iter().enumerate() {
+        let id = k as ImageT;
+        let mut frame = Frame::new(id, 0);
+        frame.add_data_id(DataT::camera(1, id));
+        frames.insert(id, frame);
+        let mut image = Image::new(id, 1, id, format!("{k}.png"));
+        image.points2d = points
+            .iter()
+            .map(|p| Point2D::new(camera.project(&pose.transform_point(p)).unwrap()))
+            .collect();
+        images.insert(id, image);
+    }
+    let mut graph = CorrespondenceGraph::new();
+    for id in 0..3 {
+        graph.add_image(id, points.len());
+    }
+    let matches: Vec<(usize, usize)> = (0..points.len()).map(|j| (j, j)).collect();
+    for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+        graph
+            .add_two_view_geometry(a, b, &matches, ConfigurationType::Calibrated)
+            .unwrap();
+    }
+    graph.finalize();
+    let mut cameras = BTreeMap::new();
+    cameras.insert(1, camera);
+    let db = DatabaseCache::from_parts(BTreeMap::from([(0, rig)]), cameras, frames, images, graph);
+    (db, poses, points.len())
+}
+
 /// C2.5 profiling harness: a `bundle::BundleAdjustment` (not a full
 /// `Reconstruction`/`DatabaseCache` — this is deliberately built directly at
 /// the BA-problem level, bypassing the triangulator/mapper, so a 2-3k-point,

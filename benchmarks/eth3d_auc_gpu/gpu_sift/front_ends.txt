@@ -1,0 +1,18 @@
+# ETH3D front ends with each extractor (RunPod: an NVIDIA RTX 3090, 13 CPU
+# threads, commit f8ee5b5): gsplat_photos with its CPU SIFT and with
+# --gpu-sift, both matching on the GPU. Mean keypoints per image, seconds.
+scene cpu_keypoints cpu_sift gpu_keypoints gpu_sift cpu_match_verify gpu_match_verify
+pipes 3365 8.7 3365 0.6 0.6 0.1
+courtyard 10636 7.0 10635 0.8 2.1 1.9
+delivery_area 5175 8.1 5174 0.8 1.2 1.1
+electro 5360 7.6 5359 0.8 1.0 0.9
+facade 12077 15.1 12144 1.5 7.5 7.5
+kicker 4415 5.8 4415 0.7 0.8 0.5
+meadow 10823 4.5 10822 0.5 0.6 0.3
+office 1452 4.3 1452 0.6 0.2 0.2
+playground 11072 7.6 11071 0.9 1.9 1.9
+relief 7003 5.8 7002 0.7 1.0 0.9
+relief_2 5085 5.8 5085 0.7 0.7 0.6
+terrace 8470 4.8 8470 0.6 0.7 0.5
+terrains 6056 7.3 6055 0.8 1.1 0.9
+total - 92.4 - 10.0 19.4 17.3

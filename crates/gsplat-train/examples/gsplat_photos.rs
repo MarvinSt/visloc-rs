@@ -5,9 +5,17 @@
 //!     --images <folder> --out <work dir> [--steps 30000] [--max-size 1600] [--focal PX] \
 //!     [--no-mesh] [--normal-weight 0.005] [--appearance] [--exhaustive-max 300] [--window 20]
 //!     [--retrieval 30] [--max-keypoints 8192] [--sift-opt key=value ...] [--match-f32] [--mask-black 12]
+//!     [--cpu] [--cpu-sift] [--no-complete-model] [--gpu-ba]
 //! ```
 //!
-//! SfM from `visloc_gsplat_train::photos` (EXIF focal, GPU SIFT/matching,
+//! SIFT runs on the GPU (`visloc_sift_gpu::VlfeatSiftGpu`, an f32 port of
+//! the CPU extractor) unless `--cpu-sift` or `--cpu`; `--cpu` also matches
+//! on the CPU. The mapper extends its largest model with the images it left
+//! out (its `complete_largest_model`) unless `--no-complete-model`.
+//! `--gpu-ba` also solves the mapper's large bundle adjustments on the GPU
+//! (docs/gpu_bundle_adjustment.md).
+//!
+//! SfM from `visloc_gsplat_train::photos` (EXIF focal, SIFT, GPU matching,
 //! the COLMAP-port mapper, intrinsics refinement), brush-strategy training,
 //! then mesh extraction (`visloc_gsplat_train::mesh`). Writes
 //! `<out>/scene.ply` and `<out>/mesh.ply`; no COLMAP or Python involved.
@@ -61,6 +69,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // domain_size_pooling=1` for strongly oblique / wide-baseline photos.
             "--sift-opt" => sfm.sift_overrides.push(next()?),
             "--cpu" => sfm.gpu = false,
+            // Large bundle adjustments' reduced camera systems on the GPU.
+            "--gpu-ba" => sfm.gpu_ba = true,
+            // SIFT on the CPU (the default extracts on the GPU).
+            "--cpu-sift" => sfm.gpu_sift = false,
+            // Leave the largest model as the mapper built it.
+            "--no-complete-model" => sfm.complete_model = false,
+            // The defaults, kept for older command lines.
+            "--gpu-sift" => sfm.gpu_sift = true,
+            "--complete-model" => sfm.complete_model = true,
             "--no-mesh" => mesh = false,
             "--normal-weight" => normal_weight = next()?.parse()?,
             // Per-photo colour correction (varying exposure / white balance).

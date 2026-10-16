@@ -132,6 +132,37 @@ camera-centre RMSE, and beats official COLMAP on the 38-image courtyard control
 
 <p align="center"><sub>Same-input CPU8 Electro 1,200: visloc-rs <b>3.46× faster</b> and <b>25.2% lower</b> camera-centre RMSE than COLMAP. Unordered SfM, sequential SfM vs COLMAP, and EuRoC reconstruction evidence are in the <a href="docs/unordered_sfm_benchmark.md">SfM benchmark docs</a>.</sub></p>
 
+### Against COLMAP 4.2 and GLOMAP on the same inputs
+
+On the 13 ETH3D DSLR training scenes, the visloc-rs mapper is on par with
+COLMAP 4.2's incremental mapper and its global mapper (GLOMAP), and maps
+about 7× faster. All three get the same COLMAP SIFT features and exhaustive
+matches, the GLOMAP paper's setup, and the scoring follows that paper:
+
+| Mapper (pycolmap 4.2.1, 4 threads) | Mean AUC@1° / 3° / 5° | Registered | Mapper time |
+| --- | ---: | ---: | ---: |
+| visloc-rs | 50.9 / 75.5 / 82.1 | 445 / 454 | **28.4 s** |
+| COLMAP incremental | 50.4 / 75.2 / 81.7 | 445 / 454 | 200.7 s |
+| COLMAP global (GLOMAP) | 51.6 / 75.5 / 81.7 | 454 / 454 | 184.4 s |
+
+On visloc-rs's own matches it leads both at every threshold: 53.1 / 78.9 /
+85.7, against COLMAP's three-run means of 50.2 / 75.1 / 82.0 (incremental)
+and 51.3 / 75.0 / 81.1 (global). The global mapper still registers more
+images; completing the largest model, now on by default in
+`gsplat_photos`, closes most of that gap. In a later run on COLMAP's
+matches, it took visloc-rs to 452 of 454 images and 53.7 / 79.9 / 86.9,
+ahead of COLMAP's incremental mapper (51.3 / 76.3 / 82.9) and its global
+mapper. The global mapper failed on one scene in that run; without that
+scene the means are 53.7 / 79.7 / 86.7 against 52.7 / 76.3 / 82.7. GPU
+SIFT, also the default now, extracts those features at the same AUC (53.1 /
+78.9 / 85.7): 10.0 s for the 13 scenes on an RTX 3090, against 92.4 s on 13
+CPU threads of the same machine. On a large capture,
+the 5,822 SmallCity photos, both mappers get visloc-rs's matches and 32 CPU
+threads: visloc-rs maps it in 21.7 min, and COLMAP's global mapper had not
+finished after 94 min, when a 100-minute cap stopped it.
+Per-scene tables, the SmallCity stages, the run-to-run spread and the caveats
+are in the [ETH3D AUC benchmark](docs/eth3d_auc_benchmark.md).
+
 ### Large connected collections
 
 On the connected OpenLORIS 10k stress set, streamed VLAD + LSH cuts visloc-rs
@@ -245,7 +276,7 @@ outputs.
   <img src="docs/assets/photos_to_mesh.gif" alt="south-building: each raw input photo next to the trained Gaussian splat and the extracted mesh rendered from the same recovered pose" width="900">
 </p>
 
-The GIF above is the 128 raw south-building JPGs, each next to the trained Gaussian splat and the extracted mesh rendered from that photo's own recovered pose. Every image registered, focal refined from EXIF 796 px to 847.0 px (COLMAP: 847.2), held-out PSNR 22.77 at 30k steps, 37 min end to end ([GIF script](scripts/make_photos_demo_gif.py)). The orbiting GIF at the top of this page is a whole city block: the 5,822 photos of the Hierarchical 3DGS SmallCity capture (six helmet-mounted GoPros on a bicycle, four passes around the block; the release ships them undistorted to one pinhole camera with people and cars blacked out, and its focal length is used as the prior). `gsplat_photos` registered 5,583 / 5,822 photos with 957,418 points (window + VLAD retrieval matching, `--retrieval 30`), trained a 4.7M-gaussian splat to held-out PSNR 24.09 over 698 views (`--mask-black 12` leaves the blacked-out pixels out of the loss and the PSNR) and fused a 5.9M-triangle mesh: 2.5 h end to end on a Google Colab A100 (SfM 82 min, training 30 min, mesh 34 min; [log](docs/media/hero/small_city_gsplat_photos.log)), half the 5 h of the same job before this release's matching, mapper, bundle-adjustment and TSDF speed-ups. Trained from street level, the road is thin splats that turn opaque only at grazing angles, so the orbit shows the street band around the camera path at no less than 70% opacity (`--ground-min-alpha 0.7`); that is a display choice, not the trained scene. [`scripts/colab/hero_pipeline.py`](scripts/colab/hero_pipeline.py) reproduces it on a Colab GPU (from the terminal with the Colab CLI, or via [the notebook](scripts/colab/readme_hero_courthouse.ipynb)) and [`scripts/make_readme_hero.py`](scripts/make_readme_hero.py) renders the orbit; the previous hero, Tanks and Temples Courthouse (553 frames, 34 min on an L4), is kept in [its log](docs/media/hero/courthouse_gsplat_photos.log).
+The GIF above is the 128 raw south-building JPGs, each next to the trained Gaussian splat and the extracted mesh rendered from that photo's own recovered pose. Every image registered, focal refined from EXIF 796 px to 847.0 px (COLMAP: 847.2), held-out PSNR 22.77 at 30k steps, 37 min end to end ([GIF script](scripts/make_photos_demo_gif.py)). The orbiting GIF at the top of this page is a whole city block: the 5,822 photos of the Hierarchical 3DGS SmallCity capture (six helmet-mounted GoPros on a bicycle, four passes around the block; the release ships them undistorted to one pinhole camera with people and cars blacked out, and its focal length is used as the prior). `gsplat_photos` registered 5,583 / 5,822 photos with 957,418 points (window + VLAD retrieval matching, `--retrieval 30`), trained a 4.7M-gaussian splat to held-out PSNR 24.09 over 698 views (`--mask-black 12` leaves the blacked-out pixels out of the loss and the PSNR) and fused a 5.9M-triangle mesh: 2.5 h end to end on a Google Colab A100 (SfM 82 min, training 30 min, mesh 34 min; [log](docs/media/hero/small_city_gsplat_photos.log)), half the 5 h of the same job before this release's matching, mapper, bundle-adjustment and TSDF speed-ups. Replaying the current mapper on `gsplat_photos`' matches registers 5,816 photos, and against the release's own metric COLMAP model (a reference, not ground truth; [`scripts/score_smallcity_reference.py`](scripts/score_smallcity_reference.py), after a Sim(3) fit) the camera centres land within a median 0.15 m, 0.16 m and 0.65 m for mapper seeds 0, 1 and 2 (p90 0.28 m, 0.35 m and 1.52 m); seed 2 keeps a 4% scale drift between the four passes. Trained from street level, the road is thin splats that turn opaque only at grazing angles, so the orbit shows the street band around the camera path at no less than 70% opacity (`--ground-min-alpha 0.7`); that is a display choice, not the trained scene. [`scripts/colab/hero_pipeline.py`](scripts/colab/hero_pipeline.py) reproduces it on a Colab GPU (from the terminal with the Colab CLI, or via [the notebook](scripts/colab/readme_hero_courthouse.ipynb)) and [`scripts/make_readme_hero.py`](scripts/make_readme_hero.py) renders the orbit; the previous hero, Tanks and Temples Courthouse (553 frames, 34 min on an L4), is kept in [its log](docs/media/hero/courthouse_gsplat_photos.log).
 
 To reproduce the run and the GIF, use the raw `images/` of COLMAP's
 south-building dataset. `gsplat_photos` prints the focal refinement and
@@ -261,11 +292,12 @@ python scripts/make_photos_demo_gif.py --run runs/sb --out photos_to_mesh.gif --
 
 The pipeline has three stages:
 
-1. **SfM.** Takes the focal length from EXIF, then runs GPU SIFT and
-   matching, two-view verification and the COLMAP-port mapper (the
-   configuration that beats COLMAP on EuRoC above). A final bundle
-   adjustment refines the intrinsics. A COLMAP text model is written to
-   `sparse/0`, so brush and Inria 3DGS can use the result too.
+1. **SfM.** Takes the focal length from EXIF, then runs SIFT and matching
+   on the GPU (`--cpu-sift` extracts on the CPU), two-view verification
+   and the COLMAP-port mapper (the configuration that beats COLMAP on EuRoC
+   above). A final bundle adjustment refines the intrinsics. A COLMAP text
+   model is written to `sparse/0`, so brush and Inria 3DGS can use the
+   result too.
 2. **Training.** brush's refine strategy on the hand-written wgpu forward
    and backward passes. On the same GPU, at 30k steps, it is faster than
    brush 0.3 on all five benchmark scenes (14–30%). PSNR is within

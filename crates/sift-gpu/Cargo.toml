@@ -50,6 +50,11 @@ path = "examples/match_gpu_bench.rs"
 required-features = ["gpu"]
 
 [[example]]
+name = "sift_vlfeat_gpu_bench"
+path = "examples/sift_vlfeat_gpu_bench.rs"
+required-features = ["gpu"]
+
+[[example]]
 name = "sift_dump_features"
 path = "examples/sift_dump_features.rs"
 required-features = ["gpu"]

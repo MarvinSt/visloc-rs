@@ -753,6 +753,8 @@ pub fn build_euroc_dataset(
             visloc_ba_gpu::GpuContext::new().map_err(|e| EurocError::Sfm(format!("gpu: {e}")))?;
         // Process-wide: the first registration wins.
         visloc_slam::set_ba_accelerator(Box::new(visloc_ba_gpu::GpuBundleAdjuster::new(ctx)));
+        // The COLMAP-port mapper's large bundle adjustments.
+        visloc_ba_gpu::register_reduced_pcg().map_err(|e| EurocError::Sfm(format!("gpu: {e}")))?;
     }
     // Decode + undistort + write the training PNG in parallel; SIFT then
     // runs on the GPU one frame at a time (one device), or in parallel on

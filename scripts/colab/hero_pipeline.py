@@ -129,13 +129,18 @@ def setup_vulkan():
         for n in ['libGLX_nvidia', 'libnvidia-glcore', 'libnvidia-glvkspirv', 'libnvidia-tls',
                   'libnvidia-gpucomp', 'libEGL_nvidia', 'libnvidia-eglcore', 'libnvidia-glsi']:
             src = f'{ex}/{n}.so.{drv}'
-            if os.path.exists(src):
+            # The container runtime may already mount some of these (same
+            # driver version) read-only; keep those.
+            if os.path.exists(src) and not os.path.exists(f'{LIBDIR}/{n}.so.{drv}'):
                 shutil.copy(src, LIBDIR)
-                if n in ('libGLX_nvidia', 'libEGL_nvidia'):
-                    link = f'{LIBDIR}/{n}.so.0'
+            if os.path.exists(src) and n in ('libGLX_nvidia', 'libEGL_nvidia'):
+                link = f'{LIBDIR}/{n}.so.0'
+                try:
                     if os.path.lexists(link):
                         os.remove(link)
                     os.symlink(f'{n}.so.{drv}', link)
+                except OSError as e:
+                    print(f'keeping {link}: {e}', flush=True)
         sh('ldconfig', quiet=True)
         write_icds()
         return True

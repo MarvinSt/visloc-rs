@@ -8,9 +8,10 @@
 //!    renders one camera), and write it to `out_dir/images`.
 //! 2. Focal length from the EXIF 35 mm equivalent when present, else
 //!    COLMAP's prior of 1.2 x the long side; principal point at the centre.
-//! 3. SIFT (COLMAP's VLFeat detector and descriptor, RootSIFT), GPU matching,
-//!    two-view verification: exhaustive pairs for up to `exhaustive_max`
-//!    images, a sliding window over the sorted names beyond.
+//! 3. SIFT (COLMAP's VLFeat detector and descriptor, RootSIFT; on the GPU
+//!    with `gpu_sift`), GPU matching, two-view verification: exhaustive
+//!    pairs for up to `exhaustive_max` images, a sliding window over the
+//!    sorted names beyond.
 //! 4. The COLMAP incremental-mapper port, then one global bundle adjustment
 //!    that also refines the shared intrinsics (the port keeps them fixed).
 
@@ -75,6 +76,22 @@ pub struct PhotoSfmConfig {
     /// datasets black out: the training images get alpha 0 there (grown by
     /// a few pixels over JPEG ringing), for `TrainConfig::alpha_mask`.
     pub mask_black: Option<u8>,
+    /// Solve the large bundle adjustments' reduced camera systems on the
+    /// GPU (`visloc_ba_gpu::GpuReducedSolver`; docs/gpu_bundle_adjustment.md):
+    /// the result then differs from the CPU solve at the f32 level.
+    pub gpu_ba: bool,
+    /// Extract the VLFeat-compatible SIFT on the GPU
+    /// (`visloc_sift_gpu::VlfeatSiftGpu`), an f32 port of the CPU extractor:
+    /// 99.97% of its keypoints, descriptor bytes 0.0007 apart on average.
+    /// Applies with `gpu` in a `gpu` build; otherwise SIFT runs on the CPU.
+    /// On by default: on ETH3D the mapper scores the same with it, and
+    /// extraction is 8 to 9 times faster than on the CPU.
+    pub gpu_sift: bool,
+    /// Once the mapper has built every model, extend the largest one with
+    /// the images it left out, from 2D-2D correspondences where they see
+    /// too few 3D points (the mapper's `complete_largest_model`). It can
+    /// only add images to that model, then refines it. On by default.
+    pub complete_model: bool,
 }
 
 impl Default for PhotoSfmConfig {
@@ -98,6 +115,9 @@ impl Default for PhotoSfmConfig {
             sift_overrides: Vec::new(),
             match_u8: true,
             mask_black: None,
+            gpu_ba: false,
+            gpu_sift: true,
+            complete_model: true,
         }
     }
 }
@@ -488,6 +508,16 @@ pub fn build_photo_dataset(
             desc
         },
     };
+    #[cfg(not(feature = "gpu"))]
+    if cfg.gpu_ba {
+        return Err(EurocError::Sfm("gpu_ba needs the `gpu` feature".into()));
+    }
+    #[cfg(feature = "gpu")]
+    if cfg.gpu_ba {
+        let adapter = visloc_ba_gpu::register_reduced_pcg()
+            .map_err(|e| EurocError::Sfm(format!("gpu: {e}")))?;
+        log(&format!("gpu ba: reduced camera systems on {adapter}"));
+    }
     let t0 = std::time::Instant::now();
     #[cfg(feature = "gpu")]
     let mut gpu_sift = if cfg.gpu {
@@ -504,7 +534,64 @@ pub fn build_photo_dataset(
     let on_gpu = gpu_sift.is_some() && visloc_sift_gpu::SiftGpu::supports(&sift_cfg);
     #[cfg(not(feature = "gpu"))]
     let on_gpu = false;
-    let features: Vec<FeatureSet> = if on_gpu {
+    // The VLFeat-compatible extractor on the GPU (with `gpu`): it borrows the
+    // matcher's context and hands it back.
+    #[cfg(feature = "gpu")]
+    let vlfeat_gpu = cfg.gpu_sift && cfg.gpu && visloc_sift_gpu::VlfeatSiftGpu::supports(&sift_cfg);
+    #[cfg(feature = "gpu")]
+    if cfg.gpu_sift && cfg.gpu && !vlfeat_gpu {
+        log("gpu sift: these SIFT settings are not VLFeat-compatible; extracting on the CPU");
+    }
+    #[cfg(not(feature = "gpu"))]
+    let vlfeat_gpu = false;
+    let features: Vec<FeatureSet> = if vlfeat_gpu {
+        #[allow(unused_mut)]
+        let mut features = Vec::with_capacity(n);
+        #[cfg(feature = "gpu")]
+        {
+            let ctx = match gpu_sift.take() {
+                Some(g) => g.into_context(),
+                None => visloc_sift_gpu::GpuContext::new()
+                    .map_err(|e| EurocError::Sift(format!("gpu: {e}")))?,
+            };
+            let mut vl = visloc_sift_gpu::VlfeatSiftGpu::new(ctx);
+            log(&format!(
+                "gpu sift: VLFeat-compatible extractor on {}",
+                vl.context().adapter_info.name
+            ));
+            for chunk in decoded.chunks(256) {
+                let grays: Vec<Vec<f32>> = chunk.par_iter().map(|(img, _)| gray_of(img)).collect();
+                let images = grays
+                    .iter()
+                    .map(|g| GrayImage::new(width as usize, height as usize, g))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| EurocError::Sift(format!("{e}")))?;
+                // Pipelined: the GPU detects the next photo while the host
+                // handles the current one. Photos past the device's binding
+                // limit go to the CPU.
+                match vl.extract_batch(&images, &sift_cfg) {
+                    Err(visloc_sift_gpu::SiftGpuError::Unsupported) => {
+                        for gray in &images {
+                            let (kps, desc) = extract_sift(gray, &sift_cfg)
+                                .map_err(|e| EurocError::Sift(format!("{e}")))?;
+                            features.push(to_features(kps, desc));
+                        }
+                    }
+                    other => {
+                        let results = other.map_err(|e| EurocError::Sift(format!("{e}")))?;
+                        for (kps, desc) in results {
+                            features.push(to_features(kps, desc));
+                        }
+                    }
+                }
+            }
+            if cfg.gpu {
+                gpu_sift = Some(visloc_sift_gpu::SiftGpu::new(vl.into_context()));
+            }
+        }
+        features
+    } else if on_gpu {
+        #[allow(unused_mut)]
         let mut features = Vec::with_capacity(n);
         #[cfg(feature = "gpu")]
         for chunk in decoded.chunks(256) {
@@ -748,7 +835,7 @@ pub fn build_photo_dataset(
     // principal point of the centred prior is ~4 px off, which fixed
     // intrinsics turned into 2-5x larger camera-centre errors.
     let t0 = std::time::Instant::now();
-    let port_overrides: Vec<String> = if cfg.refine_intrinsics {
+    let mut port_overrides: Vec<String> = if cfg.refine_intrinsics {
         vec![
             "ba_refine_focal_length=1".into(),
             "ba_refine_principal_point=1".into(),
@@ -756,6 +843,9 @@ pub fn build_photo_dataset(
     } else {
         Vec::new()
     };
+    if cfg.complete_model {
+        port_overrides.push("complete_largest_model=1".into());
+    }
     let models = run_colmap_port(
         out_dir,
         &camera,

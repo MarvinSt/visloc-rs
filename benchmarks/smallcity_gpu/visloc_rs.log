@@ -1,0 +1,33 @@
+# SmallCity on the GPU machine (RunPod, NVIDIA L4, 21 CPU threads, Ubuntu 24.04), commit 3dd9550.
+# The visloc-rs mapper (colmap_incremental_mapper, --random-seed 0, gsplat_photos' mapper options)
+# on the gsplat_photos matches, without and with --gpu-pcg 1 (= --gpu-ba 1): closing lines, GNU time -v,
+# then camera-centre errors against the release's COLMAP model after a Sim(3) fit, as
+# scripts/score_smallcity_reference.py score computes them.
+## ours
+BA_MEMORY n_free_frames=5815 obs=15085365 points=1234266 edges=3406331 rig_obs_mb=0 problem_obs_mb=1611 point_free_frames_mb=56 point_pair_edge_idx_mb=1927 (pairs=505060806) contributions_mb=112 points_lin_mb=2144 elimination_mb=936 pcg_f32_mb=468
+BA_MEMORY n_free_frames=5815 obs=15084995 points=1234223 edges=3406464 rig_obs_mb=0 problem_obs_mb=1611 point_free_frames_mb=56 point_pair_edge_idx_mb=1927 (pairs=505067381) contributions_mb=112 points_lin_mb=2144 elimination_mb=936 pcg_f32_mb=468
+mapper done; rss=13995 MB peak=19275 MB
+mapper finished in 1168.1s: 1 model(s) kept
+model 0: 5816 registered images, 1233932 points3D -> /content/runs/ours/model/0
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 19:59.43
+	Maximum resident set size (kbytes): 19737112
+## ours_gpu
+BA_MEMORY n_free_frames=5815 obs=15084939 points=1234215 edges=3400758 rig_obs_mb=0 problem_obs_mb=1611 point_free_frames_mb=56 point_pair_edge_idx_mb=0 (pairs=0) contributions_mb=112 points_lin_mb=2144 elimination_mb=934 pcg_f32_mb=467
+BA_MEMORY n_free_frames=5815 obs=15084929 points=1234180 edges=3401204 rig_obs_mb=0 problem_obs_mb=1611 point_free_frames_mb=56 point_pair_edge_idx_mb=0 (pairs=0) contributions_mb=112 points_lin_mb=2144 elimination_mb=934 pcg_f32_mb=467
+mapper done; rss=12627 MB peak=17266 MB
+mapper finished in 1193.4s: 1 model(s) kept
+model 0: 5816 registered images, 1234031 points3D -> /content/runs/ours_gpu/model/0
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 20:25.84
+	Maximum resident set size (kbytes): 17680292
+## score ours
+poses_ours.txt: 5816 registered; vs reference: median 0.281 m, p90 0.731, max 1.23
+   pass1: 1499 imgs, global-fit median 0.444; own-fit median 0.088 p90 0.156; scale 4.026
+   pass2: 1500 imgs, global-fit median 0.235; own-fit median 0.043 p90 0.066; scale 4.056
+   pass3: 1500 imgs, global-fit median 0.154; own-fit median 0.013 p90 0.027; scale 4.006
+   pass4: 1317 imgs, global-fit median 0.470; own-fit median 0.063 p90 0.100; scale 3.988
+## score ours_gpu
+poses_ours_gpu.txt: 5816 registered; vs reference: median 0.577 m, p90 1.946, max 2.69
+   pass1: 1499 imgs, global-fit median 0.758; own-fit median 0.126 p90 0.229; scale 3.936
+   pass2: 1500 imgs, global-fit median 0.368; own-fit median 0.066 p90 0.121; scale 4.026
+   pass3: 1500 imgs, global-fit median 0.561; own-fit median 0.095 p90 0.197; scale 4.099
+   pass4: 1317 imgs, global-fit median 1.491; own-fit median 0.048 p90 0.073; scale 4.175

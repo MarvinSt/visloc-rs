@@ -222,6 +222,33 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+/// `plane_scene` with a textureless rectangle in the reference image (view
+/// 0), and the pixels whose whole matching window lies inside it (tests).
+#[cfg(test)]
+pub(crate) fn textureless_scene() -> (crate::workspace::Workspace, Vec<usize>) {
+    let mut ws = crate::patch_match::plane_scene();
+    let (w, x0, x1, y0, y1) = (ws.views[0].width, 18, 46, 12, 36);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            ws.views[0].gray[y * w + x] = 128.0;
+        }
+    }
+    let inner = (y0 + 6..y1 - 6)
+        .flat_map(|y| (x0 + 6..x1 - 6).map(move |x| y * w + x))
+        .collect();
+    (ws, inner)
+}
+
+/// The mean relative depth error of `map` over `pixels` (tests).
+#[cfg(test)]
+pub(crate) fn mean_relative_error(map: &DepthMap, truth: &DepthMap, pixels: &[usize]) -> f32 {
+    pixels
+        .iter()
+        .map(|&i| (map.depth[i] - truth.depth[i]).abs() / truth.depth[i])
+        .sum::<f32>()
+        / pixels.len() as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,36 +297,16 @@ mod tests {
     #[test]
     fn the_prior_fills_a_textureless_region() {
         use crate::patch_match::{estimate, estimate_with_prior, PatchMatchOptions};
-        let mut ws = plane_scene();
-        let (w, x0, x1, y0, y1) = (64usize, 18usize, 46usize, 12usize, 36usize);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                ws.views[0].gray[y * w + x] = 128.0;
-            }
-        }
-        let options = PatchMatchOptions {
-            iterations: 3,
-            ..PatchMatchOptions::default()
-        };
+        let (ws, inner) = textureless_scene();
+        let options = PatchMatchOptions::default();
         let photometric = estimate(&ws, 0, &options, None);
         let prior_options = PlanarPriorOptions::default();
         let prior = planar_prior(&ws.views[0], &photometric, &prior_options);
         let with_prior =
             estimate_with_prior(&ws, 0, &options, &prior_options, &photometric, &prior);
         let truth = plane_scene_truth(&ws, 0);
-        // Pixels whose whole window is textureless.
-        let error = |map: &DepthMap| -> f32 {
-            let (mut sum, mut count) = (0.0f32, 0usize);
-            for y in y0 + 6..y1 - 6 {
-                for x in x0 + 6..x1 - 6 {
-                    let i = y * w + x;
-                    sum += (map.depth[i] - truth.depth[i]).abs() / truth.depth[i];
-                    count += 1;
-                }
-            }
-            sum / count as f32
-        };
-        let (before, after) = (error(&photometric), error(&with_prior));
+        let before = mean_relative_error(&photometric, &truth, &inner);
+        let after = mean_relative_error(&with_prior, &truth, &inner);
         assert!(after < 0.01, "with the prior: {after}");
         assert!(
             before > 5.0 * after,

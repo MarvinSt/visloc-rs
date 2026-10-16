@@ -131,7 +131,14 @@ fn main() {
                      prior_options: &PlanarPriorOptions,
                      start: &DepthMap,
                      prior: &PlanarPrior| {
-        let mut map = estimate_with_prior(ws, view, options, prior_options, start, prior);
+        let estimate_prior = || {
+            #[cfg(feature = "gpu")]
+            if let Some(gpu) = &gpu {
+                return gpu.estimate_with_prior(ws, view, options, prior_options, start, prior);
+            }
+            estimate_with_prior(ws, view, options, prior_options, start, prior)
+        };
+        let mut map = estimate_prior();
         if !save_maps {
             map.cost = Vec::new();
         }

@@ -11,7 +11,9 @@
 # images. Appends to WORK_DIR/{colmap,visloc}_matches.jsonl. Needs release
 # builds of gsplat_photos and colmap_incremental_mapper, and pycolmap >= 4.2,
 # numpy, Pillow and py7zr. With VISLOC_BENCH_DEVICE=cuda (benchmark_eth3d_auc.py's
-# GPU settings) the front end also matches on the GPU.
+# GPU settings) the front end also extracts and matches on the GPU.
+# VISLOC_BENCH_PHOTOS_ARGS adds gsplat_photos flags, e.g. "--cpu-sift
+# --no-complete-model" for the setup of the stored runs that predate them.
 set -euo pipefail
 W=$1
 shift
@@ -43,7 +45,7 @@ for s in "${scenes[@]}"; do
     f=$(python3 -c "print($focal * 1600 / max($width, $height))")
     "$PHOTOS" --images "$S/images/dslr_images_undistorted" --out "$R" --max-size 1600 \
       --steps 0 --no-mesh $front_cpu --focal "$f" --no-refine-intrinsics --max-keypoints 8192 \
-      >"$D/photos.log" 2>&1
+      ${VISLOC_BENCH_PHOTOS_ARGS:-} >"$D/photos.log" 2>&1
   fi
   python3 -I "$BENCH" colmap-matches "$S" "$R" "$D/colmap_matches" "$MAPPER" \
     2>"$D/colmap_matches.log" >>"$W/colmap_matches.jsonl"

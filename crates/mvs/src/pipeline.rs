@@ -65,17 +65,7 @@ pub fn geometric_pass(
 ) -> Vec<DepthMap> {
     let n = ws.views.len();
     assert_eq!(earlier.len(), n, "one earlier depth map per view");
-    // Per view, the views whose earlier depths it is the last to read.
-    let mut last_reader: Vec<usize> = (0..n).collect();
-    for (v, view) in ws.views.iter().enumerate() {
-        for &s in &view.sources {
-            last_reader[s] = last_reader[s].max(v);
-        }
-    }
-    let mut last_read_by: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (s, &v) in last_reader.iter().enumerate() {
-        last_read_by[v].push(s);
-    }
+    let last_read_by = ws.last_read_by();
     for map in &mut earlier {
         map.cost = Vec::new();
     }
@@ -195,6 +185,7 @@ pub fn downscale(ws: &Workspace) -> Workspace {
         .par_iter()
         .map(|view| {
             let (w, h) = ((view.width / 2).max(1), (view.height / 2).max(1));
+            let fine_gray = view.gray_levels();
             let mut gray = vec![0.0f32; w * h];
             let mut rgb = vec![[0u8; 3]; w * h];
             for y in 0..h {
@@ -205,7 +196,7 @@ pub fn downscale(ws: &Workspace) -> Workspace {
                         let sx = (2 * x + dx).min(view.width - 1);
                         let sy = (2 * y + dy).min(view.height - 1);
                         let i = sy * view.width + sx;
-                        g += view.gray[i];
+                        g += fine_gray[i];
                         for (acc, v) in c.iter_mut().zip(view.rgb[i]) {
                             *acc += u32::from(v);
                         }
@@ -253,6 +244,7 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
             1.0,
         ]
     };
+    let fine_gray = fine.gray_levels();
     // Costs carry over where `map` has them.
     let with_costs = !map.cost.is_empty();
     // Per row: depths, normals, costs.
@@ -269,7 +261,7 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
             };
             for x in 0..fw {
                 let fine_ray = ray(fine, x as f32 + 0.5, y as f32 + 0.5);
-                let gray = fine.gray[y * fw + x];
+                let gray = fine_gray[y * fw + x];
                 // The fine pixel's centre in coarse pixel coordinates.
                 let (cxf, cyf) = ((x as f32 + 0.5) * sx - 0.5, (y as f32 + 0.5) * sy - 0.5);
                 let (ci, cj) = (cxf.round() as i32, cyf.round() as i32);
@@ -302,7 +294,7 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
                         // The fine image's grey level at the coarse pixel.
                         let fx = (((qi as f32 + 0.5) / sx) as usize).min(fw - 1);
                         let fy = (((qj as f32 + 0.5) / sy) as usize).min(fh - 1);
-                        let dg = fine.gray[fy * fw + fx] - gray;
+                        let dg = fine_gray[fy * fw + fx] - gray;
                         let (dx, dy) = (qi as f32 - cxf, qj as f32 - cyf);
                         let w = (-(dx * dx + dy * dy) / (2.0 * SIGMA_SPATIAL * SIGMA_SPATIAL)
                             - dg * dg / (2.0 * SIGMA_COLOR * SIGMA_COLOR))

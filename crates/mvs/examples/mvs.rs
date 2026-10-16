@@ -78,7 +78,7 @@ fn main() {
 
     let started = Instant::now();
     let model = read_text_model(&sparse).expect("reading the sparse model");
-    let mut ws = Workspace::load(&model, &images, &ws_options).expect("loading the workspace");
+    let ws = Workspace::load(&model, &images, &ws_options).expect("loading the workspace");
     eprintln!(
         "workspace: {} views at {}x{} in {:.1} s",
         ws.views.len(),
@@ -125,7 +125,7 @@ fn main() {
             photometric_score(ws, view, options, map)
         };
     let map_path = |v: usize| out.join(format!("map_{v:04}.bin"));
-    let mut maps = if load_maps {
+    let maps = if load_maps {
         (0..ws.views.len())
             .map(|v| visloc_mvs::DepthMap::read(&map_path(v)).expect("reading a saved depth map"))
             .collect()
@@ -187,15 +187,8 @@ fn main() {
         }
     }
 
-    // Fusion reads depths, normals and colours only.
-    for map in &mut maps {
-        map.cost = Vec::new();
-    }
-    for view in &mut ws.views {
-        view.gray = Vec::new();
-    }
     let t = Instant::now();
-    let points = fuse(&ws, &maps, &fusion_options);
+    let points = fuse(&ws, maps, &fusion_options);
     eprintln!(
         "fusion: {} points in {:.1} s",
         points.len(),

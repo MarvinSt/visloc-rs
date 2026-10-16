@@ -30,6 +30,8 @@
 //! error (truncated at `delta` pixels) to its cost: ACMM's geometric
 //! consistency. It starts from the view's earlier depth map.
 
+use std::borrow::Cow;
+
 use rayon::prelude::*;
 
 use crate::workspace::{View, Workspace};
@@ -341,6 +343,7 @@ impl State {
 /// A source view as the reference view sees it.
 struct Source<'a> {
     view: &'a View,
+    gray: Cow<'a, [f32]>,
     fx: f32,
     fy: f32,
     cx: f32,
@@ -357,6 +360,7 @@ impl<'a> Source<'a> {
         let t = view.translation - r * reference.translation;
         Self {
             view,
+            gray: view.gray_levels(),
             fx: view.fx as f32,
             fy: view.fy as f32,
             cx: view.cx as f32,
@@ -389,6 +393,7 @@ struct RefPatch {
 /// Everything one reference view's passes share.
 struct Context<'a> {
     reference: &'a View,
+    gray: Cow<'a, [f32]>,
     sources: Vec<Source<'a>>,
     options: &'a PatchMatchOptions,
     view_id: u32,
@@ -433,6 +438,7 @@ impl<'a> Context<'a> {
         );
         Self {
             reference,
+            gray: reference.gray_levels(),
             sources,
             options,
             view_id,
@@ -457,7 +463,7 @@ impl<'a> Context<'a> {
 
     fn ref_patch(&self, x: usize, y: usize) -> RefPatch {
         let (w, h) = (self.reference.width as i32, self.reference.height as i32);
-        let gray = &self.reference.gray;
+        let gray = &self.gray;
         let center = gray[y * self.reference.width + x];
         let mut patch = RefPatch {
             n: self.window.len(),
@@ -543,7 +549,7 @@ impl<'a> Context<'a> {
             }
             let u = source.fx * p[0] / p[2] + source.cx;
             let v = source.fy * p[1] / p[2] + source.cy;
-            let value = bilinear(&view.gray, view.width, view.height, u, v) - patch.center;
+            let value = bilinear(&source.gray, view.width, view.height, u, v) - patch.center;
             let weight = patch.weights[k];
             s_w += weight * value;
             s_ww += weight * value * value;

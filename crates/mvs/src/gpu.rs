@@ -227,7 +227,7 @@ impl GpuPatchMatch {
                 dims: [source.width as u32, source.height as u32, 0, prior_offset],
             });
             let mut layer = vec![0u16; texture_width * texture_height];
-            for (y, row) in source.gray.chunks_exact(source.width).enumerate() {
+            for (y, row) in source.gray_levels().chunks_exact(source.width).enumerate() {
                 for (texel, &g) in layer[y * texture_width..].iter_mut().zip(row) {
                     *texel = f16_bits(g);
                 }
@@ -334,7 +334,7 @@ impl GpuPatchMatch {
         });
         queue.write_buffer(&uniforms, 0, &uniform_bytes);
         let sources_buf = storage("mvs-sources", bytemuck::cast_slice(&sources));
-        let images_buf = storage("mvs-images", bytemuck::cast_slice(&reference.gray));
+        let images_buf = storage("mvs-images", bytemuck::cast_slice(&reference.gray_levels()));
         let priors_buf = zeroed("mvs-priors", prior_len * 4);
         if let Some(maps) = prior {
             for (&s, source) in source_ids.iter().zip(&sources) {

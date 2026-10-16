@@ -1,6 +1,7 @@
 //! The views multi-view stereo works on: each image at the working
 //! resolution with its pinhole camera, pose, depth range and source views.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -67,7 +68,9 @@ pub struct View {
     /// World-to-camera rotation and translation.
     pub rotation: Matrix3<f64>,
     pub translation: Vector3<f64>,
-    /// Grey levels in `[0, 255]`, row-major.
+    /// Grey levels in `[0, 255]`, row-major; empty when they are the
+    /// colours' luma, which [`View::gray_levels`] then computes on demand
+    /// ([`Workspace::load`] keeps none, to save memory).
     pub gray: Vec<f32>,
     /// Colours, row-major.
     pub rgb: Vec<[u8; 3]>,
@@ -78,6 +81,16 @@ pub struct View {
 }
 
 impl View {
+    /// The grey levels: [`View::gray`], or the colours' luma
+    /// `0.299 r + 0.587 g + 0.114 b` when it is empty.
+    pub fn gray_levels(&self) -> Cow<'_, [f32]> {
+        if self.gray.is_empty() {
+            Cow::Owned(self.rgb.par_iter().map(|&c| luma(c)).collect())
+        } else {
+            Cow::Borrowed(&self.gray)
+        }
+    }
+
     /// The camera centre in world coordinates.
     pub fn center(&self) -> Vector3<f64> {
         -(self.rotation.transpose() * self.translation)
@@ -164,12 +177,6 @@ impl Workspace {
                 // is smaller than the model's camera).
                 let sx = f64::from(rgb.width()) / f64::from(camera.width);
                 let sy = f64::from(rgb.height()) / f64::from(camera.height);
-                let gray = rgb
-                    .pixels()
-                    .map(|p| {
-                        0.299 * f32::from(p[0]) + 0.587 * f32::from(p[1]) + 0.114 * f32::from(p[2])
-                    })
-                    .collect();
                 let rotation = image.rotation();
                 let translation = image.translation();
                 let depth_range = depth_range(model, image, &rotation, &translation, options)
@@ -202,7 +209,7 @@ impl Workspace {
                     cy: cy * sy,
                     rotation,
                     translation,
-                    gray,
+                    gray: Vec::new(),
                     rgb: rgb.pixels().map(|p| p.0).collect(),
                     depth_range,
                     sources: candidates.into_iter().map(|(view, _)| view).collect(),
@@ -211,6 +218,30 @@ impl Workspace {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { views })
     }
+}
+
+impl Workspace {
+    /// Per view `v`, the views that `v` is the last to read when the views
+    /// are visited in order, each reading its own data and its sources'.
+    pub(crate) fn last_read_by(&self) -> Vec<Vec<usize>> {
+        let n = self.views.len();
+        let mut last_reader: Vec<usize> = (0..n).collect();
+        for (v, view) in self.views.iter().enumerate() {
+            for &s in &view.sources {
+                last_reader[s] = last_reader[s].max(v);
+            }
+        }
+        let mut last_read_by = vec![Vec::new(); n];
+        for (s, &v) in last_reader.iter().enumerate() {
+            last_read_by[v].push(s);
+        }
+        last_read_by
+    }
+}
+
+/// The grey level of a colour.
+fn luma([r, g, b]: [u8; 3]) -> f32 {
+    0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)
 }
 
 /// Per 3D point, the model's image indices observing it.

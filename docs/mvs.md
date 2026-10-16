@@ -85,6 +85,14 @@ scale and from 364 to 229 MiB with three. At that size glibc keeps some
 freed memory: 175 MiB with one scale under
 `MALLOC_MMAP_THRESHOLD_=131072`.
 
+On ETH3D facade (76 images at 3200 px, an NVIDIA L4) peak memory falls
+from 24.2 to 12.0 GiB with one scale (in 10:16 instead of 11:40) and from
+28.7 to 12.4 GiB with three. The F1 scores at 2 cm, 64.96% and 62.03%,
+are within 0.03 points of the earlier runs' (64.96% and 62.06%). The
+shaders did not change, but that pod had another NVIDIA driver (580.178
+instead of 595.91), and the clouds differ slightly: 77.75 million fused
+points instead of 77.66 million with one scale.
+
 ## ETH3D high-resolution benchmark
 
 Scores come from the official ETH3D multi-view evaluator
@@ -135,7 +143,8 @@ and writing the cloud.
 - **Time:** 65 minutes for all 13 scenes, from 1:42 (14 images) to 11:40
   (76 images). On facade the photometric pass takes 3:11, the geometric
   passes 3:08 and 2:48, and the fusion on the CPU 2:13. Peak memory
-  24.2 GiB (facade).
+  24.2 GiB (facade), 12.0 GiB since the maps are released as they go
+  (Memory, above).
 - **Against the first full-resolution run** (commit `cf329e2`, before the
   NaN fix, the skipped unweighted views and the texture sampling; fused
   with two views at 30°): the two-view F1 agrees within 0.1 point on each
@@ -174,7 +183,7 @@ single-scale F1 from the table above is repeated for comparison.
 - **Fusion:** the variants rank as with one scale: 77.3% with 30°, 76.4%
   without the normal check, 76.0% with two views at 30°.
 - **Time:** 76 minutes, 1.2 times the single-scale run. Peak memory
-  28.7 GiB (facade).
+  28.7 GiB (facade), 12.4 GiB since the maps are released as they go.
 
 ### Fusion settings
 

@@ -240,7 +240,7 @@ impl Workspace {
 }
 
 /// The grey level of a colour.
-fn luma([r, g, b]: [u8; 3]) -> f32 {
+pub(crate) fn luma([r, g, b]: [u8; 3]) -> f32 {
     0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)
 }
 

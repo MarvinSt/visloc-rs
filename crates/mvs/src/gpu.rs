@@ -10,7 +10,7 @@ use visloc_gsplat_render::{GpuContext, GpuError};
 use crate::patch_match::{
     finish_depth_map, DepthMap, PatchMatchOptions, ViewSelection, MAX_COST, MAX_SOURCES,
 };
-use crate::workspace::Workspace;
+use crate::workspace::{luma, Workspace};
 
 /// Uniform parameters of one dispatch (`Params` in the shader).
 #[repr(C)]
@@ -226,13 +226,23 @@ impl GpuPatchMatch {
                 ],
                 dims: [source.width as u32, source.height as u32, 0, prior_offset],
             });
-            let mut layer = vec![0u16; texture_width * texture_height];
-            for (y, row) in source.gray_levels().chunks_exact(source.width).enumerate() {
-                for (texel, &g) in layer[y * texture_width..].iter_mut().zip(row) {
-                    *texel = f16_bits(g);
+            let start = layers.len();
+            layers.resize(start + texture_width * texture_height, 0);
+            let layer = &mut layers[start..];
+            for y in 0..source.height {
+                let texels = &mut layer[y * texture_width..y * texture_width + source.width];
+                let pixels = y * source.width..(y + 1) * source.width;
+                if source.gray.is_empty() {
+                    // The colours' luma, as View::gray_levels computes it.
+                    for (texel, &c) in texels.iter_mut().zip(&source.rgb[pixels]) {
+                        *texel = f16_bits(luma(c));
+                    }
+                } else {
+                    for (texel, &g) in texels.iter_mut().zip(&source.gray[pixels]) {
+                        *texel = f16_bits(g);
+                    }
                 }
             }
-            layers.extend_from_slice(&layer);
         }
         if source_ids.is_empty() {
             layers.resize(texture_width * texture_height, 0);

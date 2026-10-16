@@ -19,8 +19,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use visloc_mvs::{
-    estimate, fuse, multi_scale_depth_maps, read_text_model, write_ply, FusionOptions,
-    MultiScaleOptions, PatchMatchOptions, ViewSelection, Workspace, WorkspaceOptions,
+    estimate, fuse, multi_scale_depth_maps, photometric_score, read_text_model, write_ply,
+    FusionOptions, MultiScaleOptions, PatchMatchOptions, ViewSelection, Workspace,
+    WorkspaceOptions,
 };
 
 fn main() {
@@ -102,6 +103,14 @@ fn main() {
         }
         estimate(ws, view, options, prior)
     };
+    let score =
+        |ws: &Workspace, view: usize, options: &PatchMatchOptions, map: &visloc_mvs::DepthMap| {
+            #[cfg(feature = "gpu")]
+            if let Some(gpu) = &gpu {
+                return gpu.photometric_score(ws, view, options, map);
+            }
+            photometric_score(ws, view, options, map)
+        };
     let map_path = |v: usize| out.join(format!("map_{v:04}.bin"));
     let maps = if load_maps {
         (0..ws.views.len())
@@ -114,7 +123,7 @@ fn main() {
             geom_passes,
             ..MultiScaleOptions::default()
         };
-        multi_scale_depth_maps(&ws, &options, &run, &mut |line| eprintln!("{line}"))
+        multi_scale_depth_maps(&ws, &options, &run, &score, &mut |line| eprintln!("{line}"))
     } else {
         let t = Instant::now();
         let mut maps: Vec<_> = (0..ws.views.len())

@@ -35,7 +35,7 @@ use rayon::prelude::*;
 use crate::workspace::{View, Workspace};
 
 /// The cost of a view where a plane cannot be matched.
-const MAX_COST: f32 = 2.0;
+pub(crate) const MAX_COST: f32 = 2.0;
 /// Draws of the view weights under [`ViewSelection::Sampled`] (ACMM's).
 const VIEW_SAMPLES: usize = 15;
 /// Marks the random streams of those draws, apart from refinement's.

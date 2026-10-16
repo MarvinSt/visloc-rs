@@ -11,7 +11,7 @@
 
 use rayon::prelude::*;
 
-use crate::patch_match::{photometric_score, DepthMap, PatchMatchOptions};
+use crate::patch_match::{DepthMap, PatchMatchOptions};
 use crate::workspace::{View, Workspace};
 
 /// Multi-scale estimation parameters (ACMM's `k`, `eta`, `xi` and two
@@ -43,12 +43,18 @@ impl Default for MultiScaleOptions {
 pub type Estimator<'a> =
     dyn Fn(&Workspace, usize, &PatchMatchOptions, Option<&[DepthMap]>) -> DepthMap + 'a;
 
+/// How well a depth map of one view fits the images:
+/// [`crate::patch_match::photometric_score`] or the GPU's equivalent.
+pub type Scorer<'a> = dyn Fn(&Workspace, usize, &PatchMatchOptions, &DepthMap) -> Vec<f32> + 'a;
+
 /// Depth maps of every view of `ws` (at its resolution), estimated coarse
-/// to fine by `estimate`. `log` receives a line per stage.
+/// to fine by `estimate`, with `score` judging the details to restore.
+/// `log` receives a line per stage.
 pub fn multi_scale_depth_maps(
     ws: &Workspace,
     options: &MultiScaleOptions,
     estimate: &Estimator<'_>,
+    score: &Scorer<'_>,
     log: &mut dyn FnMut(&str),
 ) -> Vec<DepthMap> {
     let scales = options.scales.max(1);
@@ -95,12 +101,13 @@ pub fn multi_scale_depth_maps(
             .map(|v| {
                 let upsampled = upsample(&maps[v], &coarse.views[v], &fine.views[v]);
                 let photometric = estimate(fine, v, pm, None);
+                let upsampled_scores = score(fine, v, pm, &upsampled);
+                let photometric_scores = score(fine, v, pm, &photometric);
                 let (map, count) = restore_details(
-                    fine,
-                    v,
-                    pm,
                     &upsampled,
+                    &upsampled_scores,
                     &photometric,
+                    &photometric_scores,
                     options.detail_threshold,
                 );
                 replaced += count;
@@ -276,15 +283,12 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
 /// exceeds the photometric estimate's by more than `threshold`. Returns the
 /// map and how many pixels it replaced.
 fn restore_details(
-    ws: &Workspace,
-    view: usize,
-    options: &PatchMatchOptions,
     upsampled: &DepthMap,
+    init_scores: &[f32],
     photometric: &DepthMap,
+    photo_scores: &[f32],
     threshold: f32,
 ) -> (DepthMap, usize) {
-    let init_scores = photometric_score(ws, view, options, upsampled);
-    let photo_scores = photometric_score(ws, view, options, photometric);
     let mut out = upsampled.clone();
     let mut replaced = 0usize;
     for i in 0..out.depth.len() {

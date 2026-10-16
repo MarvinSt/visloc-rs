@@ -8,7 +8,7 @@ use bytemuck::{Pod, Zeroable};
 use visloc_gsplat_render::{GpuContext, GpuError};
 
 use crate::patch_match::{
-    finish_depth_map, DepthMap, PatchMatchOptions, ViewSelection, MAX_SOURCES,
+    finish_depth_map, DepthMap, PatchMatchOptions, ViewSelection, MAX_COST, MAX_SOURCES,
 };
 use crate::workspace::Workspace;
 
@@ -118,6 +118,45 @@ impl GpuPatchMatch {
         options: &PatchMatchOptions,
         prior: Option<&[DepthMap]>,
     ) -> DepthMap {
+        let start = prior.map(|maps| &maps[view]);
+        let (planes, costs) = self.run(ws, view, options, prior, start);
+        finish_depth_map(&ws.views[view], &planes, costs, options)
+    }
+
+    /// [`crate::patch_match::photometric_score`] on the GPU: the first
+    /// pass alone, started from `map`.
+    pub fn photometric_score(
+        &self,
+        ws: &Workspace,
+        view: usize,
+        options: &PatchMatchOptions,
+        map: &DepthMap,
+    ) -> Vec<f32> {
+        let first_pass = PatchMatchOptions {
+            iterations: 0,
+            ..options.clone()
+        };
+        let (_, mut costs) = self.run(ws, view, &first_pass, None, Some(map));
+        for (cost, &depth) in costs.iter_mut().zip(&map.depth) {
+            if depth <= 0.0 {
+                *cost = MAX_COST;
+            }
+        }
+        costs
+    }
+
+    /// The per-pixel planes and costs after `options.iterations`
+    /// iterations, starting from `start`'s planes (random ones where it
+    /// has no depth, or everywhere without it), with geometric consistency
+    /// against `prior`.
+    fn run(
+        &self,
+        ws: &Workspace,
+        view: usize,
+        options: &PatchMatchOptions,
+        prior: Option<&[DepthMap]>,
+        start: Option<&DepthMap>,
+    ) -> (Vec<[f32; 4]>, Vec<f32>) {
         let device = &self.ctx.device;
         let queue = &self.ctx.queue;
         let reference = &ws.views[view];
@@ -176,10 +215,9 @@ impl GpuPatchMatch {
             images.extend_from_slice(&source.gray);
         }
         // The starting planes as (normal, depth), depth 0 for a random one.
-        let init_planes: Vec<[f32; 4]> = match prior {
-            Some(maps) => {
-                let map = &maps[view];
-                assert_eq!((map.width, map.height), (w, h), "prior depth map size");
+        let init_planes: Vec<[f32; 4]> = match start {
+            Some(map) => {
+                assert_eq!((map.width, map.height), (w, h), "starting depth map size");
                 map.depth
                     .iter()
                     .zip(&map.normal)
@@ -350,7 +388,7 @@ impl GpuPatchMatch {
             bytemuck::cast_slice(&read_bytes(device, queue, &planes_buf, w * h * 16)).to_vec();
         let costs: Vec<f32> =
             bytemuck::cast_slice(&read_bytes(device, queue, &costs_buf, w * h * 4)).to_vec();
-        finish_depth_map(reference, &planes, costs, options)
+        (planes, costs)
     }
 }
 
@@ -390,7 +428,7 @@ fn read_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch_match::{estimate, plane_scene};
+    use crate::patch_match::{estimate, photometric_score, plane_scene, plane_scene_truth};
 
     /// The GPU recovers the synthetic plane like the CPU path, with and
     /// without geometric consistency, under either view selection.
@@ -410,6 +448,30 @@ mod tests {
             };
             check(&gpu, &ws, &options);
         }
+    }
+
+    /// The GPU's photometric score of a map matches the CPU's.
+    #[test]
+    fn gpu_photometric_score_matches_the_cpu() {
+        let Some(ctx) = visloc_gsplat_render::try_context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let gpu = GpuPatchMatch::with_context(ctx);
+        let ws = plane_scene();
+        let options = PatchMatchOptions::default();
+        let mut map = plane_scene_truth(&ws, 0);
+        // A pixel without depth scores the maximum on both.
+        map.depth[0] = 0.0;
+        let cpu = photometric_score(&ws, 0, &options, &map);
+        let on_gpu = gpu.photometric_score(&ws, 0, &options, &map);
+        assert_eq!(on_gpu[0], MAX_COST);
+        let worst = cpu
+            .iter()
+            .zip(&on_gpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-3, "largest difference {worst}");
     }
 
     fn check(gpu: &GpuPatchMatch, ws: &Workspace, options: &PatchMatchOptions) {

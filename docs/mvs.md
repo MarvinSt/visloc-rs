@@ -73,6 +73,39 @@ Scores come from the official ETH3D multi-view evaluator
 scenes, at the benchmark's 2 cm tolerance, with the scenes' ground-truth
 camera poses (`dslr_calibration_undistorted`).
 
+### Full resolution on a GPU
+
+One run on an NVIDIA L4 pod at commit `cf329e2`, before the NaN fix, the
+skipped unweighted views and the texture sampling. Settings: images at
+3200 px, 10 source views, three iterations per pass, two geometric passes,
+and ACMM's fusion (2 px, 1% depth, 30°, two agreeing source views). The
+times cover the whole `mvs` run: loading, depth maps, fusion and writing
+the cloud.
+
+| Scene | Images | F1 | Accuracy | Completeness | Time | F1, multi-scale | Time, multi-scale |
+|---|---|---|---|---|---|---|---|
+| pipes | 14 | 70.6% | 95.8% | 55.9% | 2:45 | 71.9% | 4:28 |
+| meadow | 15 | 57.4% | 92.2% | 41.7% | 5:08 | 62.7% | 7:12 |
+| terrace | 23 | 87.8% | 94.8% | 81.7% | 6:02 | 88.3% | 9:03 |
+| office | 26 | 69.7% | 86.6% | 58.4% | 6:35 | | |
+| kicker | 31 | 72.3% | 87.8% | 61.5% | 9:20 | | |
+| relief | 31 | 86.9% | 93.8% | 80.9% | 9:39 | | |
+| relief 2 | 31 | 85.0% | 91.6% | 79.3% | 8:59 | | |
+| courtyard | 38 | 86.0% | 90.3% | 82.1% | 8:12 | | |
+| playground | 38 | 65.7% | 79.3% | 56.0% | 11:21 | | |
+
+- **Mean over these nine scenes** (single-scale): F1 75.7%, accuracy
+  90.3%, completeness 66.4%. Over all 13 training scenes at 2 cm, ACMM
+  reports F1 78.86% (accuracy 90.67%, completeness 70.42%) and COLMAP
+  67.66% (91.85%, 55.13%) (arXiv 2303.09758, 2210.07582). The scene sets
+  differ, so those means only bracket ours.
+- **Multi-scale** (`--scales 3 --geom-passes 2`) raised F1 on all three
+  scenes it ran on, by 1.3, 5.3 and 0.5 points, mostly through
+  completeness.
+- **Not yet run:** terrains, delivery area, electro and facade.
+- **What falls short is completeness.** Accuracy is at ACMM's level;
+  completeness is lower, most on meadow and playground.
+
 ### Local runs on pipes (CPU)
 
 | Images | Passes | F1 | Accuracy | Completeness |

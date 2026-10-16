@@ -58,11 +58,34 @@ for the value, which assumes the rectified IMU); it is about
 1.45× slower than `euroc_config_big_window.json`.  `aria2c` is used with 16 connections when available
 (the server throttles a single connection), otherwise `urllib` is the fallback.
 
-`--slam-exe` runs the VIO plus the online mapper and submits its full-frame
-`trajectory_online.tum`. That is +5.44 Score on average over the VIO alone
-across one training sequence per track, for roughly 1.15–1.4× the run time
-([`lamaria_online_mapper.md`](lamaria_online_mapper.md)). Passing `--vio-exe` (`basalt_euroc_vio_demo`) instead runs the VIO
-only.
+`--slam-exe` runs the VIO plus the online mapper, which writes both the
+full-frame mapper trajectory `trajectory_online.tum` and the VIO's own
+`trajectory_vio.tum`. Which one is submitted depends on the track. With the
+per-device refinement, one training sequence per track scores:
+
+| Track | VIO | VIO + mapper | Submitted by default |
+|---|---:|---:|---|
+| Short (sequence_1_19) | **71.96** | 68.54 | VIO |
+| Medium (sequence_2_11) | 49.68 | **55.51** | mapper |
+| Long (sequence_3_17) | **50.06** | 46.68 | VIO |
+| Low light (sequence_4_10, low-light config) | **39.00** | 36.65 | VIO |
+| Moving platform (sequence_5_11) | 43.14 | **49.84** | mapper |
+| **Mean** | 50.77 | 51.44 | **53.27** |
+
+(see [`lamaria_drift_analysis.md`](lamaria_drift_analysis.md#with-the-online-mapper)).
+`--vio-tracks` sets the tracks that submit the VIO (default `1 3 4`; with no
+values the mapper is submitted everywhere). If `--vio-exe`
+(`basalt_euroc_vio_demo`) is passed as well, those tracks run the faster
+VIO-only build. `--vio-exe` alone runs the VIO only on every track. Each
+choice rests on one training sequence per track, so the gain over a uniform
+setup (51.44 with the mapper everywhere) will be smaller on the test set.
+
+Low light sequences (track 4) run
+[`euroc_config_big_window_multicam_lowlight.json`](../configs/basalt/variants/lamaria/euroc_config_big_window_multicam_lowlight.json),
+whose KLT round-trip threshold is 0.5 px instead of 0.2 px. It is worth +4.5
+on sequence_4_10 but −11.0 on the Medium sequence
+([`lamaria_klt_threshold.md`](lamaria_klt_threshold.md)). `--low-light-config
+none` uses `--config` there too.
 
 IMU rectification is on by default
 ([`lamaria_imu_rectification.md`](lamaria_imu_rectification.md); +4.35 Score on

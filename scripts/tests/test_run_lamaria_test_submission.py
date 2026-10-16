@@ -37,6 +37,36 @@ class EstimatorCommandTests(unittest.TestCase):
         self.assertEqual(trajectories, [Path("out/trajectory_online.tum"),
                                         Path("out/trajectory_vio.tum")])
 
+    def test_vio_track_with_the_online_demo_only_submits_its_vio_trajectory(self):
+        command, trajectories = submission.estimator_command(
+            make_args(vio_exe=None, slam_exe=Path("slam_demo")), Path("seq"),
+            Path("calib.json"), Path("out"), submit_vio=True)
+        self.assertEqual(command[0], Path("slam_demo"))
+        self.assertEqual(trajectories, [Path("out/trajectory_vio.tum")])
+
+    def test_vio_track_prefers_the_vio_only_build(self):
+        command, trajectories = submission.estimator_command(
+            make_args(slam_exe=Path("slam_demo")), Path("seq"), Path("calib.json"),
+            Path("out"), submit_vio=True)
+        self.assertEqual(command[0], Path("vio_demo"))
+        self.assertEqual(trajectories, [Path("out/trajectory.tum")])
+
+    def test_per_sequence_config_overrides_the_default(self):
+        command, _ = submission.estimator_command(
+            make_args(), Path("seq"), Path("calib.json"), Path("out"),
+            config=Path("lowlight.json"))
+        self.assertEqual(command[command.index("--config") + 1], Path("lowlight.json"))
+
+
+class TrackTests(unittest.TestCase):
+    def test_sequence_track(self):
+        self.assertEqual(submission.sequence_track("sequence_4_10"), 4)
+        self.assertEqual(submission.sequence_track("sequence_1_19"), 1)
+
+    def test_low_light_config_ships_with_the_repo(self):
+        repo = Path(__file__).resolve().parents[2]
+        self.assertTrue((repo / submission.DEFAULT_LOW_LIGHT_CONFIG).is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

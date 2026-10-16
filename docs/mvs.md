@@ -80,7 +80,8 @@ camera poses (`dslr_calibration_undistorted`).
 One run on an NVIDIA L4 pod at commit `cf329e2`, before the NaN fix, the
 skipped unweighted views and the texture sampling. Settings: images at
 3200 px, 10 source views, three iterations per pass, two geometric passes,
-and ACMM's fusion (2 px, 1% depth, 30°, two agreeing source views). The
+and the fusion default of the time (2 px, 1% depth, 30°, two agreeing
+source views). The
 times cover the whole `mvs` run: loading, depth maps, fusion and writing
 the cloud.
 
@@ -95,16 +96,18 @@ the cloud.
 | relief 2 | 31 | 85.0% | 91.6% | 79.3% | 8:59 | | |
 | courtyard | 38 | 86.0% | 90.3% | 82.1% | 8:12 | | |
 | playground | 38 | 65.7% | 79.3% | 56.0% | 11:21 | | |
+| terrains | 42 | 88.9% | 90.6% | 87.2% | 10:26 | | |
+| delivery area | 44 | 85.9% | 88.4% | 83.6% | 9:29 | | |
 
-- **Mean over these nine scenes** (single-scale): F1 75.7%, accuracy
-  90.3%, completeness 66.4%. Over all 13 training scenes at 2 cm, ACMM
+- **Mean over these 11 scenes** (single-scale): F1 77.8%, accuracy
+  90.1%, completeness 69.8%. Over all 13 training scenes at 2 cm, ACMM
   reports F1 78.86% (accuracy 90.67%, completeness 70.42%) and COLMAP
   67.66% (91.85%, 55.13%) (arXiv 2303.09758, 2210.07582). The scene sets
   differ, so those means only bracket ours.
 - **Multi-scale** (`--scales 3 --geom-passes 2`) raised F1 on all three
   scenes it ran on, by 1.3, 5.3 and 0.5 points, mostly through
   completeness.
-- **Not yet run:** terrains, delivery area, electro and facade.
+- **Not yet scored:** electro and facade.
 - **What falls short is completeness.** Accuracy is at ACMM's level;
   completeness is lower, most on meadow and playground.
 
@@ -127,6 +130,8 @@ only lowered F1. The full-resolution runs above predate this default and
 use two views.
 
 ### Local runs on pipes (CPU)
+
+Before the NaN fix, with two-view fusion:
 
 | Images | Passes | F1 | Accuracy | Completeness |
 |---|---|---|---|---|

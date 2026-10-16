@@ -129,6 +129,22 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **Multi-view stereo: `visloc-mvs`.** Dense point clouds from a COLMAP
+  sparse model with undistorted images: PatchMatch depth and normal maps
+  (ACMH, with ACMM's geometric consistency and multi-scale scheme), fused
+  into `fused.ply`, on the CPU or on the GPU through wgpu
+  (`--features gpu`). Details and scores in `docs/mvs.md`.
+  - **ETH3D high-res training, 3200 px, one NVIDIA L4:** F1 77.8% at
+    2 cm on average over 11 of the 13 scenes (accuracy 90.1%, completeness
+    69.8%), single-scale, with two-view fusion.
+    Over all 13, ACMM reports 78.86% and COLMAP 67.66%.
+  - **Time:** 2:45 (pipes, 14 images) to 11:21 (playground, 38) per scene
+    on the L4, loading and fusion included.
+  - **Fusion:** one agreeing source view keeps a point by default (ACMM
+    asks for two): on pipes at 1600 px, F1 66.9% -> 76.0%.
+  - **Run it:** `cargo run --release -p visloc-mvs --features gpu
+    --example mvs -- --sparse <model> --images <dir> --out <dir> --gpu`.
+
 - **COLMAP-port mapper: complete the largest model
   (`complete_largest_model=1`).** Off by default in the mapper; on in
   `gsplat_photos` (`--no-complete-model` turns it off, see Changed).

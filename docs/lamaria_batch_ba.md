@@ -138,7 +138,22 @@ scale drift linear in time:
 
 The sequences of 1WM093701G1276 keep 2–4 % of scale drift, and their local
 scale (Sim(3) fits in 60 s windows) varies by ±2–4 %, against ±1 % on
-sequence_1_19.
+sequence_1_19. Their IMU factors also fit worse: the whitened position
+residual per factor is 1.6–1.8, against 0.4–0.5 on 1WM09370081264.
+These do not remove it (sequence_2_11, CP Score 61.03):
+
+| Change | CP Score | Note |
+|---|---:|---|
+| Accelerometer y axis ×1.03 / ×0.97 | 60.40 / 56.48 | The IMU cost nearly doubles (20,600 → 39,100 / 36,700): the BA pins each axis' scale to well under 1 % |
+| Accelerometer delayed by −2 / +2 ms | 61.14 / 61.14 | Final cost +1,100 / −90 |
+| Accelerometer bias random walk ×10 | 60.49 | |
+| IMU noise densities ×2 | 58.02 | |
+
+A fit of the accelerometer against the pseudo-GT's second differences had
+suggested a y scale of 0.97 on this device; the BA rules that out. The
+camera exposure does not explain the local scale either: it correlates
+weakly with it on sequence_2_11 (−0.33), and on sequence_4_10 the exposure
+stays at 14 ms while the local scale varies by ±7 %.
 
 ### What the gain on sequence_1_19 comes from
 
@@ -275,6 +290,21 @@ and the drift-free solutions end within 0–1,000 of each other out of
 which costs more than it brings when the start is already that good. The
 mode stays off by default; it is the remedy for a start that drifts by
 degrees, such as a VIO without the per-device refinement.
+
+The scale mode, where the accelerometer does observe the mode, helps four
+of the five tracks a little, but the low-light one, whose vision is weak,
+loses 7 points:
+
+| Sequence | Without | `--modes scale` | Mode at the end |
+|---|---:|---:|---:|
+| sequence_1_19 | 83.02 | **83.52** | −1.3 % |
+| sequence_2_11 | 61.03 | **63.02** | +0.4 % |
+| sequence_3_17 | 50.14 | **50.32** | −0.3 % |
+| sequence_4_10 | **45.79** | 38.75 | −5.5 % |
+| sequence_5_11 | 59.06 | **60.22** | +2.0 % |
+| **Mean** | **59.81** | 59.17 | |
+
+It stays off by default as well.
 
 ## Usage
 

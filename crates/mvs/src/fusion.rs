@@ -11,10 +11,9 @@ use crate::workspace::Workspace;
 ///
 /// By default one agreeing source view within 15° of normal angle keeps a
 /// point; ACMM's code asks for two (and 10°). Over the 13 ETH3D training
-/// scenes at 3200 px (multi-scale), F1 at 2 cm is 78.0% with these
-/// defaults, 77.3% at 30°, 76.4% without the normal check and 76.0% with
-/// two views at 30°. On pipes at 1600 px, one view instead of two raises F1
-/// from 66.9% to 76.0%.
+/// scenes at 3200 px, F1 at 2 cm is 79.4% with these defaults, 79.5% at
+/// 10°, 78.8% at 30° and 77.3% with two views at 30°. On pipes at 1600 px,
+/// one view instead of two raises F1 from 66.9% to 76.0%.
 #[derive(Debug, Clone)]
 pub struct FusionOptions {
     /// Pixels between the pixel and the source depth's point projected back.

@@ -578,6 +578,20 @@ All notable changes to `visloc-rs` will be documented here.
   `N images at WxH` line. COLMAP's extraction times include decoding;
   `gsplat_photos`' SIFT times do not.
 
+- **`gsplat_photos` loads large photos faster, with the same pixels.** Its
+  photos go to the working size through a Triangle resize that performs
+  `image::imageops::resize`'s arithmetic in the same order, so the working
+  images are byte-identical. It sums blocks of source rows in registers and
+  reads the intermediate row by row, where the `image` crate reads one
+  pixel at a time and walks its intermediate down columns.
+  - **Other changes:** the decoded RGB image is moved, not copied, and
+    each file is read once for both the decoder and the EXIF focal.
+  - **One 24-megapixel ETH3D photo to 1,600 px, one thread:** the resize
+    takes 108 ms instead of 261 ms, and decoding plus resizing 325 ms
+    instead of 552 ms.
+  - **ETH3D pipes on 4 threads:** loading takes 1.3 s instead of 2.0 s, and
+    every output file is byte-identical.
+
 - **COLMAP-port BA: cheaper setup of large bundle adjustments.** Results
   are bit-identical: the SmallCity pass-1 model matches byte for byte.
   - **First linearization.** A solve's first linearization zeroed its

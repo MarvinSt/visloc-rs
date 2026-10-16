@@ -7,7 +7,7 @@
 //!     --sparse <dir with cameras.txt/images.txt/points3D.txt> \
 //!     --images <image dir> --out <dir> [--max-image-size 3200] \
 //!     [--sources 10] [--iterations 3] [--geom-passes 1] [--scales 1] [--gpu] \
-//!     [--view-selection confidence|sampled] [--init-top-k 3] \
+//!     [--view-selection confidence|sampled] [--init-top-k 3] [--detail-threshold 0.1] \
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 30]
 //! ```
@@ -33,6 +33,7 @@ fn main() {
     let fusion_options = FusionOptions::default();
     let mut geom_passes = 1usize;
     let mut scales = 1usize;
+    let mut detail_threshold = None;
     let mut use_gpu = false;
     let mut save_depth = false;
     let mut save_maps = false;
@@ -58,6 +59,7 @@ fn main() {
             "--init-top-k" => pm_options.init_top_k = value().parse().unwrap(),
             "--geom-passes" => geom_passes = value().parse().unwrap(),
             "--scales" => scales = value().parse().unwrap(),
+            "--detail-threshold" => detail_threshold = Some(value().parse().unwrap()),
             "--gpu" => use_gpu = true,
             "--save-depth" => save_depth = true,
             "--save-maps" => save_maps = true,
@@ -117,11 +119,12 @@ fn main() {
             .map(|v| visloc_mvs::DepthMap::read(&map_path(v)).expect("reading a saved depth map"))
             .collect()
     } else if scales > 1 {
+        let defaults = MultiScaleOptions::default();
         let options = MultiScaleOptions {
             patch_match: pm_options,
             scales,
             geom_passes,
-            ..MultiScaleOptions::default()
+            detail_threshold: detail_threshold.unwrap_or(defaults.detail_threshold),
         };
         multi_scale_depth_maps(&ws, &options, &run, &score, &mut |line| eprintln!("{line}"))
     } else {

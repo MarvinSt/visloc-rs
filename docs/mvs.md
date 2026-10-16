@@ -55,10 +55,10 @@ from the paper:
   triangulation angle around 5°). The depth range comes from the image's
   sparse points: COLMAP's 1% and 99% quantiles, widened by 25%.
 - **Fusion.** A pixel's 3D point is kept when a source view agrees within
-  2 pixels of reprojection error, 1% of relative depth and 30° of normal
+  2 pixels of reprojection error, 1% of relative depth and 15° of normal
   angle; the agreeing pixels are averaged into one point and not used
   again. ACMM's code asks for two agreeing views (and 10°): with these
-  depth maps one view scores much higher (below), `--min-consistent 2`
+  depth maps one view scores higher (below), and `--min-consistent 2`
   restores two.
 
 The GPU path runs the same per-pixel update as compute shaders, with the

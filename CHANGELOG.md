@@ -592,6 +592,39 @@ All notable changes to `visloc-rs` will be documented here.
     byte-identical.
   - `colmap_incremental_mapper` now logs both times.
 
+- **COLMAP-port mapper: about half the memory, byte-identical.** SmallCity
+  pass 1 (1,499 photos, 4 threads) writes the same model files as before:
+
+  | | before | now |
+  |---|---|---|
+  | Peak memory | 4.90 GB | **2.60 GB** |
+  | Memory after loading | 2.94 GB | **0.70 GB** |
+  | Loading | 6.5 s | **0.9 s** |
+  | Mapper wall time | 5:03 | **4:25** |
+
+  - **Correspondence graph.** The replay export's graph is built in one
+    pass (`CorrespondenceGraph::finalized_from_pairs`), equal field for
+    field to `add_image`, `add_two_view_geometry` and `finalize`, without
+    the per-keypoint lists the incremental path keeps until `finalize`. The
+    export's matches stay in one `u32` buffer. Correspondences and each
+    image's offsets are 32-bit, as COLMAP stores them: `Correspondence`'s
+    fields are now `u32`, and `add_image` panics on an id or a keypoint
+    count past `u32::MAX`.
+  - **Bundle adjustment:**
+    - The elimination finds each pair's block through a per-row table of
+      partner positions instead of an index over every point's pairs
+      (1.9 GB on SmallCity's last bundle adjustment).
+    - Observations name their camera in a table instead of carrying its
+      intrinsics and sensor pose: 24 bytes each instead of 112 (1.3 GB
+      there).
+    - Systems from 20,000 off-diagonal blocks are eliminated by output, as
+      those from 1,000 frames already were. The sharded loop kept 8 copies
+      of every block: 825 MB at 358k blocks, pass 1's peak. By output, pass
+      1's eliminations from 20k to 400k blocks took 0.59 to 0.90 of the
+      time.
+    - Each row of the reduced system is written into the block array in
+      place, instead of into its own buffer and then concatenated.
+
 - **`gsplat_photos` loads large photos faster, with the same pixels.** Its
   photos go to the working size through a Triangle resize that performs
   `image::imageops::resize`'s arithmetic in the same order, so the working

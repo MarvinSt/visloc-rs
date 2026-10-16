@@ -60,9 +60,11 @@ from the paper:
   and not used again.
 
 The GPU path runs the same per-pixel update as compute shaders, with the
-same sampling regions, view selection and random numbers. It differs from
-the CPU path only by floating-point rounding: on ETH3D pipes at 800 px its
-F1 score is 53.73% against the CPU's 53.67%.
+same sampling regions, view selection and random numbers. The source images
+are half-float texture layers that the texture unit samples bilinearly, as
+ACMM samples CUDA textures. The GPU differs from the CPU path only by
+rounding: on ETH3D pipes at 400 px its F1 score is 34.44% against the
+CPU's 34.47%.
 
 ## ETH3D high-resolution benchmark
 

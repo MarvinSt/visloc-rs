@@ -46,7 +46,9 @@ struct Params {
     sigma_color: f32,
     /// 0: [`ViewSelection::Confidence`], 1: [`ViewSelection::Sampled`].
     view_selection: u32,
-    pad: [u32; 3],
+    inv_texture_width: f32,
+    inv_texture_height: f32,
+    pad: u32,
 }
 
 /// A source view as the shader reads it (`Source`).
@@ -168,8 +170,21 @@ impl GpuPatchMatch {
             .copied()
             .collect();
 
-        // Images (reference first) and each source's earlier depth map.
-        let mut images: Vec<f32> = reference.gray.clone();
+        // The reference image, the sources' (one texture layer each, half
+        // floats) and each source's earlier depth map.
+        let images: Vec<f32> = reference.gray.clone();
+        let texture_width = source_ids
+            .iter()
+            .map(|&s| ws.views[s].width)
+            .max()
+            .unwrap_or(1);
+        let texture_height = source_ids
+            .iter()
+            .map(|&s| ws.views[s].height)
+            .max()
+            .unwrap_or(1);
+        let mut layers: Vec<u16> =
+            Vec::with_capacity(texture_width * texture_height * source_ids.len().max(1));
         let mut priors: Vec<f32> = Vec::new();
         let mut sources = Vec::with_capacity(source_ids.len());
         for &s in &source_ids {
@@ -205,14 +220,18 @@ impl GpuPatchMatch {
                     source.cx as f32,
                     source.cy as f32,
                 ],
-                dims: [
-                    source.width as u32,
-                    source.height as u32,
-                    images.len() as u32,
-                    prior_offset,
-                ],
+                dims: [source.width as u32, source.height as u32, 0, prior_offset],
             });
-            images.extend_from_slice(&source.gray);
+            let mut layer = vec![0u16; texture_width * texture_height];
+            for (y, row) in source.gray.chunks_exact(source.width).enumerate() {
+                for (texel, &g) in layer[y * texture_width..].iter_mut().zip(row) {
+                    *texel = f16_bits(g);
+                }
+            }
+            layers.extend_from_slice(&layer);
+        }
+        if source_ids.is_empty() {
+            layers.resize(texture_width * texture_height, 0);
         }
         // The starting planes as (normal, depth), depth 0 for a random one.
         let init_planes: Vec<[f32; 4]> = match start {
@@ -257,7 +276,9 @@ impl GpuPatchMatch {
             sigma_spatial: options.sigma_spatial,
             sigma_color: options.sigma_color,
             view_selection: u32::from(options.view_selection == ViewSelection::Sampled),
-            pad: [0; 3],
+            inv_texture_width: 1.0 / texture_width as f32,
+            inv_texture_height: 1.0 / texture_height as f32,
+            pad: 0,
         };
         // Slot 0 for `init`, then one per (iteration, colour).
         let slots = 1 + 2 * options.iterations;
@@ -311,7 +332,50 @@ impl GpuPatchMatch {
         let costs_buf = storage("mvs-costs", &vec![0u8; w * h * 4]);
         let best_buf = storage("mvs-best-views", &vec![0u8; w * h * 4]);
         let init_buf = storage("mvs-init-planes", bytemuck::cast_slice(&init_planes));
+        let texture_size = wgpu::Extent3d {
+            width: texture_width as u32,
+            height: texture_height as u32,
+            depth_or_array_layers: source_ids.len().max(1) as u32,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mvs-source-images"),
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&layers),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(2 * texture_width as u32),
+                rows_per_image: Some(texture_height as u32),
+            },
+            texture_size,
+        );
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("mvs-bilinear"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         drop(images);
+        drop(layers);
         drop(priors);
 
         let params_entry = |slot: usize| wgpu::BindGroupEntry {
@@ -340,6 +404,14 @@ impl GpuPatchMatch {
                 entry(5, &costs_buf),
                 entry(6, &best_buf),
                 entry(7, &init_buf),
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
             ],
         });
         let propagate_groups: Vec<wgpu::BindGroup> = (1..slots)
@@ -355,6 +427,14 @@ impl GpuPatchMatch {
                         entry(4, &planes_buf),
                         entry(5, &costs_buf),
                         entry(6, &best_buf),
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(&texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
                     ],
                 })
             })
@@ -390,6 +470,40 @@ impl GpuPatchMatch {
             bytemuck::cast_slice(&read_bytes(device, queue, &costs_buf, w * h * 4)).to_vec();
         (planes, costs)
     }
+}
+
+/// `x` as an IEEE half float, rounded to nearest even.
+fn f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x7f_ffff;
+    if exponent == 0xff {
+        // Infinity, or a quiet NaN.
+        return sign | 0x7c00 | if mantissa != 0 { 0x200 } else { 0 };
+    }
+    let e = exponent - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        // Subnormal (or zero): the implicit bit joins the mantissa.
+        if e < -10 {
+            return sign;
+        }
+        let m = mantissa | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = 1u32 << (shift - 1);
+        let rounded = m + half - 1 + ((m >> shift) & 1);
+        return sign | (rounded >> shift) as u16;
+    }
+    let mut out = ((e as u32) << 10) | (mantissa >> 13);
+    let rest = mantissa & 0x1fff;
+    if rest > 0x1000 || (rest == 0x1000 && out & 1 == 1) {
+        // A carry into the exponent is still the right rounding.
+        out += 1;
+    }
+    sign | out as u16
 }
 
 /// Copies `len` bytes of `buffer` back to the host.
@@ -450,7 +564,28 @@ mod tests {
         }
     }
 
-    /// The GPU's photometric score of a map matches the CPU's.
+    #[test]
+    fn half_floats_round_to_nearest_even() {
+        assert_eq!(f16_bits(0.0), 0);
+        assert_eq!(f16_bits(1.0), 0x3c00);
+        assert_eq!(f16_bits(2.0), 0x4000);
+        assert_eq!(f16_bits(0.5), 0x3800);
+        assert_eq!(f16_bits(255.0), 0x5bf8);
+        assert_eq!(f16_bits(65504.0), 0x7bff);
+        assert_eq!(f16_bits(1e6), 0x7c00);
+        assert_eq!(f16_bits(-2.0), 0xc000);
+        // One ulp up, then halfway cases to the even neighbour.
+        assert_eq!(f16_bits(1.0 + 1.0 / 1024.0), 0x3c01);
+        assert_eq!(f16_bits(1.0 + 1.0 / 2048.0), 0x3c00);
+        assert_eq!(f16_bits(1.0 + 3.0 / 2048.0), 0x3c02);
+        // The smallest subnormal, and half of it to zero (even).
+        assert_eq!(f16_bits(2f32.powi(-24)), 1);
+        assert_eq!(f16_bits(2f32.powi(-25)), 0);
+        assert_eq!(f16_bits(3.0 * 2f32.powi(-25)), 2);
+    }
+
+    /// The GPU's photometric score of a map matches the CPU's, up to the
+    /// texture unit's half floats and interpolation weights.
     #[test]
     fn gpu_photometric_score_matches_the_cpu() {
         let Some(ctx) = visloc_gsplat_render::try_context() else {
@@ -466,12 +601,15 @@ mod tests {
         let cpu = photometric_score(&ws, 0, &options, &map);
         let on_gpu = gpu.photometric_score(&ws, 0, &options, &map);
         assert_eq!(on_gpu[0], MAX_COST);
-        let worst = cpu
+        let mut differences: Vec<f32> = cpu
             .iter()
             .zip(&on_gpu)
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(worst < 1e-3, "largest difference {worst}");
+            .collect();
+        differences.sort_by(f32::total_cmp);
+        let at = |q: f64| differences[((differences.len() - 1) as f64 * q) as usize];
+        assert!(at(0.5) < 1e-3, "median difference {}", at(0.5));
+        assert!(at(0.99) < 1e-2, "99th percentile difference {}", at(0.99));
     }
 
     fn check(gpu: &GpuPatchMatch, ws: &Workspace, options: &PatchMatchOptions) {

@@ -44,9 +44,10 @@ struct Params {
     sigma_color: f32,
     // 0: the paper's confidence weights; 1: ACMM's sampled weights.
     view_selection: u32,
+    // One over the source texture's size, for normalized coordinates.
+    inv_texture_width: f32,
+    inv_texture_height: f32,
     pad0: u32,
-    pad1: u32,
-    pad2: u32,
 }
 
 // Reference camera frame to source camera frame: rows of R with t in w.
@@ -56,13 +57,13 @@ struct Source {
     r2: vec4<f32>,
     // fx, fy, cx, cy
     k: vec4<f32>,
-    // width, height, image offset, prior depth offset
+    // width, height, unused, prior depth offset
     dims: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> sources: array<Source>;
-// The reference image at offset 0, then each source's.
+// The reference image.
 @group(0) @binding(2) var<storage, read> images: array<f32>;
 // Each source's earlier depth map (geometric mode).
 @group(0) @binding(3) var<storage, read> priors: array<f32>;
@@ -73,6 +74,10 @@ struct Source {
 @group(0) @binding(6) var<storage, read_write> best_views: array<u32>;
 // `init`: the earlier map's (normal, depth) per pixel, depth 0 for none.
 @group(0) @binding(7) var<storage, read> init_planes: array<vec4<f32>>;
+// Source j's grey levels in layer j (half floats), sampled bilinearly by
+// the texture unit.
+@group(0) @binding(8) var source_images: texture_2d_array<f32>;
+@group(0) @binding(9) var bilinear: sampler;
 
 // The reference window of the current pixel, row by row.
 var<private> patch_values: array<f32, 64>;
@@ -176,21 +181,14 @@ fn plane_depth(plane: vec4<f32>, ray: vec3<f32>) -> f32 {
     return d;
 }
 
-fn source_gray(s: Source, u: f32, v: f32) -> f32 {
-    let w = s.dims.x;
-    let h = s.dims.y;
-    let x = clamp(u - 0.5, 0.0, f32(w - 1u));
-    let y = clamp(v - 0.5, 0.0, f32(h - 1u));
-    let x0 = u32(x);
-    let y0 = u32(y);
-    let x1 = min(x0 + 1u, w - 1u);
-    let y1 = min(y0 + 1u, h - 1u);
-    let fx = x - f32(x0);
-    let fy = y - f32(y0);
-    let base = s.dims.z;
-    let top = images[base + y0 * w + x0] * (1.0 - fx) + images[base + y0 * w + x1] * fx;
-    let bottom = images[base + y1 * w + x0] * (1.0 - fx) + images[base + y1 * w + x1] * fx;
-    return top * (1.0 - fy) + bottom * fy;
+// Source j's grey level at pixel coordinates (u, v) (pixel centres at
+// +0.5), clamped to its image: the CPU path's bilinear lookup, by the
+// texture unit.
+fn source_gray(j: u32, s: Source, u: f32, v: f32) -> f32 {
+    let x = clamp(u, 0.5, f32(s.dims.x) - 0.5);
+    let y = clamp(v, 0.5, f32(s.dims.y) - 0.5);
+    let uv = vec2<f32>(x * params.inv_texture_width, y * params.inv_texture_height);
+    return textureSampleLevel(source_images, bilinear, uv, j, 0.0).r;
 }
 
 fn photometric_cost(j: u32, ray: vec3<f32>, plane: vec4<f32>) -> f32 {
@@ -232,7 +230,7 @@ fn photometric_cost(j: u32, ray: vec3<f32>, plane: vec4<f32>) -> f32 {
             }
             let u = s.k.x * p.x / p.z + s.k.z;
             let v = s.k.y * p.y / p.z + s.k.w;
-            let value = source_gray(s, u, v) - patch_center;
+            let value = source_gray(j, s, u, v) - patch_center;
             let weight = patch_weights[k];
             s_w += weight * value;
             s_ww += weight * value * value;

@@ -1638,6 +1638,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "visloc-mvs"
+version = "0.2.1"
+dependencies = [
+ "bytemuck",
+ "image",
+ "nalgebra",
+ "rayon",
+ "thiserror",
+ "visloc-gsplat-render",
+ "wgpu",
+]
+
+[[package]]
 name = "visloc-rs"
 version = "0.2.1"
 dependencies = [

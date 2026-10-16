@@ -1,0 +1,42 @@
+[package]
+name = "visloc-mvs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Multi-view stereo for visloc-rs: PatchMatch depth and normal maps fused into a point cloud."
+readme.workspace = true
+documentation = "https://docs.rs/visloc-mvs"
+homepage.workspace = true
+repository.workspace = true
+keywords = ["mvs", "stereo", "patchmatch", "3d-reconstruction", "sfm"]
+categories = ["computer-vision", "science::robotics"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+# PatchMatch on the GPU (wgpu compute shaders). Opt-in for the same
+# toolchain reason as `visloc-gsplat-render/gpu` (wgpu 30 / naga need a
+# current Rust).
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:visloc-gsplat-render", "visloc-gsplat-render/gpu"]
+
+[dependencies]
+bytemuck = { workspace = true, optional = true }
+image = { version = "=0.25.5", default-features = false, features = ["png", "jpeg"] }
+nalgebra = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+visloc-gsplat-render = { path = "../gsplat-render", version = "0.2.1", optional = true }
+wgpu = { workspace = true, optional = true }
+
+[lib]
+doctest = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[[example]]
+name = "mvs"
+path = "examples/mvs.rs"

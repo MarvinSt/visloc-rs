@@ -1,0 +1,52 @@
+# SmallCity: CPU vs GPU SIFT, each with and without complete_largest_model=1.
+# RunPod RTX 3090, 23 CPU threads (two mappers side by side on 11 each),
+# Ubuntu 22.04, main 17e1698. Scores: scripts/score_smallcity_reference.py
+# against the release's COLMAP model, after a Sim(3) fit.
+
+## front end, cpu SIFT
+5822 images at 1024x690 (0 resized from within 1%; others dropped: 0)
+sift: mean 5088 keypoints (331.2 s)
+retrieval: VLAD top-30 added 127721 pairs to 116230 window pairs (11.7 s)
+217844 verified of 243951 candidate pairs (188.4 s; overlapped: match 132.8 s, verify 141.0 s)
+
+## mapper, cpu SIFT, base
+mapper finished in 1050.5s: 1 model(s) kept
+model 0: 5816 registered images, 1233947 points3D 
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 17:45.77
+	Maximum resident set size (kbytes): 19795112
+
+## mapper, cpu SIFT, complete
+mapper finished in 1063.8s: 1 model(s) kept
+model 0: 5816 registered images, 1233947 points3D 
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 17:57.86
+	Maximum resident set size (kbytes): 19795464
+COMPLETE model=0 registered_frames=0
+
+## front end, gpu SIFT
+5822 images at 1024x690 (0 resized from within 1%; others dropped: 0)
+gpu sift: VLFeat-compatible extractor on NVIDIA GeForce RTX 3090
+sift: mean 5087 keypoints (40.2 s)
+retrieval: VLAD top-30 added 126687 pairs to 116230 window pairs (10.9 s)
+217701 verified of 242917 candidate pairs (185.2 s; overlapped: match 132.9 s, verify 139.4 s)
+
+## mapper, gpu SIFT, base
+mapper finished in 1154.6s: 1 model(s) kept
+model 0: 5816 registered images, 1233709 points3D 
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 19:31.81
+	Maximum resident set size (kbytes): 19779940
+
+## mapper, gpu SIFT, complete
+mapper finished in 1165.1s: 1 model(s) kept
+model 0: 5816 registered images, 1233709 points3D 
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 19:41.59
+	Maximum resident set size (kbytes): 19784292
+COMPLETE model=0 registered_frames=0
+
+## scores
+poses_cpu_base.txt: 5816 registered; vs reference: median 0.147 m, p90 0.283, max 0.76
+poses_gpu_base.txt: 5816 registered; vs reference: median 0.184 m, p90 0.276, max 0.51
+
+## identity checks
+cpu complete == cpu base (byte-identical)
+gpu complete == gpu base (byte-identical)
+cpu base == the earlier Ubuntu 22.04 run (byte-identical)

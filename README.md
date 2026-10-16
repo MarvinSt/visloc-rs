@@ -148,14 +148,15 @@ matches, the GLOMAP paper's setup, and the scoring follows that paper:
 On visloc-rs's own matches it leads both at every threshold: 53.1 / 78.9 /
 85.7, against COLMAP's three-run means of 50.2 / 75.1 / 82.0 (incremental)
 and 51.3 / 75.0 / 81.1 (global). The global mapper still registers more
-images; `--complete-model` closes most of that gap. In a later run on
-COLMAP's matches, it took visloc-rs to 452 of 454 images and 53.7 / 79.9 /
-86.9, ahead of COLMAP's incremental mapper (51.3 / 76.3 / 82.9) and its
-global mapper. The global mapper failed on one scene in that run; without
-that scene the means are 53.7 / 79.7 / 86.7 against 52.7 / 76.3 / 82.7.
-With `--gpu-sift`, visloc-rs extracts those features on the GPU at
-the same AUC (53.1 / 78.9 / 85.7): 10.0 s for the 13 scenes on an RTX 3090,
-against 92.4 s on 13 CPU threads of the same machine. On a large capture,
+images; completing the largest model, now on by default in
+`gsplat_photos`, closes most of that gap. In a later run on COLMAP's
+matches, it took visloc-rs to 452 of 454 images and 53.7 / 79.9 / 86.9,
+ahead of COLMAP's incremental mapper (51.3 / 76.3 / 82.9) and its global
+mapper. The global mapper failed on one scene in that run; without that
+scene the means are 53.7 / 79.7 / 86.7 against 52.7 / 76.3 / 82.7. GPU
+SIFT, also the default now, extracts those features at the same AUC (53.1 /
+78.9 / 85.7): 10.0 s for the 13 scenes on an RTX 3090, against 92.4 s on 13
+CPU threads of the same machine. On a large capture,
 the 5,822 SmallCity photos, both mappers get visloc-rs's matches and 32 CPU
 threads: visloc-rs maps it in 21.7 min, and COLMAP's global mapper had not
 finished after 94 min, when a 100-minute cap stopped it.
@@ -291,9 +292,9 @@ python scripts/make_photos_demo_gif.py --run runs/sb --out photos_to_mesh.gif --
 
 The pipeline has three stages:
 
-1. **SfM.** Takes the focal length from EXIF, then runs SIFT (on the GPU
-   with `--gpu-sift`), GPU matching, two-view verification and the
-   COLMAP-port mapper (the configuration that beats COLMAP on EuRoC
+1. **SfM.** Takes the focal length from EXIF, then runs SIFT and matching
+   on the GPU (`--cpu-sift` extracts on the CPU), two-view verification
+   and the COLMAP-port mapper (the configuration that beats COLMAP on EuRoC
    above). A final bundle adjustment refines the intrinsics. A COLMAP text
    model is written to `sparse/0`, so brush and Inria 3DGS can use the
    result too.

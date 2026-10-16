@@ -83,11 +83,14 @@ pub struct PhotoSfmConfig {
     /// Extract the VLFeat-compatible SIFT on the GPU
     /// (`visloc_sift_gpu::VlfeatSiftGpu`), an f32 port of the CPU extractor:
     /// 99.97% of its keypoints, descriptor bytes 0.0007 apart on average.
+    /// Applies with `gpu` in a `gpu` build; otherwise SIFT runs on the CPU.
+    /// On by default: on ETH3D the mapper scores the same with it, and
+    /// extraction is 8 to 9 times faster than on the CPU.
     pub gpu_sift: bool,
     /// Once the mapper has built every model, extend the largest one with
     /// the images it left out, from 2D-2D correspondences where they see
     /// too few 3D points (the mapper's `complete_largest_model`). It can
-    /// only add images to that model, then refines it.
+    /// only add images to that model, then refines it. On by default.
     pub complete_model: bool,
 }
 
@@ -113,8 +116,8 @@ impl Default for PhotoSfmConfig {
             match_u8: true,
             mask_black: None,
             gpu_ba: false,
-            gpu_sift: false,
-            complete_model: false,
+            gpu_sift: true,
+            complete_model: true,
         }
     }
 }
@@ -531,16 +534,12 @@ pub fn build_photo_dataset(
     let on_gpu = gpu_sift.is_some() && visloc_sift_gpu::SiftGpu::supports(&sift_cfg);
     #[cfg(not(feature = "gpu"))]
     let on_gpu = false;
-    #[cfg(not(feature = "gpu"))]
-    if cfg.gpu_sift {
-        return Err(EurocError::Sift("gpu_sift needs the `gpu` feature".into()));
-    }
-    // The VLFeat-compatible extractor on the GPU (opt-in): it borrows the
+    // The VLFeat-compatible extractor on the GPU (with `gpu`): it borrows the
     // matcher's context and hands it back.
     #[cfg(feature = "gpu")]
-    let vlfeat_gpu = cfg.gpu_sift && visloc_sift_gpu::VlfeatSiftGpu::supports(&sift_cfg);
+    let vlfeat_gpu = cfg.gpu_sift && cfg.gpu && visloc_sift_gpu::VlfeatSiftGpu::supports(&sift_cfg);
     #[cfg(feature = "gpu")]
-    if cfg.gpu_sift && !vlfeat_gpu {
+    if cfg.gpu_sift && cfg.gpu && !vlfeat_gpu {
         log("gpu sift: these SIFT settings are not VLFeat-compatible; extracting on the CPU");
     }
     #[cfg(not(feature = "gpu"))]
@@ -592,6 +591,7 @@ pub fn build_photo_dataset(
         }
         features
     } else if on_gpu {
+        #[allow(unused_mut)]
         let mut features = Vec::with_capacity(n);
         #[cfg(feature = "gpu")]
         for chunk in decoded.chunks(256) {

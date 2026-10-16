@@ -130,8 +130,8 @@ All notable changes to `visloc-rs` will be documented here.
 ### Added
 
 - **COLMAP-port mapper: complete the largest model
-  (`gsplat_photos --complete-model`, `complete_largest_model=1`).** Off by
-  default.
+  (`complete_largest_model=1`).** Off by default in the mapper; on in
+  `gsplat_photos` (`--no-complete-model` turns it off, see Changed).
   - **When it runs:** once every model is built. It extends the largest
     model with the images it left out.
   - **Candidates:** images with at least `2 * abs_pose_min_num_inliers`
@@ -153,10 +153,11 @@ All notable changes to `visloc-rs` will be documented here.
       86.90 (452).
     - Details: `docs/eth3d_auc_benchmark.md`.
 
-- **VLFeat-compatible SIFT on the GPU (`gsplat_photos --gpu-sift`).**
+- **VLFeat-compatible SIFT on the GPU (`gsplat_photos`).**
   `visloc_sift_gpu::VlfeatSiftGpu` ports the photo pipeline's SIFT (the
   VLFeat-compatible detector and descriptor with COLMAP's byte
-  descriptors) to f32 WGSL. Off by default.
+  descriptors) to f32 WGSL. `gsplat_photos` uses it by default
+  (`--cpu-sift` for the CPU extractor, see Changed).
   - **On the GPU:** both scale spaces, the DoG extrema with VLFeat's
     five-step refinement, the orientation histograms, the descriptor
     pyramid's gradients and the descriptors.
@@ -540,6 +541,24 @@ All notable changes to `visloc-rs` will be documented here.
   fixed unless `refine_distortion` is set). Default off.
 
 ### Changed
+
+- **`gsplat_photos` extracts SIFT on the GPU and completes the largest
+  model by default.** `--cpu-sift` and `--no-complete-model` restore the
+  previous behaviour; `--cpu` also extracts on the CPU.
+  - **Why:** on ETH3D the mapper scores the same with GPU SIFT (mean
+    AUC@1°/3°/5° 53.08 / 78.85 / 85.68 against 53.09 / 78.85 / 85.69), and
+    completion raises it (452 of 454 images registered instead of 448).
+  - **SmallCity, one RTX 3090 run with 23 CPU threads:**
+    - The CPU-SIFT model reproduced the earlier run byte for byte
+      (5,816 / 5,822 registered, median centre error 0.147 m).
+    - Completion adds nothing there: its six left-out photos do not
+      register. The mapper took 1% longer.
+    - With GPU SIFT, extraction took 40.2 s instead of 331.2 s, and the
+      model registers 5,816 photos with a median of 0.184 m (p90 0.276 m,
+      against 0.283 m). That is within the spread of mapper seeds on this
+      capture, 0.15 to 0.65 m.
+  - The ETH3D and SmallCity numbers documented before this change were
+    measured with CPU SIFT and without completion, unless noted.
 
 - **COLMAP-port BA: cheaper setup of large bundle adjustments.** Results
   are bit-identical: the SmallCity pass-1 model matches byte for byte.

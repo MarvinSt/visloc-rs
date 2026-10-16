@@ -98,16 +98,18 @@ the cloud.
 | playground | 38 | 65.7% | 79.3% | 56.0% | 11:21 | | |
 | terrains | 42 | 88.9% | 90.6% | 87.2% | 10:26 | | |
 | delivery area | 44 | 85.9% | 88.4% | 83.6% | 9:29 | | |
+| electro | 45 | 85.2% | 96.0% | 76.7% | 11:23 | | |
 
-- **Mean over these 11 scenes** (single-scale): F1 77.8%, accuracy
-  90.1%, completeness 69.8%. Over all 13 training scenes at 2 cm, ACMM
+- **Mean over these 12 scenes** (single-scale): F1 78.5%, accuracy
+  90.6%, completeness 70.4%. Over all 13 training scenes at 2 cm, ACMM
   reports F1 78.86% (accuracy 90.67%, completeness 70.42%) and COLMAP
   67.66% (91.85%, 55.13%) (arXiv 2303.09758, 2210.07582). The scene sets
   differ, so those means only bracket ours.
 - **Multi-scale** (`--scales 3 --geom-passes 2`) raised F1 on all three
   scenes it ran on, by 1.3, 5.3 and 0.5 points, mostly through
   completeness.
-- **Not yet scored:** electro and facade.
+- **Not scored:** facade (76 images; the pod's time limit).
+- **Peak memory:** 15.5 GB (electro).
 - **What falls short is completeness.** Accuracy is at ACMM's level;
   completeness is lower, most on meadow and playground.
 

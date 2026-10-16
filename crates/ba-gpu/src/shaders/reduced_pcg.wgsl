@@ -2,11 +2,15 @@
 // camera system (`reduced.rs`): the CPU solver's iteration (`pcg_core` in
 // pipelines/slam/src/colmap_incremental/rig_ba_solver.rs) in f32.
 //
-// The matrix is n 6x6 diagonal blocks plus one stored block per edge
-// (row b, column a), read from both of its block rows through a CSR index.
-// The preconditioner applies dense inverses over runs of consecutive nodes
-// (a run of one node is block-Jacobi), plus an optional additive coarse
-// level (one shared 6-vector per aggregate of consecutive nodes).
+// The matrix is n 6x6 diagonal blocks plus one stored block B per edge
+// (a, b), the (row b, column a) block, with the edges sorted by a. The
+// product reads every block once: `matvec_out` takes the edges of one node a
+// per workgroup, a contiguous run of blocks, adds B^T p_b into row a and
+// writes u = B p_a per edge; `matvec_in` gathers the u of the edges ending at
+// each node b. The preconditioner applies dense inverses over runs of
+// consecutive nodes (a run of one node is block-Jacobi), plus an optional
+// additive coarse level (one shared 6-vector per aggregate of consecutive
+// nodes).
 //
 // Every reduction sums in a fixed order (per-row or per-workgroup partials,
 // then one workgroup), so a solve is deterministic on a given device. Once
@@ -41,25 +45,27 @@ const FAILED: u32 = 8u;
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> blocks: array<f32>;     // 36 per edge, column-major
 @group(0) @binding(2) var<storage, read> diag: array<f32>;       // 36 per node
-@group(0) @binding(3) var<storage, read> row_ptr: array<u32>;    // n + 1
-@group(0) @binding(4) var<storage, read> row_ent: array<u32>;    // edge | transpose << 31
-@group(0) @binding(5) var<storage, read> row_col: array<u32>;    // the other node
-@group(0) @binding(6) var<storage, read> cl_mat: array<f32>;     // run inverses, column-major
-@group(0) @binding(7) var<storage, read> cl_off: array<u32>;     // n_clusters + 1
-@group(0) @binding(8) var<storage, read> coarse_inv: array<f32>; // (6 coarse_m)^2, column-major
-@group(0) @binding(9) var<storage, read> rhs: array<f32>;
-@group(0) @binding(10) var<storage, read_write> x: array<f32>;
-@group(0) @binding(11) var<storage, read_write> r: array<f32>;
-@group(0) @binding(12) var<storage, read_write> z: array<f32>;
-@group(0) @binding(13) var<storage, read_write> p: array<f32>;
-@group(0) @binding(14) var<storage, read_write> ap: array<f32>;
-@group(0) @binding(15) var<storage, read_write> partials: array<f32>;
-@group(0) @binding(16) var<storage, read_write> rc: array<f32>;
-@group(0) @binding(17) var<storage, read_write> yc: array<f32>;
-@group(0) @binding(18) var<storage, read_write> scal: array<f32>;
+@group(0) @binding(3) var<storage, read> out_off: array<u32>;    // n + 1: node a's edges
+@group(0) @binding(4) var<storage, read> edge_b: array<u32>;     // b of each edge
+@group(0) @binding(5) var<storage, read> in_off: array<u32>;     // n + 1: into in_edge
+@group(0) @binding(6) var<storage, read> in_edge: array<u32>;    // edges ending at each node, ascending
+@group(0) @binding(7) var<storage, read> cl_mat: array<f32>;     // run inverses, column-major
+@group(0) @binding(8) var<storage, read> cl_off: array<u32>;     // n_clusters + 1
+@group(0) @binding(9) var<storage, read> coarse_inv: array<f32>; // (6 coarse_m)^2, row-major
+@group(0) @binding(10) var<storage, read> rhs: array<f32>;
+@group(0) @binding(11) var<storage, read_write> x: array<f32>;
+@group(0) @binding(12) var<storage, read_write> r: array<f32>;
+@group(0) @binding(13) var<storage, read_write> z: array<f32>;
+@group(0) @binding(14) var<storage, read_write> p: array<f32>;
+@group(0) @binding(15) var<storage, read_write> ap: array<f32>;
+@group(0) @binding(16) var<storage, read_write> u: array<f32>;   // B p_a, 6 per edge
+@group(0) @binding(17) var<storage, read_write> partials: array<f32>;
+@group(0) @binding(18) var<storage, read_write> rc: array<f32>;
+@group(0) @binding(19) var<storage, read_write> yc: array<f32>;
+@group(0) @binding(20) var<storage, read_write> scal: array<f32>;
 
 var<workgroup> red: array<f32, 256>;
-var<workgroup> red6: array<f32, 384>;
+var<workgroup> red192: array<f32, 1152>;
 var<workgroup> seg: array<f32, 256>;
 var<workgroup> flag: f32;
 
@@ -188,23 +194,26 @@ fn coarse_restrict(@builtin(local_invocation_index) lid: u32,
     rc[j] = acc;
 }
 
-// yc = (P^T A P)^-1 rc.
+// yc = (P^T A P)^-1 rc, one row per workgroup (a contiguous read).
 @compute @workgroup_size(256)
 fn coarse_apply(@builtin(local_invocation_index) lid: u32,
-                @builtin(global_invocation_id) gid: vec3<u32>) {
+                @builtin(workgroup_id) wg: vec3<u32>) {
     if (finished(lid)) {
         return;
     }
     let m = 6u * P.coarse_m;
-    let t = gid.x;
+    let t = wg.x;
     if (t >= m) {
         return;
     }
     var acc = 0.0;
-    for (var c = 0u; c < m; c = c + 1u) {
-        acc = acc + coarse_inv[c * m + t] * rc[c];
+    for (var c = lid; c < m; c = c + 256u) {
+        acc = acc + coarse_inv[t * m + c] * rc[c];
     }
-    yc[t] = acc;
+    let s = block_sum(lid, acc);
+    if (lid == 0u) {
+        yc[t] = s;
+    }
 }
 
 // z += P yc (when the coarse level is on), and per-workgroup partials of r.z.
@@ -256,74 +265,109 @@ fn init_p(@builtin(local_invocation_index) lid: u32,
     }
 }
 
-// ap = A p, one block row per workgroup, and partials[row] = p_row . ap_row.
-@compute @workgroup_size(64)
-fn matvec(@builtin(local_invocation_index) lid: u32,
-          @builtin(workgroup_id) wg: vec3<u32>) {
-    if (lid == 0u) {
-        flag = scal[DONE];
-    }
-    if (workgroupUniformLoad(&flag) != 0.0) {
+// The product's first half, one node a per workgroup over its edges (a, b),
+// whose blocks are contiguous: ap_a = sum of B^T p_b, and u_e = B p_a for
+// `matvec_in`. Invocation 6 j + k takes component k of the edges j, j + 32,
+// ... of the node, so consecutive invocations read consecutive floats.
+@compute @workgroup_size(192)
+fn matvec_out(@builtin(local_invocation_index) lid: u32,
+              @builtin(workgroup_id) wg: vec3<u32>) {
+    if (finished(lid)) {
         return;
     }
-    let row = wg.x + wg.y * P.rows_x;
-    if (row >= P.n) {
+    let a = wg.x + wg.y * P.rows_x;
+    if (a >= P.n) {
         return;
+    }
+    let k = lid % 6u;
+    let j = lid / 6u;
+    var pa: array<f32, 6>;
+    for (var c = 0u; c < 6u; c = c + 1u) {
+        pa[c] = p[6u * a + c];
     }
     var acc = array<f32, 6>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    if (lid == 0u) {
-        let d = row * 36u;
+    let end = out_off[a + 1u];
+    for (var e = out_off[a] + j; e < end; e = e + 32u) {
+        let base = 36u * e;
+        let pb = p[6u * edge_b[e] + k];
+        var uk = 0.0;
         for (var c = 0u; c < 6u; c = c + 1u) {
-            let xc = p[6u * row + c];
-            for (var k = 0u; k < 6u; k = k + 1u) {
-                acc[k] = acc[k] + diag[d + c * 6u + k] * xc;
-            }
+            // B[k][c]: row k (node b's component), column c (node a's).
+            let v = blocks[base + 6u * c + k];
+            uk = uk + v * pa[c];
+            acc[c] = acc[c] + v * pb;
         }
+        u[6u * e + k] = uk;
     }
-    let end = row_ptr[row + 1u];
-    for (var j = row_ptr[row] + lid; j < end; j = j + 64u) {
-        let ent = row_ent[j];
-        let e = (ent & 0x7fffffffu) * 36u;
-        let o = 6u * row_col[j];
-        if ((ent >> 31u) == 0u) {
-            // This row is the block's row b: y_b += B x_a.
-            for (var c = 0u; c < 6u; c = c + 1u) {
-                let xc = p[o + c];
-                for (var k = 0u; k < 6u; k = k + 1u) {
-                    acc[k] = acc[k] + blocks[e + c * 6u + k] * xc;
-                }
-            }
-        } else {
-            // This row is the block's column a: y_a += B^T x_b.
-            for (var c = 0u; c < 6u; c = c + 1u) {
-                var dot = 0.0;
-                for (var k = 0u; k < 6u; k = k + 1u) {
-                    dot = dot + blocks[e + c * 6u + k] * p[o + k];
-                }
-                acc[c] = acc[c] + dot;
-            }
-        }
-    }
-    for (var k = 0u; k < 6u; k = k + 1u) {
-        red6[lid * 6u + k] = acc[k];
+    // Sum the 192 invocations' 6-vectors in a fixed order.
+    for (var c = 0u; c < 6u; c = c + 1u) {
+        red192[lid * 6u + c] = acc[c];
     }
     workgroupBarrier();
-    for (var s = 32u; s > 0u; s = s >> 1u) {
+    if (lid < 64u) {
+        for (var c = 0u; c < 6u; c = c + 1u) {
+            red192[lid * 6u + c] = red192[lid * 6u + c] + red192[(lid + 128u) * 6u + c];
+        }
+    }
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s = s >> 1u) {
         if (lid < s) {
-            for (var k = 0u; k < 6u; k = k + 1u) {
-                red6[lid * 6u + k] = red6[lid * 6u + k] + red6[(lid + s) * 6u + k];
+            for (var c = 0u; c < 6u; c = c + 1u) {
+                red192[lid * 6u + c] = red192[lid * 6u + c] + red192[(lid + s) * 6u + c];
             }
         }
         workgroupBarrier();
     }
-    if (lid == 0u) {
-        var d = 0.0;
-        for (var k = 0u; k < 6u; k = k + 1u) {
-            let v = red6[k];
-            ap[6u * row + k] = v;
-            d = d + p[6u * row + k] * v;
+    if (lid < 6u) {
+        ap[6u * a + lid] = red192[lid];
+    }
+}
+
+// The second half, one node b per workgroup: ap_b = D_b p_b + (the first
+// half's B^T terms) + the u of the edges ending at b, and partials[b] =
+// p_b . ap_b. Invocation 6 j + k sums component k of the edges j, j + 32,
+// ... of the node's list.
+@compute @workgroup_size(192)
+fn matvec_in(@builtin(local_invocation_index) lid: u32,
+             @builtin(workgroup_id) wg: vec3<u32>) {
+    if (finished(lid)) {
+        return;
+    }
+    let b = wg.x + wg.y * P.rows_x;
+    if (b >= P.n) {
+        return;
+    }
+    let k = lid % 6u;
+    let j = lid / 6u;
+    var acc = 0.0;
+    let end = in_off[b + 1u];
+    for (var i = in_off[b] + j; i < end; i = i + 32u) {
+        acc = acc + u[6u * in_edge[i] + k];
+    }
+    red192[lid] = acc;
+    workgroupBarrier();
+    for (var s = 16u; s > 0u; s = s >> 1u) {
+        if (j < s) {
+            red192[lid] = red192[lid] + red192[lid + 6u * s];
         }
-        partials[row] = d;
+        workgroupBarrier();
+    }
+    var y = 0.0;
+    if (lid < 6u) {
+        let d = b * 36u;
+        for (var c = 0u; c < 6u; c = c + 1u) {
+            y = y + diag[d + c * 6u + lid] * p[6u * b + c];
+        }
+        y = y + ap[6u * b + lid] + red192[lid];
+    }
+    workgroupBarrier();
+    if (lid < 6u) {
+        ap[6u * b + lid] = y;
+        red192[lid] = p[6u * b + lid] * y;
+    }
+    workgroupBarrier();
+    if (lid == 0u) {
+        partials[b] = red192[0] + red192[1] + red192[2] + red192[3] + red192[4] + red192[5];
     }
 }
 

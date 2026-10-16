@@ -193,21 +193,27 @@ All notable changes to `visloc-rs` will be documented here.
   adjustments through wgpu (`visloc_ba_gpu::GpuReducedSolver`). Without the
   flag nothing changes: the CPU path stays bit-identical.
   - **What moves:** bundle adjustments with at least 1,000 free frames. The
-    GPU forms the reduced camera system's off-diagonal blocks and runs the
-    preconditioned conjugate gradients. The CPU keeps the linearization,
-    the diagonal blocks and right-hand side, the preconditioner's
-    factorization and the back-substitution, in f64.
-  - **Deterministic:** the blocks are exact sums (64-bit fixed point over
-    two 32-bit atomics) and the conjugate gradients reduce in a fixed
-    order, so a solve repeats exactly on a given device. It is not
-    bit-identical to the CPU path.
+    GPU runs the preconditioned conjugate gradients on the reduced camera
+    system. Its product reads each off-diagonal block once, as the CPU's
+    does: one workgroup per frame over the contiguous blocks of its edges,
+    which writes the other half of each edge's product for a second pass
+    to gather. The CPU keeps the linearization, the point elimination, the
+    preconditioner's factorization and the back-substitution, in f64, and
+    uploads the blocks in f32 for each solve.
+  - **GPU elimination, opt-in** (`VISLOC_GPU_ELIMINATION=1`): the GPU forms
+    the off-diagonal blocks itself, as exact sums (64-bit fixed point over
+    two 32-bit atomics), and keeps them for the solve.
+  - **Deterministic:** the conjugate gradients reduce in a fixed order, so
+    a solve repeats exactly on a given device. It is not bit-identical to
+    the CPU path.
   - **Validation:** on a SmallCity pass-1 replay (1,499 photos, llvmpipe)
-    the large bundle adjustments take the CPU's PCG iteration counts, and
-    the camera centres differ from the CPU model by a median of 5e-6 and at
-    most 0.015% of the scene extent.
-  - **Not faster yet:** on an NVIDIA L4 with 21 CPU threads, SmallCity's
-    mapper took 1,193 s with it and 1,168 s without; the GPU's block
-    product and elimination are the reasons.
+    the large bundle adjustments take about the CPU's PCG iteration counts,
+    and the camera centres differ from the CPU model by a median of 4e-5
+    and at most 0.005% of the scene extent.
+  - **Speed:** the first version (each block read twice, the blocks formed
+    on the GPU) was not faster: on an NVIDIA L4 with 21 CPU threads,
+    SmallCity's mapper took 1,193 s with it and 1,168 s without. The
+    current version has not been timed on a GPU yet.
   - `visloc_slam::ReducedSolveAccelerator` is the hook another backend can
     implement. Details: `docs/gpu_bundle_adjustment.md`.
 

@@ -14,17 +14,49 @@ systems keep the CPU's block Cholesky. In one Levenberg-Marquardt trial:
 | Step | Where | Precision |
 |---|---|---|
 | Linearization (residuals, Jacobians, `J_cᵀJ_p` blocks) | CPU | f64 |
-| Point inverses, diagonal blocks and right-hand side of the reduced system | CPU, the CPU path's sums in the same order | f64 |
-| Off-diagonal blocks (`-Σ W_tp V_p⁻¹ W_spᵀ` over shared points) | GPU | f32 terms, exact sums |
-| Preconditioner: dense inverses over runs of 32 frames, coarse level | CPU, from the blocks the GPU returns | f64 |
+| Point elimination: the reduced system's blocks and right-hand side | CPU, as the CPU path | f64, uploaded in f32 |
+| Preconditioner: dense inverses over runs of 32 frames, coarse level | CPU | f64 |
 | Conjugate gradients | GPU | f32 vectors, fixed-order reductions |
 | Point back-substitution, trial cost, step acceptance | CPU | f64 |
 
-The camera-point blocks are uploaded once per linearization and the
-elimination's index once per bundle adjustment; per trial only the point
-inverses (9 floats a point) and the bounds below go up.
+Each trial uploads the off-diagonal blocks (490 MB in f32 at SmallCity's
+size), the diagonal blocks, the right-hand side and the preconditioner; the
+edge index goes up once per bundle adjustment. The CPU path makes the same
+f32 copy of the blocks for its own product, so the GPU path adds no
+conversion.
 
-## Exact, deterministic sums
+## The product
+
+The off-diagonal block of each edge `(a, b)` (frames `a < b`, edges sorted
+by `a`) is stored once and acts on both of its block rows: `y_b += B x_a`
+and `y_a += Bᵀ x_b`. The conjugate gradients' product reads each block
+once, as the CPU's does, in two passes:
+
+1. One workgroup per frame `a` reads the blocks of its edges, a contiguous
+   run, with consecutive invocations on consecutive floats. It sums
+   `Bᵀ x_b` into row `a` and writes `B x_a`, six floats, per edge.
+2. One workgroup per frame `b` gathers those six floats from the edges
+   ending at `b` (an index built once per bundle adjustment) and adds the
+   diagonal block's product.
+
+That is 144 bytes a block read once, plus 24 bytes an edge written and read
+back. The previous product read each block twice, once per block row, and
+gathered every row's blocks from scattered places.
+
+## Deterministic sums
+
+Every sum of the conjugate gradients runs in a fixed order: per row in the
+product, then per workgroup and in one workgroup for the dot products. A
+solve is therefore deterministic on a given device, but it is not
+bit-identical to the CPU path.
+
+## Point elimination on the GPU (opt-in)
+
+`VISLOC_GPU_ELIMINATION=1` forms the off-diagonal blocks on the device
+instead, from the camera-point blocks (uploaded once per linearization) and
+the point inverses (9 floats a point per trial), and keeps them there for
+the solve. The CPU then factors the preconditioner from the run blocks and
+aggregate sums the device returns.
 
 Each off-diagonal entry is a sum of terms from every point two frames share.
 A workgroup takes a run of up to 160 edges of one frame's row and adds its
@@ -33,9 +65,10 @@ over two 32-bit atomics. Every term is first divided by the Cauchy-Schwarz
 bound `sqrt(D_t[r][r] D_s[c][c])`, with `D` the per-frame elimination
 diagonal the CPU already has, so the whole sum fits in `[-1, 1]`. A unit is
 `2^-61`, so each f32 term is added exactly. Integer addition is associative,
-so the blocks do not depend on the order the terms arrive in. The reductions
-of the conjugate gradients sum in a fixed order too. A solve is therefore
-deterministic on a given device, but it is not bit-identical to the CPU path.
+so the blocks do not depend on the order the terms arrive in.
+
+It is off by default because the CPU forms the blocks faster on the machine
+measured below.
 
 ## Validation
 
@@ -46,17 +79,24 @@ deterministic on a given device, but it is not bit-identical to the CPU path.
   blocks match f64 sums within 2.2e-8 of each entry's bound. A repeated
   elimination gives identical blocks.
 - **SmallCity pass 1** (1,499 images; local llvmpipe replay, which checks
-  correctness, not speed). The large bundle adjustments took the CPU's
-  iteration counts (61, 116, 136 vs 61, 116, 135, ...). Camera centres
-  differ from the CPU model by a median of 5e-6 and at most 0.015% of the
-  scene extent. Forming the blocks on the GPU instead of the CPU changed the
-  final camera centres by at most 5e-15.
+  correctness, not speed). The large bundle adjustments took about the
+  CPU's iteration counts: 59, 116, 136, 66, ... against 61, 116, 135, 62,
+  ..., and 1,359 against 1,309 over the final one's six trials. Both models
+  register all 1,499 images, and the camera centres differ from the CPU
+  model by a median of 4e-5 and at most 0.005% of the scene extent. The
+  previous version (each block read twice, the blocks formed on the GPU)
+  differed by a median of 5e-6 and at most 0.015%. With
+  `VISLOC_GPU_ELIMINATION=1` the replay takes the same iteration counts,
+  and its camera centres are within 5e-15 of the default's.
+- **The CPU path** is unchanged: the replay without `--gpu-ba` writes the
+  same model byte for byte as before this version.
 
-## Speed on a GPU: not faster yet
+## Speed on a GPU, before the single-read product
 
-On an NVIDIA L4 (24 GB, 300 GB/s) with 21 CPU threads, the GPU path is
-slower than the CPU's. SmallCity, all 5,822 photos, mapper seed 0, commit
-`3dd9550`, the same matches for both runs:
+On an NVIDIA L4 (24 GB, 300 GB/s) with 21 CPU threads, the first version
+(the product that read each block twice, the elimination on the GPU) was
+slower than the CPU path. SmallCity, all 5,822 photos, mapper seed 0,
+commit `3dd9550`, the same matches for both runs:
 
 | | CPU | `--gpu-ba 1` |
 |---|---|---|
@@ -90,3 +130,6 @@ What it would take to win:
   the off-diagonal blocks then go up once per trial (490 MB in f32);
 - a GPU with more bandwidth: the CPU here is 21 threads of a large server
   part.
+
+The current version does the first two ([The product](#the-product)). It
+has not been timed on a GPU yet.

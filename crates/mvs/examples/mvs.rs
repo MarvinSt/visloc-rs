@@ -6,14 +6,14 @@
 //! cargo run --release -p visloc-mvs --example mvs -- \
 //!     --sparse <dir with cameras.txt/images.txt/points3D.txt> \
 //!     --images <image dir> --out <dir> [--max-image-size 3200] \
-//!     [--sources 10] [--iterations 3] [--geom-passes 1] [--scales 1] [--gpu] \
+//!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 1] [--gpu] \
 //!     [--view-selection confidence|sampled] [--init-top-k 3] [--detail-threshold 0.1] \
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 15]
 //! ```
 //!
-//! `--scales 3 --geom-passes 2` runs ACMM's multi-scale scheme; `--gpu`
-//! (a `--features gpu` build) runs PatchMatch on the GPU.
+//! `--scales 3` runs ACMM's multi-scale scheme; `--gpu` (a `--features gpu`
+//! build) runs PatchMatch on the GPU.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -31,7 +31,7 @@ fn main() {
     let mut ws_options = WorkspaceOptions::default();
     let mut pm_options = PatchMatchOptions::default();
     let fusion_options = FusionOptions::default();
-    let mut geom_passes = 1usize;
+    let mut geom_passes = 2usize;
     let mut scales = 1usize;
     let mut detail_threshold = None;
     let mut use_gpu = false;

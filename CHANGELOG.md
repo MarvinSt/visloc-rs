@@ -210,10 +210,13 @@ All notable changes to `visloc-rs` will be documented here.
     the large bundle adjustments take about the CPU's PCG iteration counts,
     and the camera centres differ from the CPU model by a median of 4e-5
     and at most 0.005% of the scene extent.
-  - **Speed:** the first version (each block read twice, the blocks formed
-    on the GPU) was not faster: on an NVIDIA L4 with 21 CPU threads,
-    SmallCity's mapper took 1,193 s with it and 1,168 s without. The
-    current version has not been timed on a GPU yet.
+  - **Speed (SmallCity on an NVIDIA L4, 15 CPU threads):** the mapper takes
+    845.0 s with it and 846.7 s without. Its conjugate-gradient iterations
+    take 3.4 ms against the CPU's 6.8 ms at 3.4M edges, but each solve's
+    upload cost 0.59 s, and those solves are a tenth of the mapper's time.
+    Uploads now go through a buffer kept between solves (not yet timed on a
+    GPU). The first version (each block read twice, the blocks formed on
+    the GPU) took 1,193 s against 1,168 s on an L4 with 21 threads.
   - `visloc_slam::ReducedSolveAccelerator` is the hook another backend can
     implement. Details: `docs/gpu_bundle_adjustment.md`.
 

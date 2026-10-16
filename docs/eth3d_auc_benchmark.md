@@ -404,7 +404,9 @@ matches (6.6 min):
   like that across mapper seeds too (0.15 m to 0.65 m).
 - **The GPU bundle adjustment** is not faster on this GPU, and its run parts
   from the CPU run after its first solve
-  ([GPU bundle adjustment](gpu_bundle_adjustment.md)).
+  ([GPU bundle adjustment](gpu_bundle_adjustment.md)). A later version's
+  conjugate gradients run twice as fast as the CPU's, but the mapper's time
+  stays the same (845.0 s against 846.7 s on another L4 machine).
 - **GPU SIFT** (an RTX 3090 machine with 23 CPU threads): the 5,822
   photos at 1,024 px take 43.8 s, against 201.9 s for the CPU extractor on
   the same machine.

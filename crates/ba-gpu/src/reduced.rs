@@ -211,6 +211,10 @@ struct State {
     /// Structure whose blocks the last elimination left in the PCG's block
     /// buffer.
     resident: Option<u64>,
+    /// Host-visible buffer that stages each solve's uploads, kept between
+    /// solves, and whether it is mapped for writing.
+    upload: Option<wgpu::Buffer>,
+    upload_mapped: bool,
 }
 
 /// The reduced-camera solve on the GPU; register it with
@@ -351,6 +355,8 @@ impl GpuReducedSolver {
             elim_of: None,
             hcp_of: None,
             resident: None,
+            upload: None,
+            upload_mapped: false,
         };
         Self {
             ctx,
@@ -804,11 +810,7 @@ impl GpuReducedSolver {
                 return None;
             }
         }
-        if !resident {
-            queue.write_buffer(st.pcg.get(B_BLOCKS), 0, bytemuck::cast_slice(sys.offdiag));
-            st.resident = None;
-        }
-        if lost_csr || sys.structure_id == 0 || st.csr_of != Some(sys.structure_id) {
+        let csr = if lost_csr || sys.structure_id == 0 || st.csr_of != Some(sys.structure_id) {
             // Node a's edges (a, _) are the run out_off[a]..out_off[a + 1]
             // (the edges are sorted by a); the edges ending at node b are
             // in_edge[in_off[b]..in_off[b + 1]], in edge order.
@@ -834,30 +836,75 @@ impl GpuReducedSolver {
                 in_edge[cursor[b as usize] as usize] = e as u32;
                 cursor[b as usize] += 1;
             }
-            for (b, data) in [
-                (B_OUT_OFF, &out_off),
-                (B_EDGE_B, &edge_b),
-                (B_IN_OFF, &in_off),
-                (B_IN_EDGE, &in_edge),
-            ] {
-                if !data.is_empty() {
-                    queue.write_buffer(st.pcg.get(b), 0, bytemuck::cast_slice(data));
-                }
-            }
             st.csr_of = (sys.structure_id != 0).then_some(sys.structure_id);
+            Some([out_off, edge_b, in_off, in_edge])
+        } else {
+            None
+        };
+        // This solve's uploads go through one host-visible buffer kept
+        // between solves. `Queue::write_buffer` stages each call in a
+        // freshly allocated buffer, and allocating ~0.5 GB of host memory
+        // per solve (the blocks at SmallCity's size) cost ~0.6 s on an L4
+        // machine, a third of the solve.
+        let mut parts: Vec<(usize, &[u8])> = Vec::new();
+        if !resident {
+            parts.push((B_BLOCKS, bytemuck::cast_slice(sys.offdiag)));
+            st.resident = None;
         }
-        queue.write_buffer(&st.pcg_params, 0, bytemuck::bytes_of(&params));
-        for (b, bytes) in [
+        if let Some(csr) = &csr {
+            for (b, data) in [B_OUT_OFF, B_EDGE_B, B_IN_OFF, B_IN_EDGE]
+                .into_iter()
+                .zip(csr)
+            {
+                parts.push((b, bytemuck::cast_slice(data)));
+            }
+        }
+        parts.extend([
             (B_DIAG, bytemuck::cast_slice::<f32, u8>(&diag)),
             (B_CL_MAT, bytemuck::cast_slice(&cl_mat)),
             (B_CL_OFF, bytemuck::cast_slice(&cl_off)),
             (B_COARSE, bytemuck::cast_slice(&coarse_inv)),
             (B_RHS, bytemuck::cast_slice(&rhs)),
-        ] {
-            if !bytes.is_empty() {
-                queue.write_buffer(st.pcg.get(b), 0, bytes);
+        ]);
+        parts.retain(|(_, data)| !data.is_empty());
+        let total: u64 = parts.iter().map(|(_, data)| data.len() as u64).sum();
+        if st.upload.as_ref().map_or(0, |u| u.size()) < total {
+            // Every part is 4-byte words, so `total` is a multiple of 4,
+            // as a buffer mapped at creation must be.
+            let size = ((total + total / 4).div_ceil(4) * 4)
+                .min(self.ctx.limits.max_buffer_size / 4 * 4)
+                .max(total);
+            st.upload = Some(dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("reduced-upload"),
+                size,
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            }));
+            st.upload_mapped = true;
+        }
+        let upload = st.upload.as_ref().expect("upload buffer");
+        if !st.upload_mapped {
+            let (tx, rx) = std::sync::mpsc::channel();
+            upload.slice(..).map_async(wgpu::MapMode::Write, move |r| {
+                let _ = tx.send(r);
+            });
+            dev.poll(wgpu::PollType::wait_indefinitely()).ok();
+            rx.recv().ok()?.ok()?;
+            st.upload_mapped = true;
+        }
+        let mut offsets = Vec::with_capacity(parts.len());
+        {
+            let mut view = upload.slice(..total).get_mapped_range_mut().ok()?;
+            let mut off = 0usize;
+            for (_, data) in &parts {
+                view.slice(off..off + data.len()).copy_from_slice(data);
+                offsets.push(off as u64);
+                off += data.len();
             }
         }
+        upload.unmap();
+        st.upload_mapped = false;
+        queue.write_buffer(&st.pcg_params, 0, bytemuck::bytes_of(&params));
         let entries: Vec<wgpu::BindGroupEntry> = (0..NUM_BINDINGS)
             .map(|b| wgpu::BindGroupEntry {
                 binding: b as u32,
@@ -899,6 +946,17 @@ impl GpuReducedSolver {
             let mut encoder = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("reduced-pcg"),
             });
+            if with_init {
+                for ((b, data), &off) in parts.iter().zip(&offsets) {
+                    encoder.copy_buffer_to_buffer(
+                        upload,
+                        off,
+                        st.pcg.get(*b),
+                        0,
+                        data.len() as u64,
+                    );
+                }
+            }
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("reduced-pcg"),

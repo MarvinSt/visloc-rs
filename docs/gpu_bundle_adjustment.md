@@ -20,8 +20,9 @@ systems keep the CPU's block Cholesky. In one Levenberg-Marquardt trial:
 | Point back-substitution, trial cost, step acceptance | CPU | f64 |
 
 Each trial uploads the off-diagonal blocks (490 MB in f32 at SmallCity's
-size), the diagonal blocks, the right-hand side and the preconditioner; the
-edge index goes up once per bundle adjustment. The CPU path makes the same
+size), the diagonal blocks, the right-hand side and the preconditioner,
+through one host-visible buffer kept between solves; the edge index goes up
+once per bundle adjustment. The CPU path makes the same
 f32 copy of the blocks for its own product, so the GPU path adds no
 conversion.
 
@@ -91,12 +92,55 @@ measured below.
 - **The CPU path** is unchanged: the replay without `--gpu-ba` writes the
   same model byte for byte as before this version.
 
-## Speed on a GPU, before the single-read product
+## Speed on a GPU: the product is faster, the mapper is not
 
-On an NVIDIA L4 (24 GB, 300 GB/s) with 21 CPU threads, the first version
-(the product that read each block twice, the elimination on the GPU) was
-slower than the CPU path. SmallCity, all 5,822 photos, mapper seed 0,
-commit `3dd9550`, the same matches for both runs:
+On an NVIDIA L4 (24 GB, 300 GB/s) with 15 CPU threads. SmallCity, all 5,822
+photos, mapper seed 0, commit `e0ab6ee`, the same matches for both runs
+(`gsplat_photos`' GPU SIFT on that machine):
+
+| | CPU | `--gpu-ba 1` |
+|---|---|---|
+| Mapper | 846.7 s | 845.0 s |
+| Peak memory | 18.9 GiB | 19.1 GiB |
+| Large bundle adjustments: elimination | 80.2 s | 82.9 s |
+| Large bundle adjustments: conjugate gradients, with the preconditioner's setup | 80.8 s (20,706 iterations) | 85.3 s (23,947 iterations) |
+| PCG iteration at 3.4M edges | 6.8 ms | **3.4 ms** |
+| Per-solve cost at 3.4M edges | 0.04 s | 0.59 s |
+| Median camera-centre error against the release's model | 0.297 m | 0.522 m |
+
+The last two pairs of figures come from a least-squares split of each large
+bundle adjustment's solve time into a part per conjugate-gradient iteration
+and a part per solve, both proportional to its edges.
+
+- **The product is twice as fast as the CPU's.** The first version took
+  14.9 ms an iteration against the CPU's 7.9 ms (table below). The new
+  product moves about 720 MB an iteration at SmallCity's size, so 3.4 ms is
+  about 210 GB/s, 70% of the L4's bandwidth.
+- **Each solve's upload cost as much as the iterations saved.** It went
+  through a staging buffer that `Queue::write_buffer` allocates per call,
+  ~0.5 GB of host memory each time: 0.59 s at 3.4M edges, 34 s over the
+  run. Uploads now go through one buffer kept between solves; that version
+  has not been timed on a GPU yet.
+- **The rest of the mapper stays on the CPU.** The large bundle
+  adjustments' conjugate gradients are 81 s of the CPU run's 847 s, and
+  their elimination another 80 s. Even an instant solve would save under a
+  tenth.
+- **Accuracy.** The runs part after the first bundle adjustment the GPU
+  solves, as any last-bit difference makes the incremental mapper do. Both
+  models show this capture's scale drift between its four passes: the
+  passes' scales differ by up to 2.0% (CPU) and 2.9% (GPU), against 0.9% in
+  the best CPU run (0.147 m). Mapper seeds alone spread the median error
+  from 0.15 m to 0.65 m. Both GPU runs so far ended in the worse part of
+  that range, 0.522 m here and 0.577 m below. Two runs do not show that the
+  GPU path is less accurate.
+- The logs' summary is in `benchmarks/smallcity_gpu/gpu_ba_l4.txt`.
+
+### The first version
+
+On an NVIDIA L4 with 21 CPU threads, the first version (the product that
+read each block twice, the elimination on the GPU) was slower than the CPU
+path. SmallCity, all 5,822 photos, mapper seed 0, commit `3dd9550`, the same
+matches for both runs:
 
 | | CPU | `--gpu-ba 1` |
 |---|---|---|
@@ -105,7 +149,7 @@ commit `3dd9550`, the same matches for both runs:
 | Elimination, per LM trial (5,000+ frames) | **1.58 s** | 1.87 s |
 | PCG, per iteration (5,000+ frames) | **7.9 ms** | 14.9 ms |
 
-- **Products.** The GPU's matrix-vector product reads every off-diagonal
+- **Products.** The GPU's matrix-vector product read every off-diagonal
   block twice, once per triangle: 980 MB per product at SmallCity's size,
   at about 65 GB/s, a fifth of the L4's bandwidth. The CPU reads each block
   once and applies it both ways.
@@ -114,22 +158,7 @@ commit `3dd9550`, the same matches for both runs:
   fixed-point atomics: consecutive frames share most of their points, so a
   workgroup's threads keep adding into the same few counters.
 - **The two runs part** after the first bundle adjustment the GPU solves
-  (1,005 frames: one 3D point fewer), as any last-bit difference makes the
-  incremental mapper do. They end at a median camera-centre error of
-  0.281 m (CPU) and 0.577 m (GPU) against the release's own model. The GPU
-  run's final bundle adjustment rejected 7 of its 16 trials, the CPU run's
-  none of 14. One run each, so this does not show that the GPU path is
-  less accurate; it does not show the opposite either.
-
-What it would take to win:
-
-- a block product that reads each block once, in contiguous runs per
-  workgroup, writing the transposed half per edge and gathering it in a
-  second pass;
-- the elimination back on the CPU, which already forms the blocks faster;
-  the off-diagonal blocks then go up once per trial (490 MB in f32);
-- a GPU with more bandwidth: the CPU here is 21 threads of a large server
-  part.
-
-The current version does the first two ([The product](#the-product)). It
-has not been timed on a GPU yet.
+  (1,005 frames: one 3D point fewer). They end at a median camera-centre
+  error of 0.281 m (CPU) and 0.577 m (GPU) against the release's own model.
+  The GPU run's final bundle adjustment rejected 7 of its 16 trials, the CPU
+  run's none of 14.

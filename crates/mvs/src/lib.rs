@@ -20,6 +20,6 @@ pub use fusion::{fuse, FusedPoint, FusionOptions};
 pub use gpu::GpuPatchMatch;
 pub use model::{read_text_model, SparseModel};
 pub use patch_match::{estimate, photometric_score, DepthMap, PatchMatchOptions, ViewSelection};
-pub use pipeline::{multi_scale_depth_maps, Estimator, MultiScaleOptions, Scorer};
+pub use pipeline::{geometric_pass, multi_scale_depth_maps, Estimator, MultiScaleOptions, Scorer};
 pub use ply::write_ply;
 pub use workspace::{View, Workspace, WorkspaceOptions};

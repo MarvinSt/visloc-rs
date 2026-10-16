@@ -30,6 +30,8 @@
 //! error (truncated at `delta` pixels) to its cost: ACMM's geometric
 //! consistency. It starts from the view's earlier depth map.
 
+use std::borrow::Cow;
+
 use rayon::prelude::*;
 
 use crate::workspace::{View, Workspace};
@@ -127,7 +129,9 @@ impl Default for PatchMatchOptions {
 }
 
 /// A view's depths (camera `z`, 0 where there is none), unit normals in the
-/// camera frame and final costs, row-major.
+/// camera frame and final costs, row-major. The costs are for inspection
+/// only (no pass or fusion reads them); `cost` is empty when they were not
+/// kept.
 #[derive(Debug, Clone)]
 pub struct DepthMap {
     pub width: usize,
@@ -139,8 +143,14 @@ pub struct DepthMap {
 
 impl DepthMap {
     /// Writes the map as raw little-endian data: width and height (`u32`),
-    /// then the depths, normals and costs (`f32`).
+    /// then the depths, normals and the costs if it has them (`f32`).
     pub fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if !(self.cost.is_empty() || self.cost.len() == self.depth.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "depth map with a partial cost map",
+            ));
+        }
         let mut bytes = Vec::with_capacity(8 + self.depth.len() * 20);
         bytes.extend_from_slice(&(self.width as u32).to_le_bytes());
         bytes.extend_from_slice(&(self.height as u32).to_le_bytes());
@@ -172,9 +182,13 @@ impl DepthMap {
         let width = u32::from_le_bytes(word(0)?) as usize;
         let height = u32::from_le_bytes(word(1)?) as usize;
         let n = width * height;
-        if bytes.len() != 8 + n * 20 {
+        let with_costs = if bytes.len() == 8 + n * 20 {
+            true
+        } else if bytes.len() == 8 + n * 16 {
+            false
+        } else {
             return Err(invalid());
-        }
+        };
         let float = |i: usize| f32::from_le_bytes(word(2 + i).expect("checked length"));
         Ok(Self {
             width,
@@ -183,7 +197,11 @@ impl DepthMap {
             normal: (0..n)
                 .map(|i| [float(n + 3 * i), float(n + 3 * i + 1), float(n + 3 * i + 2)])
                 .collect(),
-            cost: (0..n).map(|i| float(4 * n + i)).collect(),
+            cost: if with_costs {
+                (0..n).map(|i| float(4 * n + i)).collect()
+            } else {
+                Vec::new()
+            },
         })
     }
 }
@@ -325,6 +343,7 @@ impl State {
 /// A source view as the reference view sees it.
 struct Source<'a> {
     view: &'a View,
+    gray: Cow<'a, [f32]>,
     fx: f32,
     fy: f32,
     cx: f32,
@@ -341,6 +360,7 @@ impl<'a> Source<'a> {
         let t = view.translation - r * reference.translation;
         Self {
             view,
+            gray: view.gray_levels(),
             fx: view.fx as f32,
             fy: view.fy as f32,
             cx: view.cx as f32,
@@ -373,6 +393,7 @@ struct RefPatch {
 /// Everything one reference view's passes share.
 struct Context<'a> {
     reference: &'a View,
+    gray: Cow<'a, [f32]>,
     sources: Vec<Source<'a>>,
     options: &'a PatchMatchOptions,
     view_id: u32,
@@ -417,6 +438,7 @@ impl<'a> Context<'a> {
         );
         Self {
             reference,
+            gray: reference.gray_levels(),
             sources,
             options,
             view_id,
@@ -441,7 +463,7 @@ impl<'a> Context<'a> {
 
     fn ref_patch(&self, x: usize, y: usize) -> RefPatch {
         let (w, h) = (self.reference.width as i32, self.reference.height as i32);
-        let gray = &self.reference.gray;
+        let gray = &self.gray;
         let center = gray[y * self.reference.width + x];
         let mut patch = RefPatch {
             n: self.window.len(),
@@ -527,7 +549,7 @@ impl<'a> Context<'a> {
             }
             let u = source.fx * p[0] / p[2] + source.cx;
             let v = source.fy * p[1] / p[2] + source.cy;
-            let value = bilinear(&view.gray, view.width, view.height, u, v) - patch.center;
+            let value = bilinear(&source.gray, view.width, view.height, u, v) - patch.center;
             let weight = patch.weights[k];
             s_w += weight * value;
             s_ww += weight * value * value;
@@ -1358,5 +1380,28 @@ mod tests {
         }
         assert_eq!(sampling_regions()[0].len(), 7);
         assert_eq!(sampling_regions()[4].len(), 11);
+    }
+
+    /// Maps round-trip through their files, with or without costs.
+    #[test]
+    fn depth_maps_round_trip_with_or_without_costs() {
+        let ws = plane_scene();
+        let mut map = plane_scene_truth(&ws, 1);
+        map.cost = (0..map.depth.len()).map(|i| i as f32 / 100.0).collect();
+        let path = std::env::temp_dir().join(format!("visloc_mvs_map_{}.bin", std::process::id()));
+        for keep_costs in [true, false] {
+            if !keep_costs {
+                map.cost = Vec::new();
+            }
+            map.write(&path).expect("writing the map");
+            let back = DepthMap::read(&path).expect("reading the map");
+            assert_eq!((back.width, back.height), (map.width, map.height));
+            assert_eq!(back.depth, map.depth);
+            assert_eq!(back.normal, map.normal);
+            assert_eq!(back.cost, map.cost);
+        }
+        std::fs::remove_file(&path).ok();
+        map.cost = vec![0.0; 3];
+        assert!(map.write(&path).is_err(), "a partial cost map is refused");
     }
 }

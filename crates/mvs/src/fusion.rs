@@ -46,11 +46,21 @@ pub struct FusedPoint {
     pub color: [u8; 3],
 }
 
-/// Fuses `maps` (indexed like `ws.views`). Views are visited in order and
-/// pixels in raster order; a pixel used by a point is not used again.
-pub fn fuse(ws: &Workspace, maps: &[DepthMap], options: &FusionOptions) -> Vec<FusedPoint> {
+/// Fuses `maps` (indexed like `ws.views`), consuming them. Views are
+/// visited in order and pixels in raster order; a pixel used by a point is
+/// not used again. Each map is dropped once no later view reads it, so the
+/// maps and the points are not all held at once.
+pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) -> Vec<FusedPoint> {
     let cos_max_angle = options.max_normal_angle_deg.to_radians().cos();
-    let mut used: Vec<Vec<bool>> = maps.iter().map(|m| vec![false; m.depth.len()]).collect();
+    let last_read_by = ws.last_read_by();
+    for map in &mut maps {
+        map.cost = Vec::new();
+    }
+    // Per view, a bit per pixel: already in a point.
+    let mut used: Vec<Vec<u64>> = maps
+        .iter()
+        .map(|m| vec![0; m.depth.len().div_ceil(64)])
+        .collect();
     let mut points = Vec::new();
     let world_normal = |view: usize, n: [f32; 3]| -> Vector3<f64> {
         ws.views[view].rotation.transpose()
@@ -63,7 +73,7 @@ pub fn fuse(ws: &Workspace, maps: &[DepthMap], options: &FusionOptions) -> Vec<F
             for x in 0..map.width {
                 let p = y * map.width + x;
                 let depth = f64::from(map.depth[p]);
-                if used[i][p] || depth <= 0.0 {
+                if is_set(&used[i], p) || depth <= 0.0 {
                     continue;
                 }
                 let (u, v) = (x as f64 + 0.5, y as f64 + 0.5);
@@ -86,7 +96,7 @@ pub fn fuse(ws: &Workspace, maps: &[DepthMap], options: &FusionOptions) -> Vec<F
                     }
                     let q = sy * source_map.width + sx;
                     let source_depth = f64::from(source_map.depth[q]);
-                    if used[j][q] || source_depth <= 0.0 {
+                    if is_set(&used[j], q) || source_depth <= 0.0 {
                         continue;
                     }
                     let source_point =
@@ -116,15 +126,28 @@ pub fn fuse(ws: &Workspace, maps: &[DepthMap], options: &FusionOptions) -> Vec<F
                         normal: [normal.x as f32, normal.y as f32, normal.z as f32],
                         color: sum_color.map(|s| (s / count).round().clamp(0.0, 255.0) as u8),
                     });
-                    used[i][p] = true;
+                    set(&mut used[i], p);
                     for &(j, q) in &agreeing {
-                        used[j][q] = true;
+                        set(&mut used[j], q);
                     }
                 }
             }
         }
+        for &s in &last_read_by[i] {
+            maps[s].depth = Vec::new();
+            maps[s].normal = Vec::new();
+            used[s] = Vec::new();
+        }
     }
     points
+}
+
+fn is_set(bits: &[u64], i: usize) -> bool {
+    bits[i / 64] >> (i % 64) & 1 == 1
+}
+
+fn set(bits: &mut [u64], i: usize) {
+    bits[i / 64] |= 1 << (i % 64);
 }
 
 #[cfg(test)]
@@ -138,7 +161,7 @@ mod tests {
         let maps: Vec<DepthMap> = (0..ws.views.len())
             .map(|v| plane_scene_truth(&ws, v))
             .collect();
-        let points = fuse(&ws, &maps, &FusionOptions::default());
+        let points = fuse(&ws, maps.clone(), &FusionOptions::default());
         // Most reference pixels see the plane in both other views.
         assert!(points.len() > 2000, "{} points", points.len());
         for p in &points {
@@ -151,6 +174,32 @@ mod tests {
             min_consistent_views: 3,
             ..FusionOptions::default()
         };
-        assert!(fuse(&ws, &maps, &strict).is_empty());
+        assert!(fuse(&ws, maps, &strict).is_empty());
+    }
+
+    /// Dropping maps once no later view reads them changes nothing: the
+    /// same points as a fusion that keeps every map to the end, which a
+    /// last view without depths, reading all the others, forces.
+    #[test]
+    fn released_maps_fuse_the_same_points() {
+        let mut ws = plane_scene();
+        // View 0's map is dropped after view 1.
+        ws.views[2].sources = vec![1];
+        let maps: Vec<DepthMap> = (0..ws.views.len())
+            .map(|v| plane_scene_truth(&ws, v))
+            .collect();
+        let released = fuse(&ws, maps.clone(), &FusionOptions::default());
+        assert!(!released.is_empty());
+
+        let mut kept_ws = ws.clone();
+        let mut last = kept_ws.views[0].clone();
+        last.sources = vec![0, 1, 2];
+        kept_ws.views.push(last);
+        let mut kept_maps = maps;
+        let mut no_depth = kept_maps[0].clone();
+        no_depth.depth.iter_mut().for_each(|d| *d = 0.0);
+        kept_maps.push(no_depth);
+        let kept = fuse(&kept_ws, kept_maps, &FusionOptions::default());
+        assert_eq!(released, kept);
     }
 }

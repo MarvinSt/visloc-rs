@@ -145,6 +145,12 @@ All notable changes to `visloc-rs` will be documented here.
   - **Fusion:** one agreeing source view within 15° keeps a point by
     default (ACMM asks for two views within 10°): over the 13 scenes,
     79.4% against 77.3% with two views at 30°.
+  - **Memory:** one set of depth maps at a time (a geometric pass and
+    fusion drop each map after the last view that reads it), costs only
+    with `--save-maps`, grey levels computed from the colours. On ETH3D
+    facade (76 images at 3200 px, an L4), peak memory falls from 24.2 to
+    12.0 GiB with one scale and from 28.7 to 12.4 GiB with three;
+    `fused.ply` is byte-identical on pipes (CPU and GPU).
   - **Run it:** `cargo run --release -p visloc-mvs --features gpu
     --example mvs -- --sparse <model> --images <dir> --out <dir> --gpu`.
 

@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use visloc_mvs::{
-    estimate, fuse, multi_scale_depth_maps, photometric_score, read_text_model, write_ply,
-    FusionOptions, MultiScaleOptions, PatchMatchOptions, ViewSelection, Workspace,
+    estimate, fuse, geometric_pass, multi_scale_depth_maps, photometric_score, read_text_model,
+    write_ply, FusionOptions, MultiScaleOptions, PatchMatchOptions, ViewSelection, Workspace,
     WorkspaceOptions,
 };
 
@@ -95,15 +95,26 @@ fn main() {
     });
     #[cfg(not(feature = "gpu"))]
     assert!(!use_gpu, "--gpu needs a build with --features gpu");
-    let run = |ws: &Workspace,
-               view: usize,
-               options: &PatchMatchOptions,
-               prior: Option<&[visloc_mvs::DepthMap]>| {
+    let estimate_one = |ws: &Workspace,
+                        view: usize,
+                        options: &PatchMatchOptions,
+                        prior: Option<&[visloc_mvs::DepthMap]>| {
         #[cfg(feature = "gpu")]
         if let Some(gpu) = &gpu {
             return gpu.estimate(ws, view, options, prior);
         }
         estimate(ws, view, options, prior)
+    };
+    // The costs are kept only to be saved: no pass or fusion reads them.
+    let run = |ws: &Workspace,
+               view: usize,
+               options: &PatchMatchOptions,
+               prior: Option<&[visloc_mvs::DepthMap]>| {
+        let mut map = estimate_one(ws, view, options, prior);
+        if !save_maps {
+            map.cost = Vec::new();
+        }
+        map
     };
     let score =
         |ws: &Workspace, view: usize, options: &PatchMatchOptions, map: &visloc_mvs::DepthMap| {
@@ -135,9 +146,7 @@ fn main() {
         eprintln!("photometric pass: {:.1} s", t.elapsed().as_secs_f64());
         for pass in 0..geom_passes {
             let t = Instant::now();
-            maps = (0..ws.views.len())
-                .map(|v| run(&ws, v, &pm_options, Some(&maps)))
-                .collect();
+            maps = geometric_pass(&ws, maps, &pm_options, &run);
             eprintln!(
                 "geometric pass {}: {:.1} s",
                 pass + 1,
@@ -179,7 +188,7 @@ fn main() {
     }
 
     let t = Instant::now();
-    let points = fuse(&ws, &maps, &fusion_options);
+    let points = fuse(&ws, maps, &fusion_options);
     eprintln!(
         "fusion: {} points in {:.1} s",
         points.len(),

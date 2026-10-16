@@ -70,6 +70,21 @@ ACMM samples CUDA textures. The GPU differs from the CPU path only by
 rounding: on ETH3D pipes at 400 px its F1 score is 34.44% against the
 CPU's 34.47%.
 
+**Memory.** A view keeps its colours, 3 bytes a pixel; its grey levels
+are the colours' luma, computed when the view is matched. A depth map
+keeps a depth and a normal, 16 bytes a pixel, and its costs only with
+`--save-maps` (no pass or fusion reads them). A geometric pass releases
+the previous pass's maps as it goes: a view's normals once it is
+re-estimated, its depths after the last view that uses it as a source.
+Fusion drops each map after the last view that reads it. So one set of
+maps is held at a time, not two, and the output does not change: on
+pipes, `fused.ply` is byte-identical on the CPU and the GPU, with one
+scale and with three. With the images pre-resized to 800 px (one
+iteration per pass, CPU), peak memory falls from 305 to 218 MiB with one
+scale and from 364 to 229 MiB with three. At that size glibc keeps some
+freed memory: 175 MiB with one scale under
+`MALLOC_MMAP_THRESHOLD_=131072`.
+
 ## ETH3D high-resolution benchmark
 
 Scores come from the official ETH3D multi-view evaluator

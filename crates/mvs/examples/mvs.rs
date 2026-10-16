@@ -7,6 +7,7 @@
 //!     --sparse <dir with cameras.txt/images.txt/points3D.txt> \
 //!     --images <image dir> --out <dir> [--max-image-size 3200] \
 //!     [--sources 10] [--iterations 3] [--geom-passes 1] [--scales 1] [--gpu] \
+//!     [--view-selection confidence|sampled] [--init-top-k 3] \
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 2] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 30]
 //! ```
@@ -19,7 +20,7 @@ use std::time::Instant;
 
 use visloc_mvs::{
     estimate, fuse, multi_scale_depth_maps, read_text_model, write_ply, FusionOptions,
-    MultiScaleOptions, PatchMatchOptions, Workspace, WorkspaceOptions,
+    MultiScaleOptions, PatchMatchOptions, ViewSelection, Workspace, WorkspaceOptions,
 };
 
 fn main() {
@@ -46,6 +47,14 @@ fn main() {
             "--max-image-size" => ws_options.max_image_size = Some(value().parse().unwrap()),
             "--sources" => ws_options.num_sources = value().parse().unwrap(),
             "--iterations" => pm_options.iterations = value().parse().unwrap(),
+            "--view-selection" => {
+                pm_options.view_selection = match value().as_str() {
+                    "confidence" => ViewSelection::Confidence,
+                    "sampled" => ViewSelection::Sampled,
+                    other => panic!("--view-selection: confidence or sampled, not {other}"),
+                }
+            }
+            "--init-top-k" => pm_options.init_top_k = value().parse().unwrap(),
             "--geom-passes" => geom_passes = value().parse().unwrap(),
             "--scales" => scales = value().parse().unwrap(),
             "--gpu" => use_gpu = true,

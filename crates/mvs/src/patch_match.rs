@@ -36,10 +36,31 @@ use crate::workspace::{View, Workspace};
 
 /// The cost of a view where a plane cannot be matched.
 const MAX_COST: f32 = 2.0;
+/// Draws of the view weights under [`ViewSelection::Sampled`] (ACMM's).
+const VIEW_SAMPLES: usize = 15;
+/// Marks the random streams of those draws, apart from refinement's.
+const SAMPLING_STREAM: u32 = 0x8000_0000;
 /// Most window samples a cost uses.
 const MAX_SAMPLES: usize = 64;
+/// Least total bilateral weight of a matchable reference window.
+const MIN_WEIGHT_SUM: f32 = 1e-6;
 /// Most source views per reference view.
 pub const MAX_SOURCES: usize = 32;
+
+/// How a pixel weighs the source views from its candidates' costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewSelection {
+    /// The ACMH paper's rule: a selected view weighs the mean confidence
+    /// of its good costs; the previous iteration's most important view
+    /// keeps a double weight (0.2 if it is no longer selected).
+    Confidence,
+    /// ACMM's released code: that confidence, also `exp(-tau² / 0.32)` for
+    /// a view with too few good costs but fewer than `n2` bad ones, times
+    /// a prior from the four adjacent pixels' selected views (0.9 each
+    /// that selected it, 0.1 each that did not), is a distribution the
+    /// weights are drawn from: 15 samples, a view's weight its count.
+    Sampled,
+}
 
 /// ACMH/ACMM parameters (the paper's values by default).
 #[derive(Debug, Clone)]
@@ -61,7 +82,10 @@ pub struct PatchMatchOptions {
     pub beta: f32,
     pub n1: usize,
     pub n2: usize,
-    /// A random initial plane's cost: the mean of its best this-many views.
+    pub view_selection: ViewSelection,
+    /// A random initial plane's cost: the mean of its best this-many views
+    /// (they are its first selected views under
+    /// [`ViewSelection::Sampled`]).
     pub init_top_k: usize,
     /// Geometric consistency: weight and truncation (pixels) of the
     /// reprojection error.
@@ -90,6 +114,7 @@ impl Default for PatchMatchOptions {
             beta: 0.3,
             n1: 2,
             n2: 3,
+            view_selection: ViewSelection::Confidence,
             init_top_k: 3,
             geom_lambda: 0.2,
             geom_delta: 3.0,
@@ -271,9 +296,30 @@ impl Plane {
 struct State {
     plane: Vec<Plane>,
     cost: Vec<f32>,
-    /// Index into the sources of the previous iteration's most important
-    /// view, `u8::MAX` for none.
-    best_view: Vec<u8>,
+    /// [`ViewSelection::Confidence`]: index into the sources of the
+    /// previous iteration's most important view, `u32::MAX` for none.
+    /// [`ViewSelection::Sampled`]: the selected views, bit `j` for source
+    /// `j`.
+    views: Vec<u32>,
+}
+
+/// One image row of a first state: planes, costs and view states.
+type Row = (Vec<Plane>, Vec<f32>, Vec<u32>);
+
+impl State {
+    fn from_rows(rows: Vec<Row>, len: usize) -> Self {
+        let mut state = State {
+            plane: Vec::with_capacity(len),
+            cost: Vec::with_capacity(len),
+            views: Vec::with_capacity(len),
+        };
+        for (planes, costs, views) in rows {
+            state.plane.extend(planes);
+            state.cost.extend(costs);
+            state.views.extend(views);
+        }
+        state
+    }
 }
 
 /// A source view as the reference view sees it.
@@ -341,9 +387,8 @@ struct Context<'a> {
     window: Vec<(i32, i32)>,
 }
 
-/// Per-view matching costs of up to nine planes (eight candidates and the
-/// current one).
-type CostRows = [[f32; MAX_SOURCES]; 9];
+/// Per-view matching costs of the eight candidates.
+type CostRows = [[f32; MAX_SOURCES]; 8];
 
 impl<'a> Context<'a> {
     fn new(
@@ -423,6 +468,11 @@ impl<'a> Context<'a> {
             patch.sum_w += weight;
             sum += weight * value;
             sum_sq += weight * value * value;
+        }
+        if patch.sum_w < MIN_WEIGHT_SUM {
+            // Every sample differs too much from the centre (the window
+            // skips it): nothing to match, where 0/0 would give NaN costs.
+            return patch;
         }
         patch.mean = sum / patch.sum_w;
         patch.var = sum_sq / patch.sum_w - patch.mean * patch.mean;
@@ -562,6 +612,62 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// A first plane's cost, the mean of its best `init_top_k` views'
+    /// costs, and its per-pixel view state: those views as selection bits
+    /// under [`ViewSelection::Sampled`], none (`u32::MAX`) otherwise.
+    fn initial_cost(&self, photo: &[f32; MAX_SOURCES], geo: &[f32; MAX_SOURCES]) -> (f32, u32) {
+        let n = self.sources.len();
+        let sampled = self.options.view_selection == ViewSelection::Sampled;
+        if n == 0 {
+            return (MAX_COST, if sampled { 0 } else { u32::MAX });
+        }
+        let k = self.options.init_top_k.clamp(1, n);
+        let mut total = [0.0f32; MAX_SOURCES];
+        for j in 0..n {
+            total[j] = photo[j] + geo[j];
+        }
+        let mut sorted = total;
+        sorted[..n].sort_by(f32::total_cmp);
+        let cost = sorted[..k].iter().sum::<f32>() / k as f32;
+        if !sampled {
+            return (cost, u32::MAX);
+        }
+        let threshold = sorted[k - 1];
+        let views = (0..n)
+            .filter(|&j| total[j] <= threshold)
+            .fold(0u32, |bits, j| bits | 1 << j);
+        (cost, views)
+    }
+
+    /// The weighted mean over the source views of `plane`'s costs
+    /// (photometric plus geometric), matching only the views with weight.
+    fn weighted_cost(
+        &self,
+        patch: &RefPatch,
+        (x, y): (usize, usize),
+        ray: [f32; 3],
+        plane: &Plane,
+        weights: &[f32; MAX_SOURCES],
+        weight_sum: f32,
+    ) -> f32 {
+        let geometric = |j: usize| {
+            if self.geometric {
+                let error = self.reprojection_error(&self.sources[j], x, y, ray, plane);
+                self.options.geom_lambda * error
+            } else {
+                0.0
+            }
+        };
+        (0..self.sources.len())
+            .filter(|&j| weights[j] > 0.0)
+            .map(|j| {
+                let photo = self.photometric_cost(patch, &self.sources[j], ray, plane);
+                weights[j] * (photo + geometric(j))
+            })
+            .sum::<f32>()
+            / weight_sum
+    }
+
     /// A random plane at the ray: depth uniform in the depth range, normal
     /// uniform over the directions facing the camera.
     fn random_plane(&self, rng: &mut Rng, ray: [f32; 3]) -> Plane {
@@ -571,13 +677,12 @@ impl<'a> Context<'a> {
 
     fn random_state(&self) -> State {
         let (w, h) = (self.reference.width, self.reference.height);
-        let n = self.sources.len();
-        let k = self.options.init_top_k.clamp(1, n.max(1));
-        let rows: Vec<(Vec<Plane>, Vec<f32>)> = (0..h)
+        let rows: Vec<Row> = (0..h)
             .into_par_iter()
             .map(|y| {
                 let mut planes = Vec::with_capacity(w);
                 let mut costs = Vec::with_capacity(w);
+                let mut views = Vec::with_capacity(w);
                 let (mut photo, mut geo) = ([0.0; MAX_SOURCES], [0.0; MAX_SOURCES]);
                 for x in 0..w {
                     let mut rng = Rng::new(self.options.seed, self.view_id, x, y, u32::MAX);
@@ -585,29 +690,15 @@ impl<'a> Context<'a> {
                     let plane = self.random_plane(&mut rng, ray);
                     let patch = self.ref_patch(x, y);
                     self.view_costs(&patch, (x, y), ray, &plane, (&mut photo, &mut geo));
-                    let mut total: Vec<f32> = (0..n).map(|j| photo[j] + geo[j]).collect();
-                    total.sort_by(f32::total_cmp);
-                    let cost = if n == 0 {
-                        MAX_COST
-                    } else {
-                        total[..k].iter().sum::<f32>() / k as f32
-                    };
+                    let (cost, selected) = self.initial_cost(&photo, &geo);
                     planes.push(plane);
                     costs.push(cost);
+                    views.push(selected);
                 }
-                (planes, costs)
+                (planes, costs, views)
             })
             .collect();
-        let mut state = State {
-            plane: Vec::with_capacity(w * h),
-            cost: Vec::with_capacity(w * h),
-            best_view: vec![u8::MAX; w * h],
-        };
-        for (planes, costs) in rows {
-            state.plane.extend(planes);
-            state.cost.extend(costs);
-        }
-        state
+        State::from_rows(rows, w * h)
     }
 
     /// The state of an earlier depth map, with costs recomputed under this
@@ -615,13 +706,12 @@ impl<'a> Context<'a> {
     fn state_from(&self, map: &DepthMap) -> State {
         let (w, h) = (self.reference.width, self.reference.height);
         assert_eq!((map.width, map.height), (w, h), "prior depth map size");
-        let n = self.sources.len();
-        let k = self.options.init_top_k.clamp(1, n.max(1));
-        let rows: Vec<(Vec<Plane>, Vec<f32>)> = (0..h)
+        let rows: Vec<Row> = (0..h)
             .into_par_iter()
             .map(|y| {
                 let mut planes = Vec::with_capacity(w);
                 let mut costs = Vec::with_capacity(w);
+                let mut views = Vec::with_capacity(w);
                 let (mut photo, mut geo) = ([0.0; MAX_SOURCES], [0.0; MAX_SOURCES]);
                 for x in 0..w {
                     let ray = self.ray(x, y);
@@ -634,59 +724,46 @@ impl<'a> Context<'a> {
                     };
                     let patch = self.ref_patch(x, y);
                     self.view_costs(&patch, (x, y), ray, &plane, (&mut photo, &mut geo));
-                    let mut total: Vec<f32> = (0..n).map(|j| photo[j] + geo[j]).collect();
-                    total.sort_by(f32::total_cmp);
-                    let cost = if n == 0 {
-                        MAX_COST
-                    } else {
-                        total[..k].iter().sum::<f32>() / k as f32
-                    };
+                    let (cost, selected) = self.initial_cost(&photo, &geo);
                     planes.push(plane);
                     costs.push(cost);
+                    views.push(selected);
                 }
-                (planes, costs)
+                (planes, costs, views)
             })
             .collect();
-        let mut state = State {
-            plane: Vec::with_capacity(w * h),
-            cost: Vec::with_capacity(w * h),
-            best_view: vec![u8::MAX; w * h],
-        };
-        for (planes, costs) in rows {
-            state.plane.extend(planes);
-            state.cost.extend(costs);
-        }
-        state
+        State::from_rows(rows, w * h)
     }
 
     /// Updates the pixels of one checkerboard colour (`(x + y) % 2 ==
     /// color`) from the other's current state.
     fn pass(&self, state: &mut State, iteration: usize, color: usize) {
         let (w, h) = (self.reference.width, self.reference.height);
-        let updates: Vec<Vec<(usize, Plane, f32, u8)>> = (0..h)
+        let updates: Vec<Vec<(usize, Plane, f32, u32)>> = (0..h)
             .into_par_iter()
             .map(|y| {
                 let mut row = Vec::with_capacity(w / 2 + 1);
                 let mut x = (y + color) % 2;
                 while x < w {
-                    let (plane, cost, best) = self.update_pixel(state, x, y, iteration, color);
-                    row.push((x, plane, cost, best));
+                    let (plane, cost, views) = self.update_pixel(state, x, y, iteration, color);
+                    row.push((x, plane, cost, views));
                     x += 2;
                 }
                 row
             })
             .collect();
         for (y, row) in updates.into_iter().enumerate() {
-            for (x, plane, cost, best) in row {
+            for (x, plane, cost, views) in row {
                 let i = y * w + x;
                 state.plane[i] = plane;
                 state.cost[i] = cost;
-                state.best_view[i] = best;
+                state.views[i] = views;
             }
         }
     }
 
-    /// The new plane, cost and most important view of pixel `(x, y)`.
+    /// The new plane, cost and view state (see [`State::views`]) of pixel
+    /// `(x, y)`.
     fn update_pixel(
         &self,
         state: &State,
@@ -694,12 +771,12 @@ impl<'a> Context<'a> {
         y: usize,
         iteration: usize,
         color: usize,
-    ) -> (Plane, f32, u8) {
+    ) -> (Plane, f32, u32) {
         let (w, h) = (self.reference.width, self.reference.height);
         let n = self.sources.len();
         let i = y * w + x;
         if n == 0 {
-            return (state.plane[i], MAX_COST, u8::MAX);
+            return (state.plane[i], MAX_COST, state.views[i]);
         }
         let ray = self.ray(x, y);
         let patch = self.ref_patch(x, y);
@@ -722,25 +799,23 @@ impl<'a> Context<'a> {
             candidates[region] = best.map(|(_, j)| state.plane[j]);
         }
 
-        // Per-view costs of the candidates (rows 0..8) and the current
-        // plane (row 8).
-        let mut photo: CostRows = [[MAX_COST; MAX_SOURCES]; 9];
-        let mut geo: CostRows = [[0.0; MAX_SOURCES]; 9];
+        // Per-view costs of the candidates.
+        let mut photo: CostRows = [[MAX_COST; MAX_SOURCES]; 8];
+        let mut geo: CostRows = [[0.0; MAX_SOURCES]; 8];
         for (row, candidate) in candidates.iter().enumerate() {
             if let Some(plane) = candidate {
                 self.view_costs(&patch, (x, y), ray, plane, (&mut photo[row], &mut geo[row]));
             }
         }
         let current = state.plane[i];
-        self.view_costs(&patch, (x, y), ray, &current, (&mut photo[8], &mut geo[8]));
 
         // Multi-hypothesis joint view selection over the candidates.
         let opt = self.options;
         let t = iteration as f32;
         let tau = opt.tau0 * (-t * t / opt.alpha).exp();
-        let mut weights = [0.0f32; MAX_SOURCES];
-        let previous = state.best_view[i];
-        for (j, weight) in weights.iter_mut().enumerate().take(n) {
+        // A view's votes: the candidates' good and bad costs in it, and the
+        // confidence of the good ones.
+        let votes = |j: usize| -> (usize, usize, f32) {
             let (mut good, mut bad, mut confidence) = (0usize, 0usize, 0.0f32);
             for (row, candidate) in candidates.iter().enumerate() {
                 if candidate.is_none() {
@@ -754,20 +829,70 @@ impl<'a> Context<'a> {
                     bad += 1;
                 }
             }
-            let selected = good > opt.n1 && bad < opt.n2;
-            let is_previous = previous as usize == j;
-            *weight = if selected {
-                let w0 = confidence / good as f32;
-                if is_previous {
-                    2.0 * w0
-                } else {
-                    w0
+            (good, bad, confidence)
+        };
+        let mut weights = [0.0f32; MAX_SOURCES];
+        let mut sampled_views = 0u32;
+        match opt.view_selection {
+            ViewSelection::Confidence => {
+                let previous = state.views[i];
+                for (j, weight) in weights.iter_mut().enumerate().take(n) {
+                    let (good, bad, confidence) = votes(j);
+                    let selected = good > opt.n1 && bad < opt.n2;
+                    let is_previous = previous as usize == j;
+                    *weight = if selected {
+                        let w0 = confidence / good as f32;
+                        if is_previous {
+                            2.0 * w0
+                        } else {
+                            w0
+                        }
+                    } else if is_previous {
+                        0.2
+                    } else {
+                        0.0
+                    };
                 }
-            } else if is_previous {
-                0.2
-            } else {
-                0.0
-            };
+            }
+            ViewSelection::Sampled => {
+                let mut prior = [0.0f32; MAX_SOURCES];
+                for (dx, dy) in [(0i32, -1i32), (0, 1), (-1, 0), (1, 0)] {
+                    let (sx, sy) = (x as i32 + dx, y as i32 + dy);
+                    if sx < 0 || sy < 0 || sx >= w as i32 || sy >= h as i32 {
+                        continue;
+                    }
+                    let bits = state.views[sy as usize * w + sx as usize];
+                    for (j, p) in prior.iter_mut().enumerate().take(n) {
+                        *p += if bits >> j & 1 == 1 { 0.9 } else { 0.1 };
+                    }
+                }
+                // The unnormalized distribution's running sums.
+                let mut cdf = [0.0f32; MAX_SOURCES];
+                let mut total = 0.0f32;
+                for j in 0..n {
+                    let (good, bad, confidence) = votes(j);
+                    let p = if good > opt.n1 && bad < opt.n2 {
+                        confidence / good as f32
+                    } else if bad < opt.n2 {
+                        (-tau * tau / 0.32).exp()
+                    } else {
+                        0.0
+                    };
+                    total += p * prior[j];
+                    cdf[j] = total;
+                }
+                if total > 0.0 {
+                    let pass = SAMPLING_STREAM | (iteration * 2 + color) as u32;
+                    let mut rng = Rng::new(opt.seed, self.view_id, x, y, pass);
+                    for _ in 0..VIEW_SAMPLES {
+                        let u = rng.uniform() * total;
+                        if let Some(j) = (0..n).find(|&j| cdf[j] > u) {
+                            weights[j] += 1.0;
+                            sampled_views |= 1 << j;
+                        }
+                    }
+                }
+            }
         }
         let weight_sum: f32 = weights[..n].iter().sum();
         if weight_sum <= 0.0 {
@@ -781,21 +906,30 @@ impl<'a> Context<'a> {
                 .sum::<f32>()
                 / weight_sum
         };
-        let new_best = (0..n)
-            .max_by(|&a, &b| weights[a].total_cmp(&weights[b]).then(b.cmp(&a)))
-            .map_or(u8::MAX, |j| j as u8);
 
+        // Views without weight add nothing, so the current plane and the
+        // refinement's are only matched in the others.
         let mut best_plane = current;
-        let mut best_cost = aggregate(&photo[8], &geo[8]);
+        let mut best_cost = self.weighted_cost(&patch, (x, y), ray, &current, &weights, weight_sum);
+        let mut adopted = false;
         for (row, candidate) in candidates.iter().enumerate() {
             if let Some(plane) = candidate {
                 let cost = aggregate(&photo[row], &geo[row]);
                 if cost < best_cost && plane.depth(ray).is_some() {
                     best_cost = cost;
                     best_plane = *plane;
+                    adopted = true;
                 }
             }
         }
+        let views = match opt.view_selection {
+            ViewSelection::Confidence => (0..n)
+                .max_by(|&a, &b| weights[a].total_cmp(&weights[b]).then(b.cmp(&a)))
+                .map_or(u32::MAX, |j| j as u32),
+            // As ACMM: a pixel's selection changes with its plane.
+            ViewSelection::Sampled if adopted => sampled_views,
+            ViewSelection::Sampled => state.views[i],
+        };
 
         // Refinement: a random and a perturbed depth and normal combined
         // with the current ones.
@@ -816,20 +950,18 @@ impl<'a> Context<'a> {
             (depth_now, normal_perturbed),
             (depth_perturbed, normal_perturbed),
         ];
-        let (mut photo1, mut geo1) = ([0.0; MAX_SOURCES], [0.0; MAX_SOURCES]);
         for (depth, normal) in hypotheses {
             if !(self.depth_min..=self.depth_max).contains(&depth) {
                 continue;
             }
             let plane = Plane::from_depth(depth, normal, ray);
-            self.view_costs(&patch, (x, y), ray, &plane, (&mut photo1, &mut geo1));
-            let cost = aggregate(&photo1, &geo1);
+            let cost = self.weighted_cost(&patch, (x, y), ray, &plane, &weights, weight_sum);
             if cost < best_cost {
                 best_cost = cost;
                 best_plane = plane;
             }
         }
-        (best_plane, best_cost, new_best)
+        (best_plane, best_cost, views)
     }
 
     fn depth_map(&self, state: &State) -> DepthMap {
@@ -1161,43 +1293,60 @@ mod tests {
     #[test]
     fn estimation_recovers_a_plane() {
         let ws = plane_scene();
-        let options = PatchMatchOptions {
-            iterations: 4,
-            ..PatchMatchOptions::default()
-        };
-        let map = estimate(&ws, 0, &options, None);
-        // Away from the borders (window and parallax), most pixels land
-        // within 1% of the true depth.
-        let mut inside = 0;
-        let mut good = 0;
-        for y in 8..40 {
-            for x in 12..52 {
-                inside += 1;
-                let d = map.depth[y * 64 + x];
-                if (d - 4.0).abs() < 0.04 {
-                    good += 1;
+        for view_selection in [ViewSelection::Confidence, ViewSelection::Sampled] {
+            let options = PatchMatchOptions {
+                iterations: 4,
+                view_selection,
+                ..PatchMatchOptions::default()
+            };
+            let map = estimate(&ws, 0, &options, None);
+            // Away from the borders (window and parallax), most pixels
+            // land within 1% of the true depth.
+            let mut inside = 0;
+            let mut good = 0;
+            for y in 8..40 {
+                for x in 12..52 {
+                    inside += 1;
+                    let d = map.depth[y * 64 + x];
+                    if (d - 4.0).abs() < 0.04 {
+                        good += 1;
+                    }
                 }
             }
-        }
-        assert!(
-            good * 10 >= inside * 9,
-            "{good} of {inside} pixels within 1%"
-        );
-        // Geometric consistency against the other views' maps keeps it.
-        let maps: Vec<DepthMap> = (0..3).map(|v| estimate(&ws, v, &options, None)).collect();
-        let refined = estimate(&ws, 0, &options, Some(&maps));
-        let mut good_geo = 0;
-        for y in 8..40 {
-            for x in 12..52 {
-                if (refined.depth[y * 64 + x] - 4.0).abs() < 0.04 {
-                    good_geo += 1;
+            assert!(
+                good * 10 >= inside * 9,
+                "{view_selection:?}: {good} of {inside} pixels within 1%"
+            );
+            // Geometric consistency against the other views' maps keeps it.
+            let maps: Vec<DepthMap> = (0..3).map(|v| estimate(&ws, v, &options, None)).collect();
+            let refined = estimate(&ws, 0, &options, Some(&maps));
+            let mut good_geo = 0;
+            for y in 8..40 {
+                for x in 12..52 {
+                    if (refined.depth[y * 64 + x] - 4.0).abs() < 0.04 {
+                        good_geo += 1;
+                    }
                 }
             }
+            assert!(
+                good_geo * 10 >= inside * 9,
+                "{view_selection:?}: {good_geo} of {inside} after geometric pass"
+            );
         }
-        assert!(
-            good_geo * 10 >= inside * 9,
-            "{good_geo} of {inside} after geometric pass"
-        );
+    }
+
+    #[test]
+    fn a_window_without_weight_costs_the_maximum() {
+        // A lone bright pixel: every window sample (the window skips the
+        // centre) is 255 grey levels off, so all bilateral weights vanish.
+        let mut ws = plane_scene();
+        let view = &mut ws.views[0];
+        view.gray.iter_mut().for_each(|g| *g = 0.0);
+        let (x, y) = (32, 24);
+        view.gray[y * view.width + x] = 255.0;
+        let truth = plane_scene_truth(&ws, 0);
+        let scores = photometric_score(&ws, 0, &PatchMatchOptions::default(), &truth);
+        assert_eq!(scores[y * 64 + x], MAX_COST);
     }
 
     #[test]

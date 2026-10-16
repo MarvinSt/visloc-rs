@@ -6,8 +6,12 @@
 
 const MAX_COST: f32 = 2.0;
 const MAX_SAMPLES: u32 = 64u;
+const MIN_WEIGHT_SUM: f32 = 1e-6;
 const MAX_SOURCES: u32 = 32u;
 const NO_VIEW: u32 = 0xffffffffu;
+// Draws of the sampled view weights, and the mark of their random streams.
+const VIEW_SAMPLES: u32 = 15u;
+const SAMPLING_STREAM: u32 = 0x80000000u;
 
 struct Params {
     width: u32,
@@ -38,6 +42,11 @@ struct Params {
     window_step: i32,
     sigma_spatial: f32,
     sigma_color: f32,
+    // 0: the paper's confidence weights; 1: ACMM's sampled weights.
+    view_selection: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 }
 
 // Reference camera frame to source camera frame: rows of R with t in w.
@@ -59,21 +68,22 @@ struct Source {
 @group(0) @binding(3) var<storage, read> priors: array<f32>;
 @group(0) @binding(4) var<storage, read_write> planes: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> costs: array<f32>;
+// Per pixel: the previous iteration's most important view (confidence
+// weights) or the selected views as bits (sampled weights).
 @group(0) @binding(6) var<storage, read_write> best_views: array<u32>;
 // `init`: the earlier map's (normal, depth) per pixel, depth 0 for none.
 @group(0) @binding(7) var<storage, read> init_planes: array<vec4<f32>>;
 
-// The reference window of the current pixel; sample k's offset is
-// `window_offset(k)`.
+// The reference window of the current pixel, row by row.
 var<private> patch_values: array<f32, 64>;
 var<private> patch_weights: array<f32, 64>;
 var<private> patch_n: u32;
-var<private> window_cols: u32;
 var<private> patch_center: f32;
 var<private> patch_sum_w: f32;
 var<private> patch_mean: f32;
 var<private> patch_var: f32;
 var<private> rng_state: u32;
+var<private> top_k_views: u32;
 
 fn hash(v: u32) -> u32 {
     var x = v;
@@ -115,15 +125,6 @@ fn pixel_ray(x: u32, y: u32) -> vec3<f32> {
     );
 }
 
-fn window_offset(k: u32) -> vec2<f32> {
-    let r = params.window_radius;
-    let step = max(params.window_step, 1);
-    return vec2<f32>(
-        f32(-r + i32(k % window_cols) * step),
-        f32(-r + i32(k / window_cols) * step),
-    );
-}
-
 fn load_patch(x: u32, y: u32) {
     let center = ref_gray(i32(x), i32(y));
     patch_center = center;
@@ -135,7 +136,6 @@ fn load_patch(x: u32, y: u32) {
     var sum_sq = 0.0;
     let r = params.window_radius;
     let step = max(params.window_step, 1);
-    window_cols = u32(2 * r / step) + 1u;
     for (var dy = -r; dy <= r; dy += step) {
         for (var dx = -r; dx <= r; dx += step) {
             if (n >= MAX_SAMPLES) {
@@ -153,6 +153,13 @@ fn load_patch(x: u32, y: u32) {
     }
     patch_n = n;
     patch_sum_w = sum_w;
+    if (sum_w < MIN_WEIGHT_SUM) {
+        // Every sample differs too much from the centre (the window skips
+        // it): nothing to match, where 0/0 would give NaN costs.
+        patch_mean = 0.0;
+        patch_var = 0.0;
+        return;
+    }
     patch_mean = sum / sum_w;
     patch_var = sum_sq / sum_w - patch_mean * patch_mean;
 }
@@ -210,19 +217,28 @@ fn photometric_cost(j: u32, ray: vec3<f32>, plane: vec4<f32>) -> f32 {
     var s_w = 0.0;
     var s_ww = 0.0;
     var s_rw = 0.0;
-    for (var k = 0u; k < patch_n; k++) {
-        let o = window_offset(k);
-        let p = a + o.x * bx + o.y * by;
-        if (p.z <= 0.0) {
-            return MAX_COST;
+    // The window in `load_patch`'s order, without integer division.
+    let r = params.window_radius;
+    let step = max(params.window_step, 1);
+    var k = 0u;
+    for (var dy = -r; dy <= r; dy += step) {
+        for (var dx = -r; dx <= r; dx += step) {
+            if (k >= patch_n) {
+                break;
+            }
+            let p = a + f32(dx) * bx + f32(dy) * by;
+            if (p.z <= 0.0) {
+                return MAX_COST;
+            }
+            let u = s.k.x * p.x / p.z + s.k.z;
+            let v = s.k.y * p.y / p.z + s.k.w;
+            let value = source_gray(s, u, v) - patch_center;
+            let weight = patch_weights[k];
+            s_w += weight * value;
+            s_ww += weight * value * value;
+            s_rw += weight * patch_values[k] * value;
+            k += 1u;
         }
-        let u = s.k.x * p.x / p.z + s.k.z;
-        let v = s.k.y * p.y / p.z + s.k.w;
-        let value = source_gray(s, u, v) - patch_center;
-        let weight = patch_weights[k];
-        s_w += weight * value;
-        s_ww += weight * value * value;
-        s_rw += weight * patch_values[k] * value;
     }
     let mean = s_w / patch_sum_w;
     let var_s = s_ww / patch_sum_w - mean * mean;
@@ -310,9 +326,11 @@ fn plane_from_depth(depth: f32, n: vec3<f32>, ray: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(n, depth * dot(n, ray));
 }
 
-// The mean of the best `init_top_k` per-view costs of a plane.
+// The mean of the best `init_top_k` per-view costs of a plane; those views
+// go to `top_k_views` as bits.
 fn top_k_cost(x: u32, y: u32, ray: vec3<f32>, plane: vec4<f32>) -> f32 {
     let n = params.num_sources;
+    top_k_views = 0u;
     if (n == 0u) {
         return MAX_COST;
     }
@@ -321,8 +339,10 @@ fn top_k_cost(x: u32, y: u32, ray: vec3<f32>, plane: vec4<f32>) -> f32 {
     for (var i = 0u; i < 8u; i++) {
         best[i] = 3.0e38;
     }
+    var view_costs: array<f32, 32>;
     for (var j = 0u; j < n; j++) {
         var c = photometric_cost(j, ray, plane) + geometric_cost(j, x, y, ray, plane);
+        view_costs[j] = c;
         // Insert into the sorted best k.
         for (var i = 0u; i < k; i++) {
             if (c < best[i]) {
@@ -335,6 +355,11 @@ fn top_k_cost(x: u32, y: u32, ray: vec3<f32>, plane: vec4<f32>) -> f32 {
     var sum = 0.0;
     for (var i = 0u; i < k; i++) {
         sum += best[i];
+    }
+    for (var j = 0u; j < n; j++) {
+        if (view_costs[j] <= best[k - 1u]) {
+            top_k_views |= 1u << j;
+        }
     }
     return sum / f32(k);
 }
@@ -360,7 +385,16 @@ fn init(@builtin(global_invocation_id) gid: vec3<u32>) {
     load_patch(x, y);
     planes[i] = plane;
     costs[i] = top_k_cost(x, y, ray, plane);
-    best_views[i] = NO_VIEW;
+    if (params.view_selection == 1u) {
+        best_views[i] = top_k_views;
+    } else {
+        best_views[i] = NO_VIEW;
+    }
+}
+
+// A plane's cost in source view `j`: photometric plus geometric.
+fn view_cost(j: u32, x: u32, y: u32, ray: vec3<f32>, plane: vec4<f32>) -> f32 {
+    return photometric_cost(j, ray, plane) + geometric_cost(j, x, y, ray, plane);
 }
 
 // The eight sampling regions: V shapes (7 offsets) then long strips (11),
@@ -399,7 +433,6 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = y * w + x;
     if (n == 0u) {
         costs[i] = MAX_COST;
-        best_views[i] = NO_VIEW;
         return;
     }
     let ray = pixel_ray(x, y);
@@ -439,32 +472,43 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Multi-hypothesis joint view selection, accumulated view by view.
     let previous = best_views[i];
+    let sampled = params.view_selection == 1u;
     var weights: array<f32, 32>;
     var agg_w: array<f32, 9>;
     var agg_u: array<f32, 9>;
     var weight_sum = 0.0;
     var new_best = NO_VIEW;
     var new_best_weight = 0.0;
+    // Sampled weights: each view's probability before the prior.
+    var probs: array<f32, 32>;
     let two_beta_sq = 2.0 * params.beta * params.beta;
     for (var j = 0u; j < n; j++) {
-        var row_cost: array<f32, 9>;
+        var row_cost: array<f32, 8>;
         var good = 0u;
         var bad = 0u;
         var confidence = 0.0;
-        for (var r = 0u; r < 9u; r++) {
+        for (var r = 0u; r < 8u; r++) {
             if (!valid[r]) {
                 continue;
             }
             let m = photometric_cost(j, ray, cand[r]);
-            row_cost[r] = m + geometric_cost(j, x, y, ray, cand[r]);
-            if (r < 8u) {
-                if (m < params.tau) {
-                    good += 1u;
-                    confidence += exp(-m * m / two_beta_sq);
-                } else if (m > params.tau1) {
-                    bad += 1u;
-                }
+            if (!sampled) {
+                row_cost[r] = m + geometric_cost(j, x, y, ray, cand[r]);
             }
+            if (m < params.tau) {
+                good += 1u;
+                confidence += exp(-m * m / two_beta_sq);
+            } else if (m > params.tau1) {
+                bad += 1u;
+            }
+        }
+        if (sampled) {
+            if (good > params.n1 && bad < params.n2) {
+                probs[j] = confidence / f32(good);
+            } else if (bad < params.n2) {
+                probs[j] = exp(-params.tau * params.tau / 0.32);
+            }
+            continue;
         }
         let selected = good > params.n1 && bad < params.n2;
         let is_previous = previous == j;
@@ -483,10 +527,80 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
             new_best_weight = weight;
             new_best = j;
         }
-        for (var r = 0u; r < 9u; r++) {
+        for (var r = 0u; r < 8u; r++) {
             if (valid[r]) {
                 agg_w[r] += weight * row_cost[r];
                 agg_u[r] += row_cost[r];
+            }
+        }
+        // The current plane only counts in views with weight.
+        if (weight > 0.0) {
+            agg_w[8] += weight * view_cost(j, x, y, ray, current);
+        }
+    }
+    var sampled_views = 0u;
+    if (sampled) {
+        // ACMM's: the probabilities times a prior from the four adjacent
+        // pixels' selected views, then VIEW_SAMPLES draws; the candidates
+        // are matched in the drawn views only.
+        var prior: array<f32, 32>;
+        for (var d = 0u; d < 4u; d++) {
+            var o = vec2<i32>(0, -1);
+            switch (d) {
+                case 1u: { o = vec2<i32>(0, 1); }
+                case 2u: { o = vec2<i32>(-1, 0); }
+                case 3u: { o = vec2<i32>(1, 0); }
+                default: {}
+            }
+            let sx = i32(x) + o.x;
+            let sy = i32(y) + o.y;
+            if (sx < 0 || sy < 0 || sx >= i32(w) || sy >= i32(h)) {
+                continue;
+            }
+            let bits = best_views[u32(sy) * w + u32(sx)];
+            for (var j = 0u; j < n; j++) {
+                if (((bits >> j) & 1u) == 1u) {
+                    prior[j] += 0.9;
+                } else {
+                    prior[j] += 0.1;
+                }
+            }
+        }
+        var cdf: array<f32, 32>;
+        var total = 0.0;
+        for (var j = 0u; j < n; j++) {
+            total += probs[j] * prior[j];
+            cdf[j] = total;
+        }
+        if (total > 0.0) {
+            rng_init(x, y, SAMPLING_STREAM | (params.iteration * 2u + params.color));
+            for (var sample = 0u; sample < VIEW_SAMPLES; sample++) {
+                let u = uniform01() * total;
+                for (var j = 0u; j < n; j++) {
+                    if (cdf[j] > u) {
+                        weights[j] += 1.0;
+                        sampled_views |= 1u << j;
+                        break;
+                    }
+                }
+            }
+        }
+        for (var j = 0u; j < n; j++) {
+            weight_sum += weights[j];
+        }
+        for (var j = 0u; j < n; j++) {
+            if (weight_sum > 0.0 && weights[j] <= 0.0) {
+                continue;
+            }
+            for (var r = 0u; r < 8u; r++) {
+                if (valid[r]) {
+                    let c = view_cost(j, x, y, ray, cand[r]);
+                    agg_w[r] += weights[j] * c;
+                    agg_u[r] += c;
+                }
+            }
+            if (weight_sum > 0.0) {
+                agg_w[8] += weights[j] * view_cost(j, x, y, ray, current);
             }
         }
     }
@@ -494,6 +608,9 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (uniform_weights) {
         weight_sum = f32(n);
         new_best = 0u;
+        for (var j = 0u; j < n; j++) {
+            agg_u[8] += view_cost(j, x, y, ray, current);
+        }
     }
     var best_plane = current;
     var best_cost: f32;
@@ -502,6 +619,7 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         best_cost = agg_w[8] / weight_sum;
     }
+    var adopted = false;
     for (var r = 0u; r < 8u; r++) {
         if (!valid[r]) {
             continue;
@@ -515,6 +633,7 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (c < best_cost && plane_depth(cand[r], ray) > 0.0) {
             best_cost = c;
             best_plane = cand[r];
+            adopted = true;
         }
     }
 
@@ -546,11 +665,10 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
         let plane = plane_from_depth(depth, normal, ray);
         var sum = 0.0;
         for (var j = 0u; j < n; j++) {
-            let total = photometric_cost(j, ray, plane) + geometric_cost(j, x, y, ray, plane);
             if (uniform_weights) {
-                sum += total;
-            } else {
-                sum += weights[j] * total;
+                sum += view_cost(j, x, y, ray, plane);
+            } else if (weights[j] > 0.0) {
+                sum += weights[j] * view_cost(j, x, y, ray, plane);
             }
         }
         let c = sum / weight_sum;
@@ -561,5 +679,10 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     planes[i] = best_plane;
     costs[i] = best_cost;
-    best_views[i] = new_best;
+    if (!sampled) {
+        best_views[i] = new_best;
+    } else if (adopted) {
+        // As ACMM: a pixel's selection changes with its plane.
+        best_views[i] = sampled_views;
+    }
 }

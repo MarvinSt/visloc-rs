@@ -19,7 +19,7 @@ pub use fusion::{fuse, FusedPoint, FusionOptions};
 #[cfg(feature = "gpu")]
 pub use gpu::GpuPatchMatch;
 pub use model::{read_text_model, SparseModel};
-pub use patch_match::{estimate, DepthMap, PatchMatchOptions};
+pub use patch_match::{estimate, DepthMap, PatchMatchOptions, ViewSelection};
 pub use pipeline::{multi_scale_depth_maps, MultiScaleOptions};
 pub use ply::write_ply;
 pub use workspace::{View, Workspace, WorkspaceOptions};

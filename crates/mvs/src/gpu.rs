@@ -7,7 +7,9 @@
 use bytemuck::{Pod, Zeroable};
 use visloc_gsplat_render::{GpuContext, GpuError};
 
-use crate::patch_match::{finish_depth_map, DepthMap, PatchMatchOptions, MAX_SOURCES};
+use crate::patch_match::{
+    finish_depth_map, DepthMap, PatchMatchOptions, ViewSelection, MAX_SOURCES,
+};
 use crate::workspace::Workspace;
 
 /// Uniform parameters of one dispatch (`Params` in the shader).
@@ -42,6 +44,9 @@ struct Params {
     window_step: i32,
     sigma_spatial: f32,
     sigma_color: f32,
+    /// 0: [`ViewSelection::Confidence`], 1: [`ViewSelection::Sampled`].
+    view_selection: u32,
+    pad: [u32; 3],
 }
 
 /// A source view as the shader reads it (`Source`).
@@ -213,6 +218,8 @@ impl GpuPatchMatch {
             window_step: options.window_step,
             sigma_spatial: options.sigma_spatial,
             sigma_color: options.sigma_color,
+            view_selection: u32::from(options.view_selection == ViewSelection::Sampled),
+            pad: [0; 3],
         };
         // Slot 0 for `init`, then one per (iteration, colour).
         let slots = 1 + 2 * options.iterations;
@@ -386,7 +393,7 @@ mod tests {
     use crate::patch_match::{estimate, plane_scene};
 
     /// The GPU recovers the synthetic plane like the CPU path, with and
-    /// without geometric consistency.
+    /// without geometric consistency, under either view selection.
     #[test]
     fn gpu_patch_match_recovers_a_plane() {
         let Some(ctx) = visloc_gsplat_render::try_context() else {
@@ -395,10 +402,17 @@ mod tests {
         };
         let gpu = GpuPatchMatch::with_context(ctx);
         let ws = plane_scene();
-        let options = PatchMatchOptions {
-            iterations: 4,
-            ..PatchMatchOptions::default()
-        };
+        for view_selection in [ViewSelection::Confidence, ViewSelection::Sampled] {
+            let options = PatchMatchOptions {
+                iterations: 4,
+                view_selection,
+                ..PatchMatchOptions::default()
+            };
+            check(&gpu, &ws, &options);
+        }
+    }
+
+    fn check(gpu: &GpuPatchMatch, ws: &Workspace, options: &PatchMatchOptions) {
         let within = |map: &DepthMap| {
             let mut good = 0;
             for y in 8..40 {
@@ -411,25 +425,26 @@ mod tests {
             good
         };
         let inside = 32 * 40;
-        let map = gpu.estimate(&ws, 0, &options, None);
-        let cpu = estimate(&ws, 0, &options, None);
+        let map = gpu.estimate(ws, 0, options, None);
+        let cpu = estimate(ws, 0, options, None);
         assert!(
             within(&map) * 10 >= inside * 9,
-            "GPU: {} of {inside}",
+            "GPU {:?}: {} of {inside}",
+            options.view_selection,
             within(&map)
         );
         assert!(
             within(&cpu) * 10 >= inside * 9,
-            "CPU: {} of {inside}",
+            "CPU {:?}: {} of {inside}",
+            options.view_selection,
             within(&cpu)
         );
-        let maps: Vec<DepthMap> = (0..3)
-            .map(|v| gpu.estimate(&ws, v, &options, None))
-            .collect();
-        let refined = gpu.estimate(&ws, 0, &options, Some(&maps));
+        let maps: Vec<DepthMap> = (0..3).map(|v| gpu.estimate(ws, v, options, None)).collect();
+        let refined = gpu.estimate(ws, 0, options, Some(&maps));
         assert!(
             within(&refined) * 10 >= inside * 9,
-            "GPU geometric: {}",
+            "GPU geometric {:?}: {}",
+            options.view_selection,
             within(&refined)
         );
     }

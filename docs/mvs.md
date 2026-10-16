@@ -10,7 +10,7 @@ cargo run --release -p visloc-mvs --features gpu --example mvs -- \
     --sparse <dir with cameras.txt, images.txt, points3D.txt> \
     --images <image dir> --out <dir> --gpu \
     [--max-image-size 3200] [--sources 10] [--iterations 3] \
-    [--geom-passes 2] [--scales 1]
+    [--geom-passes 2] [--scales 1] [--view-selection confidence|sampled]
 ```
 
 The image names in `images.txt` are relative to `--images`. The cameras must
@@ -33,11 +33,16 @@ from the paper:
   `0.8 exp(-t² / 90)` (`t` the iteration) and fewer than `n2 = 3` above
   1.2. Its weight is the mean of `exp(-m² / (2 · 0.3²))` over its good
   costs. The previous iteration's most important view keeps a double
-  weight.
+  weight. `--view-selection sampled` follows ACMM's released code
+  instead: those weights, times a prior from the four adjacent pixels'
+  selected views, are a distribution that 15 draws sample, and a view's
+  weight is its count. Views without weight are not matched.
 - **Refinement.** A random and a perturbed depth and normal, combined with
   the current ones into six more planes.
 - **Matching cost.** One minus a bilateral-weighted NCC over every other row
-  and column of an 11×11 window, warped by the plane's homography.
+  and column of an 11×11 window, warped by the plane's homography. The
+  window skips its centre, so where every sample's grey level is far from
+  the centre's, all the weights vanish and the pixel does not match.
 - **Geometric consistency** (`--geom-passes`). Further passes start from the
   previous depth maps and add 0.2 times each source view's
   forward-backward reprojection error, truncated at 3 pixels.

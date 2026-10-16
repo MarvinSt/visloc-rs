@@ -8,13 +8,14 @@
 //!     --images <image dir> --out <dir> [--max-image-size 3200] \
 //!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 1] [--gpu] \
 //!     [--view-selection confidence|sampled] [--init-top-k 3] [--detail-threshold 0.1] \
-//!     [--planar-prior] [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
+//!     [--no-planar-prior] [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 15]
 //! ```
 //!
-//! `--scales 3` runs ACMM's multi-scale scheme; `--planar-prior` adds ACMP's
-//! planar prior pass between the photometric and the geometric passes (one
-//! scale); `--gpu` (a `--features gpu` build) runs PatchMatch on the GPU.
+//! With one scale, ACMP's planar prior pass runs between the photometric
+//! and the geometric passes (`--no-planar-prior` leaves it out); `--scales 3`
+//! runs ACMM's multi-scale scheme instead, without it; `--gpu` (a
+//! `--features gpu` build) runs PatchMatch on the GPU.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -40,7 +41,7 @@ fn main() {
     let mut save_depth = false;
     let mut save_maps = false;
     let mut load_maps = false;
-    let mut planar_prior = false;
+    let mut planar_prior = None;
     let prior_options = PlanarPriorOptions::default();
     let mut fusion_options = fusion_options;
     let mut args = std::env::args().skip(1);
@@ -65,7 +66,8 @@ fn main() {
             "--scales" => scales = value().parse().unwrap(),
             "--detail-threshold" => detail_threshold = Some(value().parse().unwrap()),
             "--gpu" => use_gpu = true,
-            "--planar-prior" => planar_prior = true,
+            "--planar-prior" => planar_prior = Some(true),
+            "--no-planar-prior" => planar_prior = Some(false),
             "--save-depth" => save_depth = true,
             "--save-maps" => save_maps = true,
             "--load-maps" => load_maps = true,
@@ -79,10 +81,12 @@ fn main() {
     let sparse = sparse.expect("--sparse is required");
     let images = images.expect("--images is required");
     let out = out.expect("--out is required");
+    // The planar prior pass runs with one scale (by default).
     assert!(
-        !(planar_prior && scales > 1),
+        !(planar_prior == Some(true) && scales > 1),
         "--planar-prior runs with one scale"
     );
+    let planar_prior = planar_prior.unwrap_or(scales == 1);
     std::fs::create_dir_all(&out).expect("creating the output directory");
 
     let started = Instant::now();

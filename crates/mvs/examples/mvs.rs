@@ -9,7 +9,7 @@
 //!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 1] [--gpu] \
 //!     [--view-selection confidence|sampled] [--init-top-k 3] [--detail-threshold 0.1] \
 //!     [--no-planar-prior] [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
-//!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 15]
+//!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 10]
 //! ```
 //!
 //! With one scale, ACMP's planar prior pass runs between the photometric

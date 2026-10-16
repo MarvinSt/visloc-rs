@@ -238,7 +238,7 @@ pub fn estimate(
 }
 
 /// ACMP's planar prior assisted pass for `ws.views[view]`, from photometric
-/// consistency and `prior` (see [`crate::planar_prior`]). It starts from
+/// consistency and `prior` (see [`mod@crate::planar_prior`]). It starts from
 /// `start`, the view's photometric depth map with its costs, except where
 /// `prior` has a plane and the start's cost is not credible: there it
 /// starts from the prior plane. Where a pixel has a prior, hypotheses are

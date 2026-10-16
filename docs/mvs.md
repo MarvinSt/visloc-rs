@@ -10,7 +10,8 @@ cargo run --release -p visloc-mvs --features gpu --example mvs -- \
     --sparse <dir with cameras.txt, images.txt, points3D.txt> \
     --images <image dir> --out <dir> --gpu \
     [--max-image-size 3200] [--sources 10] [--iterations 3] \
-    [--geom-passes 2] [--scales 1] [--view-selection confidence|sampled]
+    [--geom-passes 2] [--scales 1] [--no-planar-prior] \
+    [--view-selection confidence|sampled]
 ```
 
 The image names in `images.txt` are relative to `--images`. The cameras must
@@ -43,6 +44,19 @@ from the paper:
   and column of an 11×11 window, warped by the plane's homography. The
   window skips its centre, so where every sample's grey level is far from
   the centre's, all the weights vanish and the pixel does not match.
+- **Planar prior** (ACMP: Q. Xu and W. Tao, "Planar Prior Assisted
+  PatchMatch Multi-View Stereo", AAAI 2020; with one scale by default,
+  `--no-planar-prior` leaves it out). After the photometric pass, each
+  view's credible pixels (the lowest-cost pixel of each 5×5 block, if its
+  cost is below 0.1) are triangulated in the image (Delaunay). The three
+  back-projected corners of each triangle span the plane that is the
+  prior of the pixels inside it. A planar prior pass then starts from the
+  photometric map, or from the prior where the cost is not credible, and
+  ranks a pixel's hypotheses by
+  `exp(-c²/0.18) · (0.5 + exp(-Δd²/(2σd²)) · exp(-Δθ²/(2σθ²)))`: `c` the
+  cost, `Δd` and `Δθ` the depth and normal angle to the prior, `σd` 1/64 of
+  the depth range, `σθ` 5°. Where weak texture leaves the costs unable to
+  tell planes apart, the hypothesis closest to the prior wins.
 - **Geometric consistency** (`--geom-passes`, 2 by default). Further
   passes start from the previous depth maps and add 0.2 times each source
   view's forward-backward reprojection error, truncated at 3 pixels.
@@ -51,15 +65,16 @@ from the paper:
   and kept where a photometric pass at the finer scale does not beat them
   by more than 0.1 (the detail restorer), then refined by geometric passes.
   On ETH3D it helps weakly textured scenes and costs accuracy on detailed
-  ones (below); the example runs one scale by default.
+  ones (below); the example runs one scale by default, and multi-scale
+  runs without the planar prior.
 - **Source views and depth ranges.** Up to 10 source views per image by
   MVSNet's score over the shared sparse points (a Gaussian in the
   triangulation angle around 5°). The depth range comes from the image's
   sparse points: COLMAP's 1% and 99% quantiles, widened by 25%.
 - **Fusion.** A pixel's 3D point is kept when a source view agrees within
-  2 pixels of reprojection error, 1% of relative depth and 15° of normal
+  2 pixels of reprojection error, 1% of relative depth and 10° of normal
   angle; the agreeing pixels are averaged into one point and not used
-  again. ACMM's code asks for two agreeing views (and 10°): with these
+  again. ACMM's and ACMP's code ask for two agreeing views: with these
   depth maps one view scores higher (below), and `--min-consistent 2`
   restores two.
 
@@ -102,61 +117,70 @@ camera poses (`dslr_calibration_undistorted`).
 
 ### All 13 training scenes on a GPU
 
-One run on an NVIDIA L4 pod at commit `3f05992` with what are now the
+One run on an NVIDIA L4 pod at commit `21b6596` with what are now the
 example's defaults: images at 3200 px, 10 source views, three iterations
-per pass, one scale and two geometric passes. The depth maps were fused
-four ways. F1, accuracy and completeness are for the default fusion (one
-agreeing source view within 15°); the other columns are the F1 of the
-same maps fused with 10°, with 30°, and with two agreeing views at 30°.
-Times cover the whole `mvs` run: loading, depth maps, the default fusion
-and writing the cloud.
+per pass, one scale, the photometric pass, the planar prior pass and two
+geometric passes. The depth maps were fused four ways. F1, accuracy and
+completeness are for the default fusion (one agreeing source view within
+10°); the other columns are the F1 of the run before the planar prior
+(commit `3f05992`, the same fusion) and of the same maps fused with 15°
+and with two agreeing views at 30°. Times cover the whole `mvs` run:
+loading, depth maps, a fusion and writing the cloud and the maps.
 
-| Scene | Images | F1 | Accuracy | Completeness | F1, 10° | F1, 30° | F1, two views | Time |
+| Scene | Images | F1 | Accuracy | Completeness | F1 without the prior | F1, 15° | F1, two views | Time |
 |---|---|---|---|---|---|---|---|---|
-| pipes | 14 | 78.0% | 90.4% | 68.6% | 78.0% | 77.2% | 70.5% | 1:42 |
-| meadow | 15 | 61.5% | 89.6% | 46.8% | 60.4% | 62.5% | 57.5% | 2:27 |
-| terrace | 23 | 88.7% | 93.9% | 84.1% | 88.8% | 88.4% | 87.8% | 3:09 |
-| office | 26 | 70.4% | 70.3% | 70.5% | 71.3% | 67.8% | 69.7% | 3:28 |
-| kicker | 31 | 75.1% | 80.1% | 70.6% | 75.4% | 73.6% | 72.4% | 4:34 |
-| relief | 31 | 87.5% | 91.6% | 83.8% | 87.7% | 86.5% | 86.9% | 4:33 |
-| relief 2 | 31 | 86.7% | 89.6% | 84.0% | 86.9% | 85.9% | 85.0% | 4:28 |
-| courtyard | 38 | 88.7% | 89.1% | 88.2% | 88.5% | 88.5% | 86.0% | 5:12 |
-| playground | 38 | 67.5% | 77.0% | 60.1% | 67.4% | 67.0% | 65.6% | 5:33 |
-| terrains | 42 | 89.4% | 89.3% | 89.5% | 89.7% | 88.9% | 88.8% | 6:17 |
-| delivery area | 44 | 87.5% | 86.4% | 88.7% | 87.8% | 86.7% | 85.9% | 5:48 |
-| electro | 45 | 86.8% | 94.3% | 80.4% | 86.7% | 86.4% | 85.3% | 6:01 |
-| facade | 76 | 65.0% | 74.9% | 57.3% | 64.9% | 64.6% | 63.3% | 11:40 |
+| pipes | 14 | 81.3% | 93.8% | 71.8% | 78.0% | 81.2% | 73.7% | 1:54 |
+| meadow | 15 | 64.2% | 90.7% | 49.7% | 60.4% | 64.9% | 60.3% | 2:49 |
+| terrace | 23 | 90.0% | 95.4% | 85.3% | 88.8% | 89.9% | 89.3% | 3:48 |
+| office | 26 | 78.5% | 79.1% | 77.9% | 71.3% | 77.6% | 76.9% | 3:59 |
+| kicker | 31 | 77.6% | 77.9% | 77.3% | 75.4% | 76.8% | 75.6% | 5:33 |
+| relief | 31 | 87.9% | 92.4% | 83.9% | 87.7% | 87.5% | 87.1% | 5:30 |
+| relief 2 | 31 | 87.0% | 90.4% | 83.9% | 86.9% | 86.7% | 85.0% | 5:12 |
+| courtyard | 38 | 89.2% | 89.9% | 88.4% | 88.5% | 89.3% | 86.6% | 6:18 |
+| playground | 38 | 67.6% | 78.8% | 59.3% | 67.4% | 67.7% | 65.9% | 6:36 |
+| terrains | 42 | 91.4% | 91.4% | 91.4% | 89.7% | 91.2% | 90.8% | 7:23 |
+| delivery area | 44 | 89.7% | 88.8% | 90.6% | 87.8% | 89.3% | 87.5% | 6:48 |
+| electro | 45 | 88.8% | 95.9% | 82.6% | 86.7% | 88.8% | 87.5% | 7:14 |
+| facade | 76 | 65.5% | 76.3% | 57.3% | 64.9% | 65.5% | 64.0% | 14:17 |
 
-- **Mean over the 13 scenes:** F1 79.4%, accuracy 85.9%, completeness
-  74.8%. Over the same 13 scenes at 2 cm, ACMM reports F1 78.86%
-  (accuracy 90.67%, completeness 70.42%) and COLMAP 67.66% (91.85%,
-  55.13%) (arXiv 2303.09758, 2210.07582).
-- **The fusion rule makes the difference.** Fused with two agreeing views,
-  the same depth maps score 77.3% (accuracy 89.5%, completeness 69.1%):
-  about ACMM's balance of accuracy and completeness, 1.6 points below its
-  F1. One view scores higher on every scene, by 0.6 (relief) to 7.5
-  points (pipes).
-- **The angle:** 15° beats 30° (78.8%) on 12 of the 13 scenes. 10° scores
-  79.5% (accuracy 88.0%, completeness 73.5%), higher on seven scenes and
-  lower on six, from −1.1 points (meadow) to +1.0 (office); 15° stays the
-  default.
-- **Time:** 65 minutes for all 13 scenes, from 1:42 (14 images) to 11:40
-  (76 images). On facade the photometric pass takes 3:11, the geometric
-  passes 3:08 and 2:48, and the fusion on the CPU 2:13. Peak memory
-  24.2 GiB (facade), 12.0 GiB since the maps are released as they go
-  (Memory, above).
-- **Against the first full-resolution run** (commit `cf329e2`, before the
-  NaN fix, the skipped unweighted views and the texture sampling; fused
-  with two views at 30°): the two-view F1 agrees within 0.1 point on each
-  of the 12 scenes that run covered, and they took 53 minutes instead of
-  99.
+- **Mean over the 13 scenes:** F1 81.4%, accuracy 87.7%, completeness
+  76.9%. Over the same scenes at 2 cm, ACMMP reports F1 83.42%, ACMP
+  79.79%, ACMM 78.86% (accuracy 90.67%, completeness 70.42%) and COLMAP
+  67.66% (91.85%, 55.13%) (arXiv 2303.09758, 2210.07582); later methods
+  reach 84 to 89% (arXiv 2503.13721).
+- **The planar prior raises F1 on all 13 scenes,** from 79.5% to 81.4%
+  on average. It adds the most in weak texture, on office (+7.2 points),
+  meadow (+3.8) and pipes (+3.4), and 0.1 to 0.3 points on the detailed
+  relief scenes and playground. Completeness rises from 73.5% to 76.9% at
+  about the same accuracy (88.0%, 87.7%).
+- **The angle:** 10° and 15° are close (81.3% at 15°); 10° is higher on
+  eight scenes and lower on three, and it is ACMM's and ACMP's angle, so
+  it is now the default. 30° scores 80.6%. Two agreeing views at 30°
+  score 79.3% (accuracy 89.0%, completeness 72.5%).
+- **Time:** 77 minutes for all 13 scenes (65 without the planar prior),
+  from 1:54 (14 images) to 14:17 (76 images). On facade the photometric
+  pass takes 2:56, the planar prior pass 3:19, the geometric passes 2:35
+  each and the fusion on the CPU 2:17. Peak memory 13.3 GiB (facade;
+  `--save-maps` keeps the costs).
+
+### Without the planar prior
+
+The run before the planar prior (commit `3f05992`, otherwise the same,
+fused with 15°) scored F1 79.4% (accuracy 85.9%, completeness 74.8%) in
+65 minutes; 77.3% with two views at 30°. Its peak memory was 24.2 GiB
+on facade, 12.0 GiB since the maps are released as they go (Memory,
+above). Against the first full-resolution run (commit `cf329e2`, before
+the NaN fix, the skipped unweighted views and the texture sampling), the
+two-view F1 agrees within 0.1 point on each of the 12 scenes that run
+covered, which took 53 minutes instead of 99.
 
 ### Multi-scale
 
 The same scenes with ACMM's three scales (`--scales 3`), two geometric
-passes at each, at commit `33b7418`, whose PatchMatch code is that of
-`3f05992`. F1, accuracy and completeness are for the default fusion; the
-single-scale F1 from the table above is repeated for comparison.
+passes at each and no planar prior, at commit `33b7418`, whose PatchMatch
+code is that of `3f05992`. F1, accuracy and completeness are for one
+agreeing view within 15°; the last F1 column is the single-scale run
+without the prior, with the same fusion.
 
 | Scene | Images | F1 | Accuracy | Completeness | F1, one scale | Time |
 |---|---|---|---|---|---|---|
@@ -200,8 +224,8 @@ two adds far more completeness than it costs accuracy:
 On pipes at 1600 px, one view takes completeness from 51.1% to 65.4% and
 accuracy from 96.9% to 90.7%. On pipes at 800 px, a stricter depth
 (0.5%) or reprojection (1 px) check, or dropping pixels by matching cost,
-only lowered F1. At 3200 px (above) a tighter normal check pays: 15°
-beats 30°, and on the multi-scale maps 30° beats no check.
+only lowered F1. At 3200 px (above) a tighter normal check pays: 10° and
+15° beat 30°, and on the multi-scale maps 30° beats no check.
 
 ### Local runs on pipes (CPU)
 

@@ -3,8 +3,9 @@
 //!
 //! The input is a COLMAP sparse model with pinhole cameras (undistorted
 //! images) and its images ([`model`], [`workspace`]). Depth estimation is
-//! ACMH with ACMM's geometric consistency (Xu and Tao, CVPR 2019); fusion
-//! keeps the points that enough source views agree on.
+//! ACMH with ACMP's planar prior ([`mod@planar_prior`]) and ACMM's geometric
+//! consistency (Xu and Tao, AAAI 2020 and CVPR 2019); fusion keeps the
+//! points that enough source views agree on.
 
 pub mod fusion;
 #[cfg(feature = "gpu")]

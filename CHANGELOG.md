@@ -131,20 +131,26 @@ All notable changes to `visloc-rs` will be documented here.
 
 - **Multi-view stereo: `visloc-mvs`.** Dense point clouds from a COLMAP
   sparse model with undistorted images: PatchMatch depth and normal maps
-  (ACMH, with ACMM's geometric consistency and multi-scale scheme), fused
-  into `fused.ply`, on the CPU or on the GPU through wgpu
-  (`--features gpu`). Details and scores in `docs/mvs.md`.
+  (ACMH, with ACMP's planar prior and ACMM's geometric consistency and
+  multi-scale scheme), fused into `fused.ply`, on the CPU or on the GPU
+  through wgpu (`--features gpu`). Details and scores in `docs/mvs.md`.
   - **ETH3D high-res training, all 13 scenes at 3200 px, one NVIDIA L4:**
-    F1 79.4% at 2 cm on average (accuracy 85.9%, completeness 74.8%) with
-    the example's defaults (one scale, two geometric passes). ACMM reports
-    78.86% and COLMAP 67.66% on the same scenes. ACMM's multi-scale scheme
-    (`--scales 3`) scores 78.0%: it helps weakly textured scenes and costs
-    accuracy on detailed ones.
-  - **Time:** 65 minutes for all 13 scenes, 1:42 to 11:40 per scene,
-    loading and fusion included.
-  - **Fusion:** one agreeing source view within 15° keeps a point by
-    default (ACMM asks for two views within 10°): over the 13 scenes,
-    79.4% against 77.3% with two views at 30°.
+    F1 81.4% at 2 cm on average (accuracy 87.7%, completeness 76.9%) with
+    the example's defaults (one scale, the planar prior pass, two
+    geometric passes). On the same scenes ACMMP reports 83.42%, ACMP
+    79.79%, ACMM 78.86% and COLMAP 67.66%.
+  - **Planar prior** (ACMP): credible pixels are triangulated into
+    planes that a prior pass favours where the costs cannot tell planes
+    apart. It raises F1 on all 13 scenes, from 79.5% to 81.4%, most on
+    office (+7.2 points), meadow (+3.8) and pipes (+3.4);
+    `--no-planar-prior` leaves it out. ACMM's multi-scale scheme
+    (`--scales 3`, without the prior) scores 78.0%: it helps weakly
+    textured scenes and costs accuracy on detailed ones.
+  - **Time:** 77 minutes for all 13 scenes, 1:54 to 14:17 per scene,
+    loading and fusion included (65 minutes without the planar prior).
+  - **Fusion:** one agreeing source view within 10° keeps a point by
+    default (ACMM and ACMP ask for two): over the 13 scenes, 81.4%
+    against 79.3% with two views at 30°.
   - **Memory:** one set of depth maps at a time (a geometric pass and
     fusion drop each map after the last view that reads it), costs only
     with `--save-maps`, grey levels computed from the colours. On ETH3D

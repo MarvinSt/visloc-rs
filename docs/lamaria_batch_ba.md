@@ -81,12 +81,18 @@ Official evaluator, one training sequence per track so far. The VIO and
 mapper columns are the per-device-refined runs of
 [`lamaria_drift_analysis.md`](lamaria_drift_analysis.md#with-the-online-mapper).
 The batch BA starts from that VIO trajectory and uses the factory camera rig.
+On sequence_4_10 the VIO is the low-light configuration (0.5 px KLT
+threshold) and the BA's SIFT runs on CLAHE-equalized images. The mean uses
+the BA without revisits.
 
 | Sequence | Track | Device | VIO | VIO + mapper | Batch BA | + revisits |
 |---|---|---|---:|---:|---:|---:|
 | sequence_1_19 | Short | 1WM09370081264 | 71.96 | 68.54 | **83.96** | — |
 | sequence_2_11 | Medium | 1WM093701G1276 | 49.68 | **55.51** | 52.29 | 54.41 |
 | sequence_3_17 | Long | 1WM093701G1276 | **50.06** | 46.68 | 49.59 | — |
+| sequence_4_10 | Low light | 1WM093701G1276 | 39.00 | 36.65 | **44.28** | — |
+| sequence_5_11 | Moving platform | 1WM093701G1276 | 43.14 | 49.84 | **55.70** | — |
+| **Mean** | | | 50.77 | 51.44 | **57.16** | |
 
 The same runs against the pseudo-GT:
 
@@ -98,9 +104,15 @@ The same runs against the pseudo-GT:
 | sequence_2_11 | Sim(3) RMSE | 2.31 m | **1.92 m** | 1.96 m |
 | sequence_3_17 | Pose recall at 1 m | **24.7 %** | 21.7 % | 15.2 % |
 | sequence_3_17 | Sim(3) RMSE | **2.07 m** | 2.48 m | 2.08 m |
-| all three | RMSE of 60 s segments, each Sim(3)-aligned | 0.151 / 0.264 / 0.182 m | | **0.127 / 0.221 / 0.148 m** |
+| sequence_4_10 | Pose recall at 1 m | 14.1 % | | **18.7 %** |
+| sequence_4_10 | Sim(3) RMSE | 3.11 m | | **2.53 m** |
+| the four above | RMSE of 60 s segments, each Sim(3)-aligned | 0.151 / 0.264 / 0.182 / 0.381 m | | **0.127 / 0.221 / 0.148 / 0.340 m** |
 
-The batch BA is the most accurate locally on every sequence. On
+On sequence_5_11 (no pseudo-GT) the BA improves 11 of its 14 CPs, for example AA2976
+from 0.94 m to 0.17 m, and halves the fitted scale drift (−5.4 % → −2.9 %). PB2, the
+only CP before the funicular ride, stays 19 m off.
+
+The batch BA is the most accurate locally on every sequence with pseudo-GT. On
 sequence_1_19 it also removes the slow drift: fitting a heading and a scale
 drift to its CP residuals leaves −0.06° and −0.6 % over the CP span, and the
 remaining CP errors do not follow a smooth drift. On the two sequences of

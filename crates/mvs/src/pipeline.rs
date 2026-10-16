@@ -47,6 +47,49 @@ pub type Estimator<'a> =
 /// [`crate::patch_match::photometric_score`] or the GPU's equivalent.
 pub type Scorer<'a> = dyn Fn(&Workspace, usize, &PatchMatchOptions, &DepthMap) -> Vec<f32> + 'a;
 
+/// One geometric pass: the depth map of every view of `ws` re-estimated by
+/// `estimate` against `earlier`, the previous pass's maps (indexed like
+/// `ws.views`), each view starting from its own earlier map.
+///
+/// The earlier maps are released as the pass goes, so it holds about one
+/// set of maps rather than two: their costs at the start, a view's normals
+/// once it is re-estimated, and a view's depths once the last view using
+/// them (itself or as a source) is. So `estimate` may read, for its view,
+/// the earlier depths of the view and of its sources and the view's own
+/// earlier normals, nothing else.
+pub fn geometric_pass(
+    ws: &Workspace,
+    mut earlier: Vec<DepthMap>,
+    options: &PatchMatchOptions,
+    estimate: &Estimator<'_>,
+) -> Vec<DepthMap> {
+    let n = ws.views.len();
+    assert_eq!(earlier.len(), n, "one earlier depth map per view");
+    // Per view, the views whose earlier depths it is the last to read.
+    let mut last_reader: Vec<usize> = (0..n).collect();
+    for (v, view) in ws.views.iter().enumerate() {
+        for &s in &view.sources {
+            last_reader[s] = last_reader[s].max(v);
+        }
+    }
+    let mut last_read_by: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (s, &v) in last_reader.iter().enumerate() {
+        last_read_by[v].push(s);
+    }
+    for map in &mut earlier {
+        map.cost = Vec::new();
+    }
+    let mut maps = Vec::with_capacity(n);
+    for v in 0..n {
+        maps.push(estimate(ws, v, options, Some(&earlier)));
+        earlier[v].normal = Vec::new();
+        for &s in &last_read_by[v] {
+            earlier[s].depth = Vec::new();
+        }
+    }
+    maps
+}
+
 /// Depth maps of every view of `ws` (at its resolution), estimated coarse
 /// to fine by `estimate`, with `score` judging the details to restore.
 /// `log` receives a line per stage.
@@ -58,23 +101,24 @@ pub fn multi_scale_depth_maps(
     log: &mut dyn FnMut(&str),
 ) -> Vec<DepthMap> {
     let scales = options.scales.max(1);
-    // levels[0] is the coarsest.
-    let mut levels = vec![ws.clone()];
+    // The coarser levels, coarsest first; `ws` is the finest. Each is
+    // dropped once the next finer one has been restored from it.
+    let mut coarser: Vec<Workspace> = Vec::with_capacity(scales - 1);
     for _ in 1..scales {
-        let finer = levels.last().expect("one level");
-        levels.push(downscale(finer));
+        let finer = coarser.last().unwrap_or(ws);
+        coarser.push(downscale(finer));
     }
-    levels.reverse();
+    coarser.reverse();
+    let mut coarser = coarser.into_iter();
+    // The current level, `None` for `ws`.
+    let mut current = coarser.next();
     let pm = &options.patch_match;
-    let all = |ws: &Workspace, prior: Option<&[DepthMap]>| -> Vec<DepthMap> {
-        (0..ws.views.len())
-            .map(|v| estimate(ws, v, pm, prior))
-            .collect()
-    };
 
-    let coarsest = &levels[0];
+    let coarsest = current.as_ref().unwrap_or(ws);
     let started = std::time::Instant::now();
-    let mut maps = all(coarsest, None);
+    let mut maps: Vec<DepthMap> = (0..coarsest.views.len())
+        .map(|v| estimate(coarsest, v, pm, None))
+        .collect();
     log(&format!(
         "scale 0 ({}x{}): photometric {:.1} s",
         coarsest.views[0].width,
@@ -83,7 +127,7 @@ pub fn multi_scale_depth_maps(
     ));
     for pass in 0..options.geom_passes {
         let t = std::time::Instant::now();
-        maps = all(coarsest, Some(&maps));
+        maps = geometric_pass(coarsest, maps, pm, estimate);
         log(&format!(
             "scale 0: geometric {} {:.1} s",
             pass + 1,
@@ -91,20 +135,25 @@ pub fn multi_scale_depth_maps(
         ));
     }
     for level in 1..scales {
-        let coarse = &levels[level - 1];
-        let fine = &levels[level];
+        let next = coarser.next();
+        let coarse = current.as_ref().unwrap_or(ws);
+        let fine = next.as_ref().unwrap_or(ws);
         let t = std::time::Instant::now();
-        // View by view, so only one photometric map is held at a time.
+        // View by view, so only one photometric map is held at a time, and
+        // each coarse map is dropped once upsampled.
         let mut replaced = 0usize;
         let mut total = 0usize;
-        let restored: Vec<DepthMap> = (0..fine.views.len())
-            .map(|v| {
-                let upsampled = upsample(&maps[v], &coarse.views[v], &fine.views[v]);
+        let restored: Vec<DepthMap> = maps
+            .into_iter()
+            .enumerate()
+            .map(|(v, coarse_map)| {
+                let upsampled = upsample(&coarse_map, &coarse.views[v], &fine.views[v]);
+                drop(coarse_map);
                 let photometric = estimate(fine, v, pm, None);
                 let upsampled_scores = score(fine, v, pm, &upsampled);
                 let photometric_scores = score(fine, v, pm, &photometric);
                 let (map, count) = restore_details(
-                    &upsampled,
+                    upsampled,
                     &upsampled_scores,
                     &photometric,
                     &photometric_scores,
@@ -123,9 +172,11 @@ pub fn multi_scale_depth_maps(
             t.elapsed().as_secs_f64()
         ));
         maps = restored;
+        current = next;
+        let fine = current.as_ref().unwrap_or(ws);
         for pass in 0..options.geom_passes {
             let t = std::time::Instant::now();
-            maps = all(fine, Some(&maps));
+            maps = geometric_pass(fine, maps, pm, estimate);
             log(&format!(
                 "scale {level}: geometric {} {:.1} s",
                 pass + 1,
@@ -202,6 +253,8 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
             1.0,
         ]
     };
+    // Costs carry over where `map` has them.
+    let with_costs = !map.cost.is_empty();
     // Per row: depths, normals, costs.
     type Row = (Vec<f32>, Vec<[f32; 3]>, Vec<f32>);
     let rows: Vec<Row> = (0..fh)
@@ -209,15 +262,20 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
         .map(|y| {
             let mut depth = vec![0.0f32; fw];
             let mut normal = vec![[0.0f32; 3]; fw];
-            let mut cost = vec![2.0f32; fw];
+            let mut cost = if with_costs {
+                vec![2.0f32; fw]
+            } else {
+                Vec::new()
+            };
             for x in 0..fw {
                 let fine_ray = ray(fine, x as f32 + 0.5, y as f32 + 0.5);
                 let gray = fine.gray[y * fw + x];
                 // The fine pixel's centre in coarse pixel coordinates.
                 let (cxf, cyf) = ((x as f32 + 0.5) * sx - 0.5, (y as f32 + 0.5) * sy - 0.5);
                 let (ci, cj) = (cxf.round() as i32, cyf.round() as i32);
-                // (weight, depth here, normal, cost) of the best plane.
-                let mut best: Option<(f32, f32, [f32; 3], f32)> = None;
+                // (weight, depth here, normal, coarse pixel) of the best
+                // plane.
+                let mut best: Option<(f32, f32, [f32; 3], usize)> = None;
                 for dj in -RADIUS..=RADIUS {
                     for di in -RADIUS..=RADIUS {
                         let (qi, qj) = (ci + di, cj + dj);
@@ -250,14 +308,16 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
                             - dg * dg / (2.0 * SIGMA_COLOR * SIGMA_COLOR))
                             .exp();
                         if best.is_none_or(|(best_w, ..)| w > best_w) {
-                            best = Some((w, depth_here, n, map.cost[q]));
+                            best = Some((w, depth_here, n, q));
                         }
                     }
                 }
-                if let Some((_, d, n, c)) = best {
+                if let Some((_, d, n, q)) = best {
                     depth[x] = d;
                     normal[x] = n;
-                    cost[x] = c;
+                    if with_costs {
+                        cost[x] = map.cost[q];
+                    }
                 }
             }
             (depth, normal, cost)
@@ -268,7 +328,7 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
         height: fh,
         depth: Vec::with_capacity(fw * fh),
         normal: Vec::with_capacity(fw * fh),
-        cost: Vec::with_capacity(fw * fh),
+        cost: Vec::with_capacity(if with_costs { fw * fh } else { 0 }),
     };
     for (d, n, c) in rows {
         out.depth.extend(d);
@@ -283,26 +343,32 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
 /// exceeds the photometric estimate's by more than `threshold`. Returns the
 /// map and how many pixels it replaced.
 fn restore_details(
-    upsampled: &DepthMap,
+    mut upsampled: DepthMap,
     init_scores: &[f32],
     photometric: &DepthMap,
     photo_scores: &[f32],
     threshold: f32,
 ) -> (DepthMap, usize) {
-    let mut out = upsampled.clone();
+    // Costs only where both maps have them.
+    if photometric.cost.is_empty() {
+        upsampled.cost = Vec::new();
+    }
+    let with_costs = !upsampled.cost.is_empty();
     let mut replaced = 0usize;
-    for i in 0..out.depth.len() {
+    for i in 0..upsampled.depth.len() {
         let upsampled_missing = upsampled.depth[i] <= 0.0;
         if photometric.depth[i] > 0.0
             && (upsampled_missing || init_scores[i] - photo_scores[i] > threshold)
         {
-            out.depth[i] = photometric.depth[i];
-            out.normal[i] = photometric.normal[i];
-            out.cost[i] = photometric.cost[i];
+            upsampled.depth[i] = photometric.depth[i];
+            upsampled.normal[i] = photometric.normal[i];
+            if with_costs {
+                upsampled.cost[i] = photometric.cost[i];
+            }
             replaced += 1;
         }
     }
-    (out, replaced)
+    (upsampled, replaced)
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -312,7 +378,33 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch_match::{plane_scene, plane_scene_truth};
+    use crate::patch_match::{estimate, plane_scene, plane_scene_truth};
+
+    /// Releasing the earlier maps during a pass changes nothing: the same
+    /// maps as a pass that keeps them all, also when a view's depths are
+    /// released before the pass ends (view 0's, after view 1).
+    #[test]
+    fn geometric_pass_releases_without_changing_maps() {
+        let mut ws = plane_scene();
+        ws.views[2].sources = vec![1];
+        let options = PatchMatchOptions {
+            iterations: 2,
+            ..PatchMatchOptions::default()
+        };
+        let first: Vec<DepthMap> = (0..ws.views.len())
+            .map(|v| estimate(&ws, v, &options, None))
+            .collect();
+        let kept: Vec<DepthMap> = (0..ws.views.len())
+            .map(|v| estimate(&ws, v, &options, Some(&first)))
+            .collect();
+        let released = geometric_pass(&ws, first, &options, &estimate);
+        assert_eq!(released.len(), kept.len());
+        for (a, b) in released.iter().zip(&kept) {
+            assert_eq!(a.depth, b.depth);
+            assert_eq!(a.normal, b.normal);
+            assert_eq!(a.cost, b.cost);
+        }
+    }
 
     #[test]
     fn downscale_keeps_projections() {

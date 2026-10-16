@@ -172,7 +172,6 @@ impl GpuPatchMatch {
 
         // The reference image, the sources' (one texture layer each, half
         // floats) and each source's earlier depth map.
-        let images: Vec<f32> = reference.gray.clone();
         let texture_width = source_ids
             .iter()
             .map(|&s| ws.views[s].width)
@@ -185,15 +184,20 @@ impl GpuPatchMatch {
             .unwrap_or(1);
         let mut layers: Vec<u16> =
             Vec::with_capacity(texture_width * texture_height * source_ids.len().max(1));
-        let mut priors: Vec<f32> = Vec::new();
+        let mut prior_len = 0usize;
         let mut sources = Vec::with_capacity(source_ids.len());
         for &s in &source_ids {
             let source = &ws.views[s];
             let r = source.rotation * reference.rotation.transpose();
             let t = source.translation - r * reference.translation;
-            let prior_offset = priors.len() as u32;
+            let prior_offset = prior_len as u32;
             if let Some(maps) = prior {
-                priors.extend_from_slice(&maps[s].depth);
+                assert_eq!(
+                    maps[s].depth.len(),
+                    source.width * source.height,
+                    "source view {s}'s earlier depth map"
+                );
+                prior_len += maps[s].depth.len();
             }
             sources.push(GpuSource {
                 r0: [
@@ -304,15 +308,19 @@ impl GpuPatchMatch {
             }
         }
 
-        let storage = |label: &str, bytes: &[u8]| -> wgpu::Buffer {
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        // wgpu zero-initializes buffers, so only data is uploaded.
+        let zeroed = |label: &str, len: usize| -> wgpu::Buffer {
+            device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: (bytes.len() as u64).max(16).div_ceil(16) * 16,
+                size: (len as u64).max(16).div_ceil(16) * 16,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
-            });
+            })
+        };
+        let storage = |label: &str, bytes: &[u8]| -> wgpu::Buffer {
+            let buffer = zeroed(label, bytes.len());
             if !bytes.is_empty() {
                 queue.write_buffer(&buffer, 0, bytes);
             }
@@ -326,11 +334,20 @@ impl GpuPatchMatch {
         });
         queue.write_buffer(&uniforms, 0, &uniform_bytes);
         let sources_buf = storage("mvs-sources", bytemuck::cast_slice(&sources));
-        let images_buf = storage("mvs-images", bytemuck::cast_slice(&images));
-        let priors_buf = storage("mvs-priors", bytemuck::cast_slice(&priors));
-        let planes_buf = storage("mvs-planes", &vec![0u8; w * h * 16]);
-        let costs_buf = storage("mvs-costs", &vec![0u8; w * h * 4]);
-        let best_buf = storage("mvs-best-views", &vec![0u8; w * h * 4]);
+        let images_buf = storage("mvs-images", bytemuck::cast_slice(&reference.gray));
+        let priors_buf = zeroed("mvs-priors", prior_len * 4);
+        if let Some(maps) = prior {
+            for (&s, source) in source_ids.iter().zip(&sources) {
+                queue.write_buffer(
+                    &priors_buf,
+                    u64::from(source.dims[3]) * 4,
+                    bytemuck::cast_slice(&maps[s].depth),
+                );
+            }
+        }
+        let planes_buf = zeroed("mvs-planes", w * h * 16);
+        let costs_buf = zeroed("mvs-costs", w * h * 4);
+        let best_buf = zeroed("mvs-best-views", w * h * 4);
         let init_buf = storage("mvs-init-planes", bytemuck::cast_slice(&init_planes));
         let texture_size = wgpu::Extent3d {
             width: texture_width as u32,
@@ -374,9 +391,8 @@ impl GpuPatchMatch {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        drop(images);
         drop(layers);
-        drop(priors);
+        drop(init_planes);
 
         let params_entry = |slot: usize| wgpu::BindGroupEntry {
             binding: 0,
@@ -464,10 +480,10 @@ impl GpuPatchMatch {
             run(&self.propagate, group, (half, gh));
         }
 
-        let planes: Vec<[f32; 4]> =
-            bytemuck::cast_slice(&read_bytes(device, queue, &planes_buf, w * h * 16)).to_vec();
-        let costs: Vec<f32> =
-            bytemuck::cast_slice(&read_bytes(device, queue, &costs_buf, w * h * 4)).to_vec();
+        let mut planes = vec![[0.0f32; 4]; w * h];
+        read_into(device, queue, &planes_buf, &mut planes);
+        let mut costs = vec![0.0f32; w * h];
+        read_into(device, queue, &costs_buf, &mut costs);
         (planes, costs)
     }
 }
@@ -506,15 +522,16 @@ fn f16_bits(x: f32) -> u16 {
     sign | out as u16
 }
 
-/// Copies `len` bytes of `buffer` back to the host.
-fn read_bytes(
+/// Copies the start of `buffer` back to the host, into `out`.
+fn read_into<T: bytemuck::Pod>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     buffer: &wgpu::Buffer,
-    len: usize,
-) -> Vec<u8> {
+    out: &mut [T],
+) {
+    let len = std::mem::size_of_val(out);
     if len == 0 {
-        return Vec::new();
+        return;
     }
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("mvs-staging"),
@@ -534,9 +551,9 @@ fn read_bytes(
     });
     device.poll(wgpu::PollType::wait_indefinitely()).ok();
     let _ = rx.recv();
-    let data = slice.get_mapped_range().expect("map range").to_vec();
+    bytemuck::cast_slice_mut::<T, u8>(out)
+        .copy_from_slice(&slice.get_mapped_range().expect("map range"));
     staging.unmap();
-    data
 }
 
 #[cfg(test)]

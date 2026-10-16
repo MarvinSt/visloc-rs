@@ -50,7 +50,11 @@ pub struct FusedPoint {
 /// pixels in raster order; a pixel used by a point is not used again.
 pub fn fuse(ws: &Workspace, maps: &[DepthMap], options: &FusionOptions) -> Vec<FusedPoint> {
     let cos_max_angle = options.max_normal_angle_deg.to_radians().cos();
-    let mut used: Vec<Vec<bool>> = maps.iter().map(|m| vec![false; m.depth.len()]).collect();
+    // Per view, a bit per pixel: already in a point.
+    let mut used: Vec<Vec<u64>> = maps
+        .iter()
+        .map(|m| vec![0; m.depth.len().div_ceil(64)])
+        .collect();
     let mut points = Vec::new();
     let world_normal = |view: usize, n: [f32; 3]| -> Vector3<f64> {
         ws.views[view].rotation.transpose()
@@ -63,7 +67,7 @@ pub fn fuse(ws: &Workspace, maps: &[DepthMap], options: &FusionOptions) -> Vec<F
             for x in 0..map.width {
                 let p = y * map.width + x;
                 let depth = f64::from(map.depth[p]);
-                if used[i][p] || depth <= 0.0 {
+                if is_set(&used[i], p) || depth <= 0.0 {
                     continue;
                 }
                 let (u, v) = (x as f64 + 0.5, y as f64 + 0.5);
@@ -86,7 +90,7 @@ pub fn fuse(ws: &Workspace, maps: &[DepthMap], options: &FusionOptions) -> Vec<F
                     }
                     let q = sy * source_map.width + sx;
                     let source_depth = f64::from(source_map.depth[q]);
-                    if used[j][q] || source_depth <= 0.0 {
+                    if is_set(&used[j], q) || source_depth <= 0.0 {
                         continue;
                     }
                     let source_point =
@@ -116,15 +120,23 @@ pub fn fuse(ws: &Workspace, maps: &[DepthMap], options: &FusionOptions) -> Vec<F
                         normal: [normal.x as f32, normal.y as f32, normal.z as f32],
                         color: sum_color.map(|s| (s / count).round().clamp(0.0, 255.0) as u8),
                     });
-                    used[i][p] = true;
+                    set(&mut used[i], p);
                     for &(j, q) in &agreeing {
-                        used[j][q] = true;
+                        set(&mut used[j], q);
                     }
                 }
             }
         }
     }
     points
+}
+
+fn is_set(bits: &[u64], i: usize) -> bool {
+    bits[i / 64] >> (i % 64) & 1 == 1
+}
+
+fn set(bits: &mut [u64], i: usize) {
+    bits[i / 64] |= 1 << (i % 64);
 }
 
 #[cfg(test)]

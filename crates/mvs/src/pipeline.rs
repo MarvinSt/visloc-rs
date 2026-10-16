@@ -12,6 +12,7 @@
 use rayon::prelude::*;
 
 use crate::patch_match::{DepthMap, PatchMatchOptions};
+use crate::planar_prior::{planar_prior, PlanarPrior, PlanarPriorOptions};
 use crate::workspace::{View, Workspace};
 
 /// Multi-scale estimation parameters (ACMM's `k`, `eta`, `xi` and two
@@ -42,6 +43,18 @@ impl Default for MultiScaleOptions {
 /// equivalent.
 pub type Estimator<'a> =
     dyn Fn(&Workspace, usize, &PatchMatchOptions, Option<&[DepthMap]>) -> DepthMap + 'a;
+
+/// One view's planar prior pass from its photometric map and prior:
+/// [`crate::patch_match::estimate_with_prior`] or the GPU's equivalent.
+pub type PriorEstimator<'a> = dyn Fn(
+        &Workspace,
+        usize,
+        &PatchMatchOptions,
+        &PlanarPriorOptions,
+        &DepthMap,
+        &PlanarPrior,
+    ) -> DepthMap
+    + 'a;
 
 /// How well a depth map of one view fits the images:
 /// [`crate::patch_match::photometric_score`] or the GPU's equivalent.
@@ -78,6 +91,37 @@ pub fn geometric_pass(
         }
     }
     maps
+}
+
+/// ACMP's planar prior pass over every view of `ws`: each view's photometric
+/// map in `maps` (with its costs) gives the view's planar prior
+/// ([`planar_prior`]) and its start, and is dropped once the view is done.
+/// `log` receives the share of pixels the priors cover.
+pub fn planar_prior_pass(
+    ws: &Workspace,
+    maps: Vec<DepthMap>,
+    options: &PatchMatchOptions,
+    prior_options: &PlanarPriorOptions,
+    estimate: &PriorEstimator<'_>,
+    log: &mut dyn FnMut(&str),
+) -> Vec<DepthMap> {
+    assert_eq!(maps.len(), ws.views.len(), "one photometric map per view");
+    let (mut covered, mut total) = (0usize, 0usize);
+    let out = maps
+        .into_iter()
+        .enumerate()
+        .map(|(v, start)| {
+            let prior = planar_prior(&ws.views[v], &start, prior_options);
+            covered += prior.covered();
+            total += prior.planes.len();
+            estimate(ws, v, options, prior_options, &start, &prior)
+        })
+        .collect();
+    log(&format!(
+        "planar priors cover {:.1}% of pixels",
+        100.0 * covered as f64 / total.max(1) as f64
+    ));
+    out
 }
 
 /// Depth maps of every view of `ws` (at its resolution), estimated coarse

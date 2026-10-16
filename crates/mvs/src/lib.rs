@@ -12,6 +12,7 @@ pub mod gpu;
 pub mod model;
 pub mod patch_match;
 pub mod pipeline;
+pub mod planar_prior;
 pub mod ply;
 pub mod workspace;
 
@@ -19,7 +20,13 @@ pub use fusion::{fuse, FusedPoint, FusionOptions};
 #[cfg(feature = "gpu")]
 pub use gpu::GpuPatchMatch;
 pub use model::{read_text_model, SparseModel};
-pub use patch_match::{estimate, photometric_score, DepthMap, PatchMatchOptions, ViewSelection};
-pub use pipeline::{geometric_pass, multi_scale_depth_maps, Estimator, MultiScaleOptions, Scorer};
+pub use patch_match::{
+    estimate, estimate_with_prior, photometric_score, DepthMap, PatchMatchOptions, ViewSelection,
+};
+pub use pipeline::{
+    geometric_pass, multi_scale_depth_maps, planar_prior_pass, Estimator, MultiScaleOptions,
+    PriorEstimator, Scorer,
+};
+pub use planar_prior::{planar_prior, PlanarPrior, PlanarPriorOptions};
 pub use ply::write_ply;
 pub use workspace::{View, Workspace, WorkspaceOptions};

@@ -34,6 +34,7 @@ use std::borrow::Cow;
 
 use rayon::prelude::*;
 
+use crate::planar_prior::{PlanarPrior, PlanarPriorOptions};
 use crate::workspace::{View, Workspace};
 
 /// The cost of a view where a plane cannot be matched.
@@ -226,8 +227,50 @@ pub fn estimate(
     let ctx = Context::new(reference, sources, options, view as u32, prior.is_some());
     let mut state = match prior {
         None => ctx.random_state(),
-        Some(maps) => ctx.state_from(&maps[view]),
+        Some(maps) => ctx.state_from(&maps[view], None),
     };
+    for iteration in 0..options.iterations {
+        for color in [0, 1] {
+            ctx.pass(&mut state, iteration, color);
+        }
+    }
+    ctx.depth_map(&state)
+}
+
+/// ACMP's planar prior assisted pass for `ws.views[view]`, from photometric
+/// consistency and `prior` (see [`crate::planar_prior`]). It starts from
+/// `start`, the view's photometric depth map with its costs, except where
+/// `prior` has a plane and the start's cost is not credible: there it
+/// starts from the prior plane. Where a pixel has a prior, hypotheses are
+/// ranked by ACMP's posterior; elsewhere by cost, as in [`estimate`].
+pub fn estimate_with_prior(
+    ws: &Workspace,
+    view: usize,
+    options: &PatchMatchOptions,
+    prior_options: &PlanarPriorOptions,
+    start: &DepthMap,
+    prior: &PlanarPrior,
+) -> DepthMap {
+    let reference = &ws.views[view];
+    assert_eq!(
+        (prior.width, prior.height),
+        (reference.width, reference.height),
+        "prior size"
+    );
+    assert_eq!(
+        start.cost.len(),
+        start.depth.len(),
+        "the start needs its costs"
+    );
+    let sources: Vec<Source<'_>> = reference
+        .sources
+        .iter()
+        .take(MAX_SOURCES)
+        .map(|&s| Source::new(reference, &ws.views[s], None))
+        .collect();
+    let mut ctx = Context::new(reference, sources, options, view as u32, false);
+    ctx.prior = Some(Prior::new(prior, prior_options, reference.depth_range));
+    let mut state = ctx.state_from(start, Some((prior, prior_options.credible_cost)));
     for iteration in 0..options.iterations {
         for color in [0, 1] {
             ctx.pass(&mut state, iteration, color);
@@ -390,6 +433,62 @@ struct RefPatch {
     var: f32,
 }
 
+/// A planar prior pass's prior and the terms of ACMP's posterior.
+struct Prior<'a> {
+    planes: &'a [[f32; 4]],
+    inv_alpha: f32,
+    gamma: f32,
+    /// `1 / (2 σd²)` and `1 / (2 σθ²)`.
+    depth_weight: f32,
+    angle_weight: f32,
+}
+
+impl<'a> Prior<'a> {
+    fn new(prior: &'a PlanarPrior, options: &PlanarPriorOptions, range: (f32, f32)) -> Self {
+        let sigma_depth = options.depth_bandwidth * (range.1 - range.0);
+        let sigma_angle = options.angle_bandwidth_deg.to_radians();
+        Self {
+            planes: &prior.planes,
+            inv_alpha: 1.0 / options.alpha,
+            gamma: options.gamma,
+            depth_weight: 1.0 / (2.0 * sigma_depth * sigma_depth),
+            angle_weight: 1.0 / (2.0 * sigma_angle * sigma_angle),
+        }
+    }
+
+    /// Pixel `i`'s prior plane and its depth on the pixel's ray.
+    fn at(&self, i: usize, ray: [f32; 3]) -> Option<(Plane, f32)> {
+        let [nx, ny, nz, rho] = self.planes[i];
+        if nx == 0.0 && ny == 0.0 && nz == 0.0 {
+            return None;
+        }
+        let plane = Plane {
+            n: [nx, ny, nz],
+            rho,
+        };
+        plane.depth(ray).map(|depth| (plane, depth))
+    }
+
+    /// ACMP's posterior of `plane` with weighted cost `cost` at a pixel
+    /// whose prior is `(prior, prior_depth)` (up to a constant factor).
+    fn score(
+        &self,
+        (prior, prior_depth): (Plane, f32),
+        cost: f32,
+        plane: &Plane,
+        ray: [f32; 3],
+    ) -> f32 {
+        let Some(depth) = plane.depth(ray) else {
+            return f32::NEG_INFINITY;
+        };
+        let dd = depth - prior_depth;
+        let angle = dot(plane.n, prior.n).clamp(-1.0, 1.0).acos();
+        (-cost * cost * self.inv_alpha).exp()
+            * (self.gamma
+                + (-dd * dd * self.depth_weight).exp() * (-angle * angle * self.angle_weight).exp())
+    }
+}
+
 /// Everything one reference view's passes share.
 struct Context<'a> {
     reference: &'a View,
@@ -398,6 +497,8 @@ struct Context<'a> {
     options: &'a PatchMatchOptions,
     view_id: u32,
     geometric: bool,
+    /// The planar prior pass's prior.
+    prior: Option<Prior<'a>>,
     fx: f32,
     fy: f32,
     cx: f32,
@@ -443,6 +544,7 @@ impl<'a> Context<'a> {
             options,
             view_id,
             geometric,
+            prior: None,
             fx: reference.fx as f32,
             fy: reference.fy as f32,
             cx: reference.cx as f32,
@@ -724,8 +826,10 @@ impl<'a> Context<'a> {
     }
 
     /// The state of an earlier depth map, with costs recomputed under this
-    /// pass's terms (the mean of the best `init_top_k` views).
-    fn state_from(&self, map: &DepthMap) -> State {
+    /// pass's terms (the mean of the best `init_top_k` views). With a planar
+    /// prior and a credible cost, a pixel whose map cost is not credible
+    /// starts from its prior plane, if it has one.
+    fn state_from(&self, map: &DepthMap, prior: Option<(&PlanarPrior, f32)>) -> State {
         let (w, h) = (self.reference.width, self.reference.height);
         assert_eq!((map.width, map.height), (w, h), "prior depth map size");
         let rows: Vec<Row> = (0..h)
@@ -738,7 +842,19 @@ impl<'a> Context<'a> {
                 for x in 0..w {
                     let ray = self.ray(x, y);
                     let i = y * w + x;
-                    let plane = if map.depth[i] > 0.0 {
+                    let prior_plane = prior.and_then(|(prior, credible)| {
+                        let p = prior.planes[i];
+                        let uncertain = map.depth[i] <= 0.0 || map.cost[i] >= credible;
+                        (uncertain && (p[0] != 0.0 || p[1] != 0.0 || p[2] != 0.0)).then_some(
+                            Plane {
+                                n: [p[0], p[1], p[2]],
+                                rho: p[3],
+                            },
+                        )
+                    });
+                    let plane = if let Some(plane) = prior_plane {
+                        plane
+                    } else if map.depth[i] > 0.0 {
                         Plane::from_depth(map.depth[i], map.normal[i], ray)
                     } else {
                         let mut rng = Rng::new(self.options.seed, self.view_id, x, y, u32::MAX);
@@ -929,16 +1045,32 @@ impl<'a> Context<'a> {
                 / weight_sum
         };
 
+        // Hypotheses are ranked by cost, or by ACMP's posterior where the
+        // planar prior pass has a prior (larger is better either way).
+        let prior = self
+            .prior
+            .as_ref()
+            .and_then(|p| p.at(i, ray).map(|at| (p, at)));
+        let score = |cost: f32, plane: &Plane| -> f32 {
+            match prior {
+                None => -cost,
+                Some((p, at)) => p.score(at, cost, plane, ray),
+            }
+        };
+
         // Views without weight add nothing, so the current plane and the
         // refinement's are only matched in the others.
         let mut best_plane = current;
         let mut best_cost = self.weighted_cost(&patch, (x, y), ray, &current, &weights, weight_sum);
+        let mut best_score = score(best_cost, &best_plane);
         let mut adopted = false;
         for (row, candidate) in candidates.iter().enumerate() {
             if let Some(plane) = candidate {
                 let cost = aggregate(&photo[row], &geo[row]);
-                if cost < best_cost && plane.depth(ray).is_some() {
+                let candidate_score = score(cost, plane);
+                if candidate_score > best_score && plane.depth(ray).is_some() {
                     best_cost = cost;
+                    best_score = candidate_score;
                     best_plane = *plane;
                     adopted = true;
                 }
@@ -978,8 +1110,10 @@ impl<'a> Context<'a> {
             }
             let plane = Plane::from_depth(depth, normal, ray);
             let cost = self.weighted_cost(&patch, (x, y), ray, &plane, &weights, weight_sum);
-            if cost < best_cost {
+            let hypothesis_score = score(cost, &plane);
+            if hypothesis_score > best_score {
                 best_cost = cost;
+                best_score = hypothesis_score;
                 best_plane = plane;
             }
         }

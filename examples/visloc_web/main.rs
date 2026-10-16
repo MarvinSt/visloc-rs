@@ -973,7 +973,7 @@ mod tests {
         };
         let mut last = 0.0;
         for line in [
-            "10 images at 1600x1067 (0 resized from within 1%; others dropped: 0)",
+            "10 images at 1600x1067 (0 resized from within 1%; others dropped: 0; decoded in 1.0 s)",
             "sift: mean 7003 keypoints (17.2 s)",
             "40 verified of 45 candidate pairs (9.0 s)",
             "REGISTER path=A frame=4 image=4 inliers=10 num_reg_frames=5 num_points3d=1",

@@ -92,6 +92,52 @@ class OutlierMaskTest(unittest.TestCase):
         self.assertGreater(err[1], 2.0)  # the error is still reported for an inactive observation
 
 
+class ModeVectorTest(unittest.TestCase):
+    def test_modes_match_small_drifts(self):
+        rng = np.random.default_rng(2)
+        n = 20
+        kf_s = np.arange(n) * 0.5
+        r_wi = np.array([rot(rng, 0.5) for _ in range(n)])
+        t_wi = np.cumsum(rng.normal(size=(n, 3)), axis=0)
+        vel = rng.normal(size=(n, 3))
+        pts = rng.normal(size=(5, 3)) * 5
+        lm_first = np.array([0, 3, 7, 12, 19])
+        vx, vl = lb.mode_vectors(["yaw", "scale"], kf_s, r_wi, t_wi, vel, pts, lm_first)
+        s = (kf_s - kf_s[0]) / (kf_s[-1] - kf_s[0])
+        s_mid = 0.5 * (s[1:] + s[:-1])
+        k_ = 1e-6
+
+        def rz(angle):
+            return lb.so3_exp(np.array([0.0, 0.0, angle]))
+
+        # yaw: the heading turns by k_ s, positions follow the turned displacements
+        dp = [rz(k_ * s_mid[j]) @ (t_wi[j + 1] - t_wi[j]) for j in range(n - 1)]
+        drifted = {
+            "yaw": (np.array([rz(k_ * s[k]) @ r_wi[k] for k in range(n)]),
+                    np.vstack([t_wi[:1], t_wi[:1] + np.cumsum(dp, axis=0)]),
+                    np.array([rz(k_ * s[k]) @ vel[k] for k in range(n)])),
+            "scale": (r_wi,
+                      np.vstack([t_wi[:1], t_wi[:1] + np.cumsum(np.diff(t_wi, axis=0) * (1 + k_ * s_mid[:, None]),
+                                                                  axis=0)]),
+                      vel * (1 + k_ * s[:, None])),
+        }
+        for m, mode in enumerate(("yaw", "scale")):
+            r2, t2, v2 = drifted[mode]
+            for k in range(n):
+                w = np.radians(lb.so3_log_deg(r_wi[k].T @ r2[k])) / k_
+                np.testing.assert_allclose(w, vx[m, k, 0:3], atol=1e-4)
+                np.testing.assert_allclose(r_wi[k].T @ (t2[k] - t_wi[k]) / k_, vx[m, k, 3:6], atol=1e-4)
+                np.testing.assert_allclose((v2[k] - vel[k]) / k_, vx[m, k, 6:9], atol=1e-4)
+            turn = (lambda a: rz(k_ * a)) if mode == "yaw" else (lambda a: np.eye(3) * (1 + k_ * a))
+            for j, k in enumerate(lm_first):
+                moved = t2[k] + turn(s[k]) @ (pts[j] - t_wi[k])
+                np.testing.assert_allclose((moved - pts[j]) / k_, vl[m, j], atol=1e-4)
+        # the yaw mode shifts the gyro bias by one offset: the mean body vertical per unit heading rate
+        up_body = np.einsum("nji,j->ni", r_wi, [0.0, 0.0, 1.0])
+        np.testing.assert_allclose(vx[0, :, 12:15], -up_body.mean(0)[None].repeat(n, 0) / (kf_s[-1] - kf_s[0]))
+        np.testing.assert_array_equal(vx[1, :, 9:15], 0.0)
+
+
 class MatchingTest(unittest.TestCase):
     def test_best_two(self):
         keys = np.array([0, 0, 1, 0, 1])

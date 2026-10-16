@@ -628,9 +628,55 @@ def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_r
     return graph, values, index, imu_factors
 
 
+def mode_vectors(modes, kf_s, r_wi, t_wi, vel, pts, lm_first):
+    """Tangent directions of slow deformations of the whole solution, per unit amplitude at the end.
+
+    yaw: the heading turns by s_k rad at keyframe k (s from 0 at the first keyframe to 1 at the
+    last); positions are re-integrated from the turned displacements, velocities turn, landmarks
+    move with their first keyframe and the gyro bias takes one offset, the mean body-frame vertical,
+    so that the preintegrated rotations still agree. scale: displacements stretch by 1 + s_k.
+    Returns V_x (m, n, DOF) in the tangent space of each keyframe and V_l (m, n_lm, 3).
+    """
+    up = np.array([0.0, 0.0, 1.0])
+    dur = max(kf_s[-1] - kf_s[0], 1e-9)
+    s = (kf_s - kf_s[0]) / dur
+    s_mid = 0.5 * (s[1:] + s[:-1])
+    dp = np.diff(t_wi, axis=0)
+    out_x, out_l = [], []
+    for mode in modes:
+        v = np.zeros((len(kf_s), DOF))
+        if mode == "yaw":
+            shift = np.vstack([np.zeros(3), np.cumsum(np.cross(up, dp) * s_mid[:, None], axis=0)])
+            up_body = np.einsum("nji,j->ni", r_wi, up)
+            v[:, 0:3] = s[:, None] * up_body
+            v[:, 6:9] = s[:, None] * np.cross(up, vel)
+            v[:, 12:15] = -up_body.mean(0) / dur
+            v_l = shift[lm_first] + s[lm_first, None] * np.cross(up, pts - t_wi[lm_first])
+        elif mode == "scale":
+            shift = np.vstack([np.zeros(3), np.cumsum(dp * s_mid[:, None], axis=0)])
+            v[:, 6:9] = s[:, None] * vel
+            v_l = shift[lm_first] + s[lm_first, None] * (pts - t_wi[lm_first])
+        else:
+            raise ValueError(f"unknown mode {mode}")
+        v[:, 3:6] = np.einsum("nji,nj->ni", r_wi, shift)
+        out_x.append(v)
+        out_l.append(v_l)
+    return np.array(out_x), np.array(out_l)
+
+
+def _band_matvec(ab, x):
+    """Symmetric banded matrix (lower storage) times a vector."""
+    nb = len(x)
+    y = ab[0] * x
+    for d in range(1, ab.shape[0]):
+        y[d:] += ab[d, :nb - d] * x[:nb - d]
+        y[:nb - d] += ab[d, :nb - d] * x[d:]
+    return y
+
+
 def cmd_solve(a):
     import gtsam
-    from gtsam.symbol_shorthand import B, X
+    from gtsam.symbol_shorthand import B, V, X
     from scipy.linalg import cho_solve_banded, cholesky_banded
 
     t0 = time.time()
@@ -675,6 +721,13 @@ def cmd_solve(a):
                                                    a.accel_rw_scale, a.gyro_rw_scale)
     n = len(kf_ns)
     nb, ne = n * DOF, 3 * rp.n_ext
+    modes = [m for m in a.modes.split(",") if m]
+    nm = len(modes)
+    nz = ne + nm  # border: the camera rotations, then the deformation modes (undamped)
+    order = np.argsort(rp.lm, kind="stable")
+    lm_first = np.zeros(rp.n_lm, np.int64)
+    lm_first[rp.lm[order][::-1]] = rp.kf[order][::-1]  # first keyframe of every landmark
+    kf_s = kf_ns.astype(np.float64) * 1e-9
     u = (max(rp.band_kf, 1) + 1) * DOF - 1  # scalar bandwidth of the reduced system
     print(f"  reduced system: {nb} banded dims (bandwidth {u}) + {ne} border dims, {time.time() - t0:.0f} s",
           flush=True)
@@ -706,8 +759,9 @@ def cmd_solve(a):
         h_xx = np.einsum("nki,nkj->nij", wjx, jx)
         h_xl = np.einsum("nki,nkj->nij", wjx, jl)
         g_x = np.einsum("nki,nk->ni", wjx, res)
+        h_ll_o = np.einsum("nki,nkj->nij", wjl, jl)
         h_ll = np.zeros((rp.n_lm, 3, 3))
-        np.add.at(h_ll, rp.lm, np.einsum("nki,nkj->nij", wjl, jl))
+        np.add.at(h_ll, rp.lm, h_ll_o)
         g_l = np.zeros((rp.n_lm, 3))
         np.add.at(g_l, rp.lm, np.einsum("nki,nk->ni", wjl, res))
         # IMU and prior factors, linearized by GTSAM: ||A dx - b||^2
@@ -722,6 +776,29 @@ def cmd_solve(a):
             np.add.at(ab_imu, ((ci - cj)[low], cj[low]), (A.T @ A)[low])
             np.add.at(rhs_imu, cols, A.T @ b)
         direct = np.add.reduceat(h_xx[rp.obs_sort][:, 0:6, 0:6], rp.obs_starts, axis=0)
+        modes_on = nm > 0 and it >= a.modes_start
+        if modes_on:
+            # H v for every mode before the landmarks are eliminated (undamped)
+            vel = np.array([values.atVector(V(k)) for k in range(n)])
+            v_x, v_l = mode_vectors(modes, kf_s, r_wi, t_wi, vel, pts, lm_first)
+            vxf = v_x.reshape(nm, nb)
+            hv_x, hv_l, hv_e = np.zeros((nm, nb)), np.zeros((nm, rp.n_lm, 3)), np.zeros((nm, ne))
+            has_o = rp.ext_slot[rp.cam] >= 0
+            for mi in range(nm):
+                v6, vlo = v_x[mi][rp.kf, 0:6], v_l[mi][rp.lm]
+                hv_x[mi] = _band_matvec(ab_imu, vxf[mi])
+                np.add.at(hv_x[mi], (rp.kf * DOF)[:, None] + np.arange(6)[None, :],
+                          np.einsum("nij,nj->ni", h_xx[:, 0:6, 0:6], v6) + np.einsum("nij,nj->ni", h_xl[:, 0:6], vlo))
+                np.add.at(hv_l[mi], rp.lm, np.einsum("nji,nj->ni", h_xl[:, 0:6], v6) + np.einsum("nij,nj->ni", h_ll_o, vlo))
+                if ne:
+                    pe = (np.einsum("nji,nj->ni", h_xx[has_o][:, 0:6, 6:9], v6[has_o])
+                          + np.einsum("nij,nj->ni", h_xl[has_o, 6:9], vlo[has_o]))
+                    for sl in range(rp.n_ext):
+                        hv_e[mi, sl * 3:sl * 3 + 3] = pe[rp.ext_slot[rp.cam[has_o]] == sl].sum(0)
+            vhv = vxf @ hv_x.T + np.einsum("mlk,nlk->mn", v_l, hv_l)
+            b_x = rhs_imu.copy()
+            np.add.at(b_x, (rp.kf * DOF)[:, None] + np.arange(6)[None, :], -g_x[:, 0:6])
+            b_v = vxf @ b_x - np.einsum("mlk,lk->m", v_l, g_l)
         accepted = False
         # landmark damping: the diagonal, floored relative to the landmark's largest entry, so that a
         # landmark with a poorly observed direction (low parallax) cannot take a huge step
@@ -730,7 +807,7 @@ def cmd_solve(a):
         for _ in range(8):
             h_ll_inv = np.linalg.inv(h_ll + lam * d_l + 1e-9 * np.eye(3)[None])
             m_o = np.einsum("nij,njk->nik", h_xl, h_ll_inv[rp.lm])
-            ab, rhs = ab_imu.copy(), np.zeros(nb + ne)
+            ab, rhs = ab_imu.copy(), np.zeros(nb + nz)
             rhs[:nb] = rhs_imu
             # Schur complement of the landmarks: -M_a X_b^T per (kf_a, kf_b) block, in chunks
             blocks = np.zeros((len(rp.blk_keys), 6, 6))
@@ -745,7 +822,7 @@ def cmd_solve(a):
                                              cols[:, None, None] + np.arange(6)[None, None, :])
                 low = ii >= jj
                 ab[(ii - jj)[low], jj[low]] += vals[low]
-            border, corner = np.zeros((nb, ne)), np.zeros((ne, ne))
+            border, corner = np.zeros((nb, nz)), np.zeros((nz, nz))
             if ne:
                 slot = rp.ext_slot[rp.cam]
                 has = slot >= 0
@@ -758,7 +835,7 @@ def cmd_solve(a):
                     bsum[key[st]] += np.add.reduceat(prod, st, axis=0)
                 np.add.at(bsum, rp.kf[has].astype(np.int64) * 2 + slot[has], h_xx[has][:, 0:6, 6:9])
                 for sl in range(rp.n_ext):
-                    border.reshape(n, DOF, ne)[:, 0:6, sl * 3:sl * 3 + 3] += bsum[sl::2]
+                    border.reshape(n, DOF, nz)[:, 0:6, sl * 3:sl * 3 + 3] += bsum[sl::2]
                 csum = np.zeros((2, 2, 3, 3))
                 for s in range(0, len(rp.cn_a), rp.chunk):
                     e = min(s + rp.chunk, len(rp.cn_a))
@@ -774,33 +851,55 @@ def cmd_solve(a):
                 np.add.at(rhs, nb + (slot[has] * 3)[:, None] + np.arange(3)[None, :], red[has, 6:9])
             ab[0] += lam * ab[0] + 1e-9
             if ne:
-                corner[np.diag_indices(ne)] += lam * np.diag(corner) + 1e-9
+                corner[np.arange(ne), np.arange(ne)] += lam * np.diag(corner)[:ne] + 1e-9
+            if nm and not modes_on:
+                corner[ne:, ne:] = np.eye(nm)  # inert until --modes-start
+            if modes_on:  # the modes' column after eliminating the landmarks; no damping
+                q = np.einsum("lij,mlj->mli", h_ll_inv, hv_l)
+                for mi in range(nm):
+                    border[:, ne + mi] = hv_x[mi]
+                    np.add.at(border[:, ne + mi], (rp.kf * DOF)[:, None] + np.arange(6)[None, :],
+                              -np.einsum("nij,nj->ni", h_xl[:, 0:6], q[mi][rp.lm]))
+                if ne:
+                    pe = np.einsum("nij,mnj->mni", h_xl[has, 6:9], q[:, rp.lm[has]])
+                    ce = hv_e.copy()
+                    for sl in range(rp.n_ext):
+                        ce[:, sl * 3:sl * 3 + 3] -= pe[:, rp.ext_slot[rp.cam[has]] == sl].sum(1)
+                    corner[:ne, ne:], corner[ne:, :ne] = ce.T, ce
+                cmm = vhv - np.einsum("mlk,nlk->mn", hv_l, q)
+                corner[ne:, ne:] = cmm + np.diag(1e-12 * np.abs(np.diag(cmm)) + 1e-12)
+                rhs[nb + ne:] = b_v + np.einsum("mlk,lk->m", hv_l, np.einsum("lij,lj->li", h_ll_inv, g_l))
             try:
                 cfac = cholesky_banded(ab, lower=True)
             except np.linalg.LinAlgError:
                 lam *= 10
                 continue
-            if ne:  # block elimination of the extrinsic border
+            if nz:  # block elimination of the border
                 yb = cho_solve_banded((cfac, True), border)
                 s_inv = np.linalg.inv(corner - border.T @ yb)
 
             def precond(r_):
                 y0 = cho_solve_banded((cfac, True), r_[:nb])
-                if not ne:
+                if not nz:
                     return y0
                 de0 = s_inv @ (r_[nb:] - border.T @ y0)
                 return np.r_[y0 - yb @ de0, de0]
 
-            sol = precond(rhs) if len(rp.off_keys) == 0 else _pcg(rp, m_o, h_xl, ab, u, nb, ne, border, corner,
+            sol = precond(rhs) if len(rp.off_keys) == 0 else _pcg(rp, m_o, h_xl, ab, u, nb, nz, border, corner,
                                                                     precond, rhs)
-            dx, de = sol[:nb], sol[nb:]
+            dx, de, dk = sol[:nb], sol[nb:nb + ne], sol[nb + ne:]
             dxo = np.zeros((len(rp.kf), 9))
             dxo[:, 0:6] = dx.reshape(n, DOF)[rp.kf, 0:6]
             if ne:
                 dxo[has, 6:9] = de.reshape(-1, 3)[slot[has]]
             back = np.zeros((rp.n_lm, 3))
             np.add.at(back, rp.lm, np.einsum("nji,nj->ni", h_xl, dxo))
+            if modes_on:
+                back += np.einsum("mlk,m->lk", hv_l, dk)
             dl = -np.einsum("nij,nj->ni", h_ll_inv, g_l + back)
+            if modes_on:  # every state also moves along the modes
+                dx = dx + vxf.T @ dk
+                dl = dl + np.einsum("mlk,m->lk", v_l, dk)
             vv = gtsam.VectorValues()
             for key, (col, dim) in index.items():
                 vv.insert(key, dx[col:col + dim])
@@ -819,6 +918,8 @@ def cmd_solve(a):
                 break
             lam *= 5
         msg = f"iter {it:2d}: cost {cost:.6g} lambda {lam:.1e} {time.time() - ti:.0f} s"
+        if modes_on and accepted:
+            msg += " | " + " ".join(f"{mo} {d_:+.2e}" for mo, d_ in zip(modes, dk))
         for c in est_cams:
             msg += f" | cam{c} rotation {np.round(so3_log_deg(cams[c]['R_ic'].T @ r_ic[c]), 3)}"
         print(msg, flush=True)
@@ -981,6 +1082,9 @@ def main():
     s.add_argument("--accel-rw-scale", type=float, default=1.0, help="multiplies the accel bias random walk")
     s.add_argument("--gyro-rw-scale", type=float, default=1.0, help="multiplies the gyro bias random walk")
     s.add_argument("--loops", action="store_true", help="add the revisit matches of the loops stage")
+    s.add_argument("--modes", default="", help="undamped deformation modes of the whole solution: yaw, scale "
+                   "(comma-separated); they let LM move along slow drifts the damped steps cannot follow")
+    s.add_argument("--modes-start", type=int, default=3, help="first iteration that uses the modes")
     a = p.parse_args()
     {"features": cmd_features, "match": cmd_match, "loops": cmd_loops, "solve": cmd_solve}[a.cmd](a)
 

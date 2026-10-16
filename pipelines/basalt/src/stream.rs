@@ -46,6 +46,9 @@ pub struct DirectKltConfig {
     pub fast: GridFastConfig,
     /// Opt-in raw-gyro rotation initialization for temporal cam0 KLT.
     pub imu_seed_rotation: bool,
+    /// Patch pattern scale: 1 for Basalt's `Pattern51` (the default), 2 for
+    /// `Pattern52`, the same layout at twice the size.
+    pub pattern_scale: f32,
 }
 
 impl Default for DirectKltConfig {
@@ -57,6 +60,7 @@ impl Default for DirectKltConfig {
             essential_residual_threshold: 0.005,
             fast: GridFastConfig::default(),
             imu_seed_rotation: false,
+            pattern_scale: 1.0,
         }
     }
 }
@@ -1075,7 +1079,11 @@ fn track_direction_from_seed_impl(
         let current_image = current_pyramid
             .level(level)
             .ok_or(KltFailure::TargetOutOfBounds)?;
-        let patch = MeanNormalizedPatch51::from_image(level_image, old_position);
+        let patch = MeanNormalizedPatch51::from_image_scaled(
+            level_image,
+            old_position,
+            config.pattern_scale,
+        );
         if !patch.valid {
             return Err(KltFailure::SourcePatchInvalid);
         }

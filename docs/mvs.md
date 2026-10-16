@@ -54,10 +54,12 @@ from the paper:
   MVSNet's score over the shared sparse points (a Gaussian in the
   triangulation angle around 5°). The depth range comes from the image's
   sparse points: COLMAP's 1% and 99% quantiles, widened by 25%.
-- **Fusion.** ACMM's: a pixel's 3D point is kept when at least two source
-  views agree within 2 pixels of reprojection error, 1% of relative depth
-  and 30° of normal angle; the agreeing pixels are averaged into one point
-  and not used again.
+- **Fusion.** A pixel's 3D point is kept when a source view agrees within
+  2 pixels of reprojection error, 1% of relative depth and 30° of normal
+  angle; the agreeing pixels are averaged into one point and not used
+  again. ACMM's code asks for two agreeing views (and 10°): with these
+  depth maps one view scores much higher (below), `--min-consistent 2`
+  restores two.
 
 The GPU path runs the same per-pixel update as compute shaders, with the
 same sampling regions, view selection and random numbers. The source images
@@ -105,6 +107,24 @@ the cloud.
 - **Not yet run:** terrains, delivery area, electro and facade.
 - **What falls short is completeness.** Accuracy is at ACMM's level;
   completeness is lower, most on meadow and playground.
+
+### Fusion settings
+
+The same depth maps fused with different rules (CPU runs with one
+geometric pass; F1 at 2 cm). One agreeing source view instead of ACMM's
+two adds far more completeness than it costs accuracy:
+
+| Run | 30°, two views | any angle, two views | 30°, one view | any angle, one view |
+|---|---|---|---|---|
+| pipes, 800 px | 53.8% | 56.4% | 67.6% | 68.3% |
+| meadow, 800 px | 51.3% | 52.4% | 56.4% | 57.1% |
+| pipes, 1600 px | 66.9% | 68.3% | **76.0%** | 75.6% |
+
+On pipes at 1600 px, one view takes completeness from 51.1% to 65.4% and
+accuracy from 96.9% to 90.7%. On pipes at 800 px, a stricter depth
+(0.5%) or reprojection (1 px) check, or dropping pixels by matching cost,
+only lowered F1. The full-resolution runs above predate this default and
+use two views.
 
 ### Local runs on pipes (CPU)
 

@@ -8,7 +8,7 @@
 //!     --images <image dir> --out <dir> [--max-image-size 3200] \
 //!     [--sources 10] [--iterations 3] [--geom-passes 1] [--scales 1] [--gpu] \
 //!     [--view-selection confidence|sampled] [--init-top-k 3] \
-//!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 2] \
+//!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 30]
 //! ```
 //!

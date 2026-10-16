@@ -1,4 +1,4 @@
-//! Depth-map fusion into a point cloud (ACMM's, after Gipuma and COLMAP):
+//! Depth-map fusion into a point cloud (after ACMM, Gipuma and COLMAP):
 //! each pixel's 3D point is checked against the depth maps of its view's
 //! source views and kept when enough of them agree.
 
@@ -7,8 +7,13 @@ use nalgebra::Vector3;
 use crate::patch_match::DepthMap;
 use crate::workspace::Workspace;
 
-/// When a source view's depth agrees with a pixel's (ACMM's values by
-/// default).
+/// When a source view's depth agrees with a pixel's, and how many must.
+///
+/// By default one agreeing source view keeps a point; ACMM's code asks for
+/// two (and 10° between the normals). On ETH3D pipes with images at
+/// 1600 px, one view raises F1 at 2 cm from 66.9% to 76.0% (accuracy 96.9%
+/// to 90.7%, completeness 51.1% to 65.4%); at 800 px it raises pipes from
+/// 53.8% to 67.6% and meadow from 51.3% to 56.4%.
 #[derive(Debug, Clone)]
 pub struct FusionOptions {
     /// Pixels between the pixel and the source depth's point projected back.
@@ -27,7 +32,7 @@ impl Default for FusionOptions {
             max_reproj_error: 2.0,
             max_relative_depth_diff: 0.01,
             max_normal_angle_deg: 30.0,
-            min_consistent_views: 2,
+            min_consistent_views: 1,
         }
     }
 }

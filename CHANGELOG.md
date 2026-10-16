@@ -602,6 +602,24 @@ All notable changes to `visloc-rs` will be documented here.
   | Loading | 6.5 s | **0.9 s** |
   | Mapper wall time | 5:03 | **4:25** |
 
+  - **All of SmallCity** (5,822 photos, one run on an NVIDIA L4 pod with
+    13 CPU threads): peak memory **9.0 GiB** instead of 18.9 GiB (the run
+    in `docs/gpu_bundle_adjustment.md`, an L4 pod with 15 threads), and
+    2.7 GiB instead of 11.3 GiB after loading.
+    - **Accuracy:** the model registers 5,816 photos with a median
+      camera-centre error of 0.184 m (p90 0.276 m) against the release's
+      model.
+    - **Why the models differ:** the two runs' VLAD retrieval picked
+      slightly different candidate pairs (242,917 against 242,592), so the
+      mapper's input differed. The earlier model scored 0.297 m. Both lie
+      within the 0.15 to 0.65 m that mapper seeds alone give on this
+      capture.
+    - **Wall time:** the newer pod ran the unchanged stages 1.6 to 2.0
+      times slower, so the wall times (1,380 s against 847 s) do not
+      compare. The pass-1 replay above times both versions on one machine.
+    - **What remains:** the largest working sets are the last global
+      bundle adjustments', on 15.1M observations: 2.1 GiB of per-point
+      linearizations and 0.9 GiB for the reduced camera system.
   - **Correspondence graph.** The replay export's graph is built in one
     pass (`CorrespondenceGraph::finalized_from_pairs`), equal field for
     field to `add_image`, `add_two_view_geometry` and `finalize`, without

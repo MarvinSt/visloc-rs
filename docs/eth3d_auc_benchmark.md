@@ -379,6 +379,9 @@ COLMAP's incremental mapper registered about 1,000 images every 14 minutes
 and would have needed about 80 minutes for all of them, before its last
 global bundle adjustment.
 
+visloc-rs has since halved its peak: 9.0 GiB on all of SmallCity, on an L4
+pod with 13 threads (the memory entry in `CHANGELOG.md`).
+
 COLMAP's stages up to the stop, against the CPU-only run above (32
 threads). The cap also covered its database (1.4 min) and re-verifying the
 matches (6.6 min):

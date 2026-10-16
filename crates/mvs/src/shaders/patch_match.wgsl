@@ -63,12 +63,12 @@ struct Source {
 // `init`: the earlier map's (normal, depth) per pixel, depth 0 for none.
 @group(0) @binding(7) var<storage, read> init_planes: array<vec4<f32>>;
 
-// The reference window of the current pixel.
+// The reference window of the current pixel; sample k's offset is
+// `window_offset(k)`.
 var<private> patch_values: array<f32, 64>;
 var<private> patch_weights: array<f32, 64>;
-var<private> patch_dx: array<f32, 64>;
-var<private> patch_dy: array<f32, 64>;
 var<private> patch_n: u32;
+var<private> window_cols: u32;
 var<private> patch_center: f32;
 var<private> patch_sum_w: f32;
 var<private> patch_mean: f32;
@@ -115,6 +115,15 @@ fn pixel_ray(x: u32, y: u32) -> vec3<f32> {
     );
 }
 
+fn window_offset(k: u32) -> vec2<f32> {
+    let r = params.window_radius;
+    let step = max(params.window_step, 1);
+    return vec2<f32>(
+        f32(-r + i32(k % window_cols) * step),
+        f32(-r + i32(k / window_cols) * step),
+    );
+}
+
 fn load_patch(x: u32, y: u32) {
     let center = ref_gray(i32(x), i32(y));
     patch_center = center;
@@ -126,6 +135,7 @@ fn load_patch(x: u32, y: u32) {
     var sum_sq = 0.0;
     let r = params.window_radius;
     let step = max(params.window_step, 1);
+    window_cols = u32(2 * r / step) + 1u;
     for (var dy = -r; dy <= r; dy += step) {
         for (var dx = -r; dx <= r; dx += step) {
             if (n >= MAX_SAMPLES) {
@@ -133,8 +143,6 @@ fn load_patch(x: u32, y: u32) {
             }
             let value = ref_gray(i32(x) + dx, i32(y) + dy) - center;
             let weight = exp(-value * value * inv_color - f32(dx * dx + dy * dy) * inv_spatial);
-            patch_dx[n] = f32(dx);
-            patch_dy[n] = f32(dy);
             patch_values[n] = value;
             patch_weights[n] = weight;
             sum_w += weight;
@@ -203,7 +211,8 @@ fn photometric_cost(j: u32, ray: vec3<f32>, plane: vec4<f32>) -> f32 {
     var s_ww = 0.0;
     var s_rw = 0.0;
     for (var k = 0u; k < patch_n; k++) {
-        let p = a + patch_dx[k] * bx + patch_dy[k] * by;
+        let o = window_offset(k);
+        let p = a + o.x * bx + o.y * by;
         if (p.z <= 0.0) {
             return MAX_COST;
         }

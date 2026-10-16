@@ -88,21 +88,19 @@ pub fn multi_scale_depth_maps(
         let coarse = &levels[level - 1];
         let fine = &levels[level];
         let t = std::time::Instant::now();
-        let upsampled: Vec<DepthMap> = (0..fine.views.len())
-            .into_par_iter()
-            .map(|v| upsample(&maps[v], &coarse.views[v], &fine.views[v]))
-            .collect();
-        let photometric = all(fine, None);
+        // View by view, so only one photometric map is held at a time.
         let mut replaced = 0usize;
         let mut total = 0usize;
         let restored: Vec<DepthMap> = (0..fine.views.len())
             .map(|v| {
+                let upsampled = upsample(&maps[v], &coarse.views[v], &fine.views[v]);
+                let photometric = estimate(fine, v, pm, None);
                 let (map, count) = restore_details(
                     fine,
                     v,
                     pm,
-                    &upsampled[v],
-                    &photometric[v],
+                    &upsampled,
+                    &photometric,
                     options.detail_threshold,
                 );
                 replaced += count;
@@ -176,10 +174,11 @@ pub fn downscale(ws: &Workspace) -> Workspace {
 }
 
 /// Joint bilateral upsampling of `map` (of `coarse`) to `fine`'s size: each
-/// fine pixel averages the depths (evaluated on its own ray from the coarse
-/// pixels' planes) and normals of the 5×5 coarse pixels around it, weighted
-/// by distance in coarse pixels and by the grey-level difference in the
-/// fine image.
+/// fine pixel takes the plane of the 5×5 coarse pixels around it with the
+/// largest bilateral weight (distance in coarse pixels, grey-level
+/// difference in the fine image), evaluated on its own ray. Averaging the
+/// planes' depths instead would bridge depth edges with surfaces that exist
+/// in no view.
 pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
     const RADIUS: i32 = 2;
     const SIGMA_SPATIAL: f32 = 1.0;
@@ -210,8 +209,8 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
                 // The fine pixel's centre in coarse pixel coordinates.
                 let (cxf, cyf) = ((x as f32 + 0.5) * sx - 0.5, (y as f32 + 0.5) * sy - 0.5);
                 let (ci, cj) = (cxf.round() as i32, cyf.round() as i32);
-                let (mut sum_w, mut sum_d, mut sum_c) = (0.0f32, 0.0f32, 0.0f32);
-                let mut sum_n = [0.0f32; 3];
+                // (weight, depth here, normal, cost) of the best plane.
+                let mut best: Option<(f32, f32, [f32; 3], f32)> = None;
                 for dj in -RADIUS..=RADIUS {
                     for di in -RADIUS..=RADIUS {
                         let (qi, qj) = (ci + di, cj + dj);
@@ -243,24 +242,15 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
                         let w = (-(dx * dx + dy * dy) / (2.0 * SIGMA_SPATIAL * SIGMA_SPATIAL)
                             - dg * dg / (2.0 * SIGMA_COLOR * SIGMA_COLOR))
                             .exp();
-                        sum_w += w;
-                        sum_d += w * depth_here;
-                        sum_c += w * map.cost[q];
-                        for (s, v) in sum_n.iter_mut().zip(n) {
-                            *s += w * v;
+                        if best.is_none_or(|(best_w, ..)| w > best_w) {
+                            best = Some((w, depth_here, n, map.cost[q]));
                         }
                     }
                 }
-                if sum_w > 0.0 {
-                    let norm = dot(sum_n, sum_n).sqrt();
-                    if norm > 0.0 {
-                        let n = sum_n.map(|v| v / norm);
-                        if dot(n, fine_ray) < 0.0 {
-                            depth[x] = sum_d / sum_w;
-                            normal[x] = n;
-                            cost[x] = sum_c / sum_w;
-                        }
-                    }
+                if let Some((_, d, n, c)) = best {
+                    depth[x] = d;
+                    normal[x] = n;
+                    cost[x] = c;
                 }
             }
             (depth, normal, cost)

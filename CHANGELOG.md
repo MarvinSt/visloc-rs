@@ -177,6 +177,11 @@ All notable changes to `visloc-rs` will be documented here.
     extraction takes 10.0 s against 92.4 s, and the visloc-rs mapper
     scores the same: mean AUC@1°/3°/5° 53.08 / 78.85 / 85.68 against
     53.09 / 78.85 / 85.69, 448/454 registered either way.
+  - **ETH3D on an L4**, the GPU of the COLMAP 4.2.1 CUDA runs (13 CPU
+    threads, COLMAP's 1,600 px input): 16.3 s with decoding, against
+    22.2 s for COLMAP's CUDA extractor. Features, matches and the mapper
+    together took 73.4 s, against 225.0 s for COLMAP with its global
+    mapper.
   - Each pyramid level is its own buffer, so no binding exceeds one level;
     an image past the device's limit is extracted on the CPU.
     `sift_vlfeat_gpu_bench` compares the two extractors on a directory of
@@ -188,21 +193,30 @@ All notable changes to `visloc-rs` will be documented here.
   adjustments through wgpu (`visloc_ba_gpu::GpuReducedSolver`). Without the
   flag nothing changes: the CPU path stays bit-identical.
   - **What moves:** bundle adjustments with at least 1,000 free frames. The
-    GPU forms the reduced camera system's off-diagonal blocks and runs the
-    preconditioned conjugate gradients. The CPU keeps the linearization,
-    the diagonal blocks and right-hand side, the preconditioner's
-    factorization and the back-substitution, in f64.
-  - **Deterministic:** the blocks are exact sums (64-bit fixed point over
-    two 32-bit atomics) and the conjugate gradients reduce in a fixed
-    order, so a solve repeats exactly on a given device. It is not
-    bit-identical to the CPU path.
+    GPU runs the preconditioned conjugate gradients on the reduced camera
+    system. Its product reads each off-diagonal block once, as the CPU's
+    does: one workgroup per frame over the contiguous blocks of its edges,
+    which writes the other half of each edge's product for a second pass
+    to gather. The CPU keeps the linearization, the point elimination, the
+    preconditioner's factorization and the back-substitution, in f64, and
+    uploads the blocks in f32 for each solve.
+  - **GPU elimination, opt-in** (`VISLOC_GPU_ELIMINATION=1`): the GPU forms
+    the off-diagonal blocks itself, as exact sums (64-bit fixed point over
+    two 32-bit atomics), and keeps them for the solve.
+  - **Deterministic:** the conjugate gradients reduce in a fixed order, so
+    a solve repeats exactly on a given device. It is not bit-identical to
+    the CPU path.
   - **Validation:** on a SmallCity pass-1 replay (1,499 photos, llvmpipe)
-    the large bundle adjustments take the CPU's PCG iteration counts, and
-    the camera centres differ from the CPU model by a median of 5e-6 and at
-    most 0.015% of the scene extent.
-  - **Not faster yet:** on an NVIDIA L4 with 21 CPU threads, SmallCity's
-    mapper took 1,193 s with it and 1,168 s without; the GPU's block
-    product and elimination are the reasons.
+    the large bundle adjustments take about the CPU's PCG iteration counts,
+    and the camera centres differ from the CPU model by a median of 4e-5
+    and at most 0.005% of the scene extent.
+  - **Speed (SmallCity on an NVIDIA L4, 15 CPU threads):** the mapper takes
+    845.0 s with it and 846.7 s without. Its conjugate-gradient iterations
+    take 3.4 ms against the CPU's 6.8 ms at 3.4M edges, but each solve's
+    upload cost 0.59 s, and those solves are a tenth of the mapper's time.
+    Uploads now go through a buffer kept between solves (not yet timed on a
+    GPU). The first version (each block read twice, the blocks formed on
+    the GPU) took 1,193 s against 1,168 s on an L4 with 21 threads.
   - `visloc_slam::ReducedSolveAccelerator` is the hook another backend can
     implement. Details: `docs/gpu_bundle_adjustment.md`.
 
@@ -559,6 +573,10 @@ All notable changes to `visloc-rs` will be documented here.
       capture, 0.15 to 0.65 m.
   - The ETH3D and SmallCity numbers documented before this change were
     measured with CPU SIFT and without completion, unless noted.
+
+- **`gsplat_photos` logs how long decoding the photos took**, on its
+  `N images at WxH` line. COLMAP's extraction times include decoding;
+  `gsplat_photos`' SIFT times do not.
 
 - **COLMAP-port BA: cheaper setup of large bundle adjustments.** Results
   are bit-identical: the SmallCity pass-1 model matches byte for byte.

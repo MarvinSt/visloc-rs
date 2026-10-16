@@ -3,12 +3,19 @@
 //!
 //! - **Conjugate gradients** (`shaders/reduced_pcg.wgsl`): the CPU solver's
 //!   preconditioned iteration (dense inverses over runs of consecutive
-//!   frames, the optional coarse level, the same stopping rule) in f32.
-//! - **Point elimination** (`shaders/reduced_elim.wgsl`): the system's
-//!   off-diagonal blocks, formed on the device and kept there for the
-//!   solve, summed exactly in 64-bit fixed point. The CPU keeps the diagonal
-//!   blocks and the right-hand side (f64) and factors the preconditioner
-//!   from the blocks the device returns.
+//!   frames, the optional coarse level, the same stopping rule) in f32. The
+//!   product reads each off-diagonal block once, as the CPU's does: one
+//!   workgroup per frame over the contiguous blocks of its edges, which
+//!   writes the other half of each edge's product for a second pass to
+//!   gather.
+//! - **Point elimination** (`shaders/reduced_elim.wgsl`, opt-in with
+//!   `VISLOC_GPU_ELIMINATION=1`): the system's off-diagonal blocks, formed
+//!   on the device and kept there for the solve, summed exactly in 64-bit
+//!   fixed point. The CPU keeps the diagonal blocks and the right-hand side
+//!   (f64) and factors the preconditioner from the blocks the device
+//!   returns. By default the CPU forms the blocks (faster on an L4 with 21
+//!   CPU threads: 1.58 s against 1.87 s a trial at SmallCity's size) and
+//!   uploads them in f32 for each solve.
 //!
 //! Every reduction sums in a fixed order and the elimination's sums are
 //! exact, so a solve is deterministic on a given device; its f32 arithmetic
@@ -26,7 +33,7 @@ use visloc_slam::{
     EliminatedBlocks, PointElimination, ReducedCameraSystem, ReducedSolveAccelerator,
 };
 
-const ENTRIES: [&str; 14] = [
+const ENTRIES: [&str; 15] = [
     "init",
     "init_b",
     "precond_cluster",
@@ -35,7 +42,8 @@ const ENTRIES: [&str; 14] = [
     "precond_finish",
     "init_rz",
     "init_p",
-    "matvec",
+    "matvec_out",
+    "matvec_in",
     "alpha",
     "update_xr",
     "check",
@@ -50,29 +58,33 @@ const COARSE_APPLY: usize = 4;
 const PRECOND_FINISH: usize = 5;
 const INIT_RZ: usize = 6;
 const INIT_P: usize = 7;
-const MATVEC: usize = 8;
-const ALPHA: usize = 9;
-const UPDATE_XR: usize = 10;
-const CHECK: usize = 11;
-const BETA: usize = 12;
-const UPDATE_P: usize = 13;
+const MATVEC_OUT: usize = 8;
+const MATVEC_IN: usize = 9;
+const ALPHA: usize = 10;
+const UPDATE_XR: usize = 11;
+const CHECK: usize = 12;
+const BETA: usize = 13;
+const UPDATE_P: usize = 14;
 
-/// PCG bindings: 0 is the uniform, 1-9 read-only storage, 10-18 read-write.
-const NUM_BINDINGS: usize = 19;
+/// PCG bindings: 0 is the uniform, 1-10 read-only storage, 11-20 read-write.
+const NUM_BINDINGS: usize = 21;
 const B_BLOCKS: usize = 1;
 const B_DIAG: usize = 2;
-const B_ROW_PTR: usize = 3;
-const B_ROW_ENT: usize = 4;
-const B_ROW_COL: usize = 5;
-const B_CL_MAT: usize = 6;
-const B_CL_OFF: usize = 7;
-const B_COARSE: usize = 8;
-const B_RHS: usize = 9;
-const B_X: usize = 10;
-const B_PARTIALS: usize = 15;
-const B_RC: usize = 16;
-const B_YC: usize = 17;
-const B_SCAL: usize = 18;
+const B_OUT_OFF: usize = 3;
+const B_EDGE_B: usize = 4;
+const B_IN_OFF: usize = 5;
+const B_IN_EDGE: usize = 6;
+const B_CL_MAT: usize = 7;
+const B_CL_OFF: usize = 8;
+const B_COARSE: usize = 9;
+const B_RHS: usize = 10;
+/// x, r, z, p, Ap: five consecutive bindings.
+const B_X: usize = 11;
+const B_U: usize = 16;
+const B_PARTIALS: usize = 17;
+const B_RC: usize = 18;
+const B_YC: usize = 19;
+const B_SCAL: usize = 20;
 /// `scal` slots read back by the host (see the shader).
 const S_DONE: usize = 6;
 const S_ITERS: usize = 7;
@@ -199,6 +211,10 @@ struct State {
     /// Structure whose blocks the last elimination left in the PCG's block
     /// buffer.
     resident: Option<u64>,
+    /// Host-visible buffer that stages each solve's uploads, kept between
+    /// solves, and whether it is mapped for writing.
+    upload: Option<wgpu::Buffer>,
+    upload_mapped: bool,
 }
 
 /// The reduced-camera solve on the GPU; register it with
@@ -214,6 +230,10 @@ pub struct GpuReducedSolver {
     state: Mutex<State>,
     /// Iterations encoded per submission between reads of the done flag.
     chunk: u32,
+    /// Whether [`ReducedSolveAccelerator::eliminate`] forms the blocks on
+    /// the device (`VISLOC_GPU_ELIMINATION=1`); otherwise it declines and
+    /// the CPU forms them.
+    device_elimination: bool,
 }
 
 /// Row-kernel grid for `count` workgroups and its x extent.
@@ -321,6 +341,7 @@ impl GpuReducedSolver {
             .and_then(|v| v.parse().ok())
             .filter(|&c: &u32| c > 0)
             .unwrap_or(32);
+        let device_elimination = std::env::var("VISLOC_GPU_ELIMINATION").is_ok_and(|v| v == "1");
         let state = State {
             pcg: BufferSet::new("reduced-pcg", NUM_BINDINGS),
             elim: BufferSet::new("reduced-elim", NUM_ELIM_BINDINGS),
@@ -334,6 +355,8 @@ impl GpuReducedSolver {
             elim_of: None,
             hcp_of: None,
             resident: None,
+            upload: None,
+            upload_mapped: false,
         };
         Self {
             ctx,
@@ -344,7 +367,15 @@ impl GpuReducedSolver {
             elim_chunk,
             state: Mutex::new(state),
             chunk,
+            device_elimination,
         }
+    }
+
+    /// Form the off-diagonal blocks on the device (or not), whatever
+    /// `VISLOC_GPU_ELIMINATION` says.
+    pub fn with_device_elimination(mut self, on: bool) -> Self {
+        self.device_elimination = on;
+        self
     }
 
     pub fn context(&self) -> &GpuContext {
@@ -397,6 +428,9 @@ impl GpuReducedSolver {
     }
 
     fn eliminate_blocks(&self, e: &PointElimination<'_>) -> Option<EliminatedBlocks> {
+        if !self.device_elimination {
+            return None;
+        }
         let n = e.row_off.len().checked_sub(1)?;
         let n_points = e.point_off.len().checked_sub(1)?;
         let n_edges = e.edges.len();
@@ -696,10 +730,21 @@ impl GpuReducedSolver {
         let (coarse_m, coarse_group, coarse_nodes, coarse_inv) = match sys.coarse {
             Some((group, nodes, inv)) => {
                 let m = inv.nrows() / 6;
-                if group == 0 || nodes > n || m == 0 || m != nodes.div_ceil(group) {
+                if group == 0
+                    || nodes > n
+                    || m == 0
+                    || m != nodes.div_ceil(group)
+                    || inv.ncols() != inv.nrows()
+                {
                     return None;
                 }
-                let mat: Vec<f32> = inv.as_slice().iter().map(|&v| v as f32).collect();
+                // Row-major: `coarse_apply` reads one row per workgroup.
+                let mat: Vec<f32> = inv
+                    .transpose()
+                    .as_slice()
+                    .iter()
+                    .map(|&v| v as f32)
+                    .collect();
                 (m, group, nodes, mat)
             }
             None => (0, 1, 0, vec![0.0f32]),
@@ -729,9 +774,10 @@ impl GpuReducedSolver {
         let mut sizes = [0u64; NUM_BINDINGS];
         sizes[B_BLOCKS] = f(36 * n_edges);
         sizes[B_DIAG] = f(diag.len());
-        sizes[B_ROW_PTR] = f(n + 1);
-        sizes[B_ROW_ENT] = f(2 * n_edges);
-        sizes[B_ROW_COL] = f(2 * n_edges);
+        sizes[B_OUT_OFF] = f(n + 1);
+        sizes[B_EDGE_B] = f(n_edges);
+        sizes[B_IN_OFF] = f(n + 1);
+        sizes[B_IN_EDGE] = f(n_edges);
         sizes[B_CL_MAT] = f(cl_mat.len());
         sizes[B_CL_OFF] = f(cl_off.len());
         sizes[B_COARSE] = f(coarse_inv.len());
@@ -739,6 +785,7 @@ impl GpuReducedSolver {
         for s in &mut sizes[B_X..B_X + 5] {
             *s = f(n6);
         }
+        sizes[B_U] = f(6 * n_edges);
         sizes[B_PARTIALS] = f(n.max(n_wg));
         sizes[B_RC] = f((6 * coarse_m).max(1));
         sizes[B_YC] = f((6 * coarse_m).max(1));
@@ -758,65 +805,106 @@ impl GpuReducedSolver {
         let mut lost_csr = false;
         for (b, &size) in sizes.iter().enumerate().skip(1) {
             let fresh = st.pcg.ensure(dev, limit, b, size);
-            lost_csr |= fresh && (B_ROW_PTR..=B_ROW_COL).contains(&b);
+            lost_csr |= fresh && (B_OUT_OFF..=B_IN_EDGE).contains(&b);
             if fresh && b == B_BLOCKS && resident {
                 return None;
             }
         }
-        if !resident {
-            queue.write_buffer(st.pcg.get(B_BLOCKS), 0, bytemuck::cast_slice(sys.offdiag));
-            st.resident = None;
-        }
-        if lost_csr || sys.structure_id == 0 || st.csr_of != Some(sys.structure_id) {
-            // Both block rows of every edge: row b reads the block as
-            // stored, row a its transpose (bit 31), each in edge order.
-            let mut row_ptr = vec![0u32; n + 1];
+        let csr = if lost_csr || sys.structure_id == 0 || st.csr_of != Some(sys.structure_id) {
+            // Node a's edges (a, _) are the run out_off[a]..out_off[a + 1]
+            // (the edges are sorted by a); the edges ending at node b are
+            // in_edge[in_off[b]..in_off[b + 1]], in edge order.
+            let mut out_off = vec![0u32; n + 1];
+            let mut in_off = vec![0u32; n + 1];
+            let mut prev_a = 0u32;
             for &(a, b) in sys.edges {
-                if a as usize >= n || b as usize >= n || a == b {
+                if a as usize >= n || b as usize >= n || a == b || a < prev_a {
                     return None;
                 }
-                row_ptr[a as usize + 1] += 1;
-                row_ptr[b as usize + 1] += 1;
+                prev_a = a;
+                out_off[a as usize + 1] += 1;
+                in_off[b as usize + 1] += 1;
             }
             for i in 0..n {
-                row_ptr[i + 1] += row_ptr[i];
+                out_off[i + 1] += out_off[i];
+                in_off[i + 1] += in_off[i];
             }
-            let mut cursor: Vec<u32> = row_ptr[..n].to_vec();
-            let mut row_ent = vec![0u32; 2 * n_edges];
-            let mut row_col = vec![0u32; 2 * n_edges];
-            for (e, &(a, b)) in sys.edges.iter().enumerate() {
-                let ia = cursor[a as usize] as usize;
-                row_ent[ia] = e as u32 | 1 << 31;
-                row_col[ia] = b;
-                cursor[a as usize] += 1;
-                let ib = cursor[b as usize] as usize;
-                row_ent[ib] = e as u32;
-                row_col[ib] = a;
+            let edge_b: Vec<u32> = sys.edges.iter().map(|&(_, b)| b).collect();
+            let mut cursor: Vec<u32> = in_off[..n].to_vec();
+            let mut in_edge = vec![0u32; n_edges];
+            for (e, &(_, b)) in sys.edges.iter().enumerate() {
+                in_edge[cursor[b as usize] as usize] = e as u32;
                 cursor[b as usize] += 1;
             }
-            for (b, data) in [
-                (B_ROW_PTR, &row_ptr),
-                (B_ROW_ENT, &row_ent),
-                (B_ROW_COL, &row_col),
-            ] {
-                if !data.is_empty() {
-                    queue.write_buffer(st.pcg.get(b), 0, bytemuck::cast_slice(data));
-                }
-            }
             st.csr_of = (sys.structure_id != 0).then_some(sys.structure_id);
+            Some([out_off, edge_b, in_off, in_edge])
+        } else {
+            None
+        };
+        // This solve's uploads go through one host-visible buffer kept
+        // between solves. `Queue::write_buffer` stages each call in a
+        // freshly allocated buffer, and allocating ~0.5 GB of host memory
+        // per solve (the blocks at SmallCity's size) cost ~0.6 s on an L4
+        // machine, a third of the solve.
+        let mut parts: Vec<(usize, &[u8])> = Vec::new();
+        if !resident {
+            parts.push((B_BLOCKS, bytemuck::cast_slice(sys.offdiag)));
+            st.resident = None;
         }
-        queue.write_buffer(&st.pcg_params, 0, bytemuck::bytes_of(&params));
-        for (b, bytes) in [
+        if let Some(csr) = &csr {
+            for (b, data) in [B_OUT_OFF, B_EDGE_B, B_IN_OFF, B_IN_EDGE]
+                .into_iter()
+                .zip(csr)
+            {
+                parts.push((b, bytemuck::cast_slice(data)));
+            }
+        }
+        parts.extend([
             (B_DIAG, bytemuck::cast_slice::<f32, u8>(&diag)),
             (B_CL_MAT, bytemuck::cast_slice(&cl_mat)),
             (B_CL_OFF, bytemuck::cast_slice(&cl_off)),
             (B_COARSE, bytemuck::cast_slice(&coarse_inv)),
             (B_RHS, bytemuck::cast_slice(&rhs)),
-        ] {
-            if !bytes.is_empty() {
-                queue.write_buffer(st.pcg.get(b), 0, bytes);
+        ]);
+        parts.retain(|(_, data)| !data.is_empty());
+        let total: u64 = parts.iter().map(|(_, data)| data.len() as u64).sum();
+        if st.upload.as_ref().map_or(0, |u| u.size()) < total {
+            // Every part is 4-byte words, so `total` is a multiple of 4,
+            // as a buffer mapped at creation must be.
+            let size = ((total + total / 4).div_ceil(4) * 4)
+                .min(self.ctx.limits.max_buffer_size / 4 * 4)
+                .max(total);
+            st.upload = Some(dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("reduced-upload"),
+                size,
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            }));
+            st.upload_mapped = true;
+        }
+        let upload = st.upload.as_ref().expect("upload buffer");
+        if !st.upload_mapped {
+            let (tx, rx) = std::sync::mpsc::channel();
+            upload.slice(..).map_async(wgpu::MapMode::Write, move |r| {
+                let _ = tx.send(r);
+            });
+            dev.poll(wgpu::PollType::wait_indefinitely()).ok();
+            rx.recv().ok()?.ok()?;
+            st.upload_mapped = true;
+        }
+        let mut offsets = Vec::with_capacity(parts.len());
+        {
+            let mut view = upload.slice(..total).get_mapped_range_mut().ok()?;
+            let mut off = 0usize;
+            for (_, data) in &parts {
+                view.slice(off..off + data.len()).copy_from_slice(data);
+                offsets.push(off as u64);
+                off += data.len();
             }
         }
+        upload.unmap();
+        st.upload_mapped = false;
+        queue.write_buffer(&st.pcg_params, 0, bytemuck::bytes_of(&params));
         let entries: Vec<wgpu::BindGroupEntry> = (0..NUM_BINDINGS)
             .map(|b| wgpu::BindGroupEntry {
                 binding: b as u32,
@@ -838,9 +926,10 @@ impl GpuReducedSolver {
         let encode = |pass: &mut wgpu::ComputePass<'_>, k: usize| {
             pass.set_pipeline(&self.pipes[k]);
             match k {
-                MATVEC => pass.dispatch_workgroups(mx, my, 1),
+                MATVEC_OUT | MATVEC_IN => pass.dispatch_workgroups(mx, my, 1),
                 PRECOND_CLUSTER => pass.dispatch_workgroups(cx, cy, 1),
-                COARSE_RESTRICT | COARSE_APPLY => pass.dispatch_workgroups(coarse_wg, 1, 1),
+                COARSE_RESTRICT => pass.dispatch_workgroups(coarse_wg, 1, 1),
+                COARSE_APPLY => pass.dispatch_workgroups(6 * coarse_m as u32, 1, 1),
                 INIT_B | INIT_RZ | ALPHA | CHECK | BETA => pass.dispatch_workgroups(1, 1, 1),
                 _ => pass.dispatch_workgroups(elem, 1, 1),
             }
@@ -857,6 +946,17 @@ impl GpuReducedSolver {
             let mut encoder = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("reduced-pcg"),
             });
+            if with_init {
+                for ((b, data), &off) in parts.iter().zip(&offsets) {
+                    encoder.copy_buffer_to_buffer(
+                        upload,
+                        off,
+                        st.pcg.get(*b),
+                        0,
+                        data.len() as u64,
+                    );
+                }
+            }
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("reduced-pcg"),
@@ -871,7 +971,8 @@ impl GpuReducedSolver {
                     encode(&mut pass, INIT_P);
                 }
                 for _ in 0..iterations {
-                    encode(&mut pass, MATVEC);
+                    encode(&mut pass, MATVEC_OUT);
+                    encode(&mut pass, MATVEC_IN);
                     encode(&mut pass, ALPHA);
                     encode(&mut pass, UPDATE_XR);
                     encode(&mut pass, CHECK);
@@ -965,6 +1066,9 @@ mod tests {
                 edges.push((a as u32, b as u32));
             }
         }
+        // Sorted, as the solver's systems are.
+        edges.sort_unstable();
+        edges.dedup();
         let scale: Vec<f64> = (0..n).map(|_| 10f64.powf(rng.next() + 1.0)).collect();
         let mut diag: Vec<Matrix6<f64>> = (0..n)
             .map(|i| Matrix6::identity() * 1e-3 * scale[i] * scale[i])
@@ -1275,7 +1379,7 @@ mod tests {
             eprintln!("no GPU adapter; skipping");
             return;
         };
-        let solver = GpuReducedSolver::new(ctx);
+        let solver = GpuReducedSolver::new(ctx).with_device_elimination(true);
         let el = random_elimination(150, 4000, 11);
         let k = 8;
         let (group, m) = (10usize, 15usize);
@@ -1352,7 +1456,7 @@ mod tests {
             eprintln!("no GPU adapter; skipping");
             return;
         };
-        let solver = GpuReducedSolver::new(ctx);
+        let solver = GpuReducedSolver::new(ctx).with_device_elimination(true);
         let el = random_elimination(120, 3000, 5);
         let input = PointElimination {
             structure_id: 7,
@@ -1414,6 +1518,10 @@ mod tests {
             .expect("uploaded solve");
         // Without an elimination there are no resident blocks.
         assert!(solver.solve(&system(&diag, &el.edges, &[], &rhs)).is_none());
+        // Device elimination is opt-in.
+        let solver = solver.with_device_elimination(false);
+        assert!(solver.eliminate(&input).is_none());
+        let solver = solver.with_device_elimination(true);
         solver.eliminate(&input).expect("GPU elimination");
         let (resident, it_res) = solver
             .solve(&system(&diag, &el.edges, &[], &rhs))
@@ -1427,6 +1535,45 @@ mod tests {
         eprintln!("iterations {it_up} vs {it_res}; max step difference {diff:.2e} of {size:.2e}");
         assert!(it_up.abs_diff(it_res) <= 1);
         assert!(diff <= 1e-4 * size);
+    }
+
+    #[test]
+    fn solves_are_deterministic_and_unsorted_edges_decline() {
+        let Some(ctx) = visloc_gsplat_render::try_context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let solver = GpuReducedSolver::new(ctx);
+        let sys = random_system(200, 13);
+        let a = dense(&sys);
+        let clusters = cluster_inverses(&a, 200, 16);
+        let coarse = coarse_matrix(&a, 200, 25)
+            .cholesky()
+            .expect("SPD")
+            .inverse();
+        let mut system = ReducedCameraSystem {
+            structure_id: 5,
+            diag: &sys.diag,
+            edges: &sys.edges,
+            offdiag: &sys.offdiag,
+            rhs: &sys.rhs,
+            clusters: Some(&clusters),
+            coarse: Some((25, 200, &coarse)),
+            tol: 1e-3,
+            max_iterations: 500,
+        };
+        let first = solver.solve(&system).expect("GPU solve");
+        // The cached structure, then a rebuilt one: the same bits.
+        assert_eq!(first, solver.solve(&system).expect("GPU solve"));
+        system.structure_id = 0;
+        assert_eq!(first, solver.solve(&system).expect("GPU solve"));
+        // Edges out of order: the product needs each node's edges
+        // contiguous, so the solver declines.
+        let mut edges = sys.edges.clone();
+        let last = edges.len() - 1;
+        edges.swap(0, last);
+        system.edges = &edges;
+        assert!(solver.solve(&system).is_none());
     }
 
     #[test]

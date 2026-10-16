@@ -2798,8 +2798,21 @@ fn solve_step(
         // accumulating into its own vector, summed in chunk order, so the
         // result does not depend on the thread count. The blocks are read
         // in f32 unless `VISLOC_PORT_PCG_F64_BLOCKS=1` ([`pcg_f32_blocks`]).
-        let blocks32: Option<Vec<nalgebra::Matrix6<f32>>> =
-            pcg_f32_blocks().then(|| flat_offdiag.par_iter().map(|m| m.cast::<f32>()).collect());
+        // One f32 copy serves both a registered accelerator (its input) and
+        // the CPU product.
+        let accelerator = crate::ba_accel::reduced_solve_accelerator();
+        let blocks32: Option<Vec<f32>> = (accelerator.is_some() || pcg_f32_blocks()).then(|| {
+            let mut out = vec![0.0f32; flat_offdiag.len() * 36];
+            out.par_chunks_mut(36)
+                .zip(flat_offdiag.par_iter())
+                .for_each(|(out, blk)| {
+                    for (o, &v) in out.iter_mut().zip(blk.as_slice()) {
+                        *o = v as f32;
+                    }
+                });
+            out
+        });
+        let cpu_blocks32 = blocks32.as_deref().filter(|_| pcg_f32_blocks());
         let n_chunks = PCG_MATVEC_CHUNKS.min(edges.len().max(1));
         let bounds: Vec<usize> = (0..=n_chunks).map(|c| c * edges.len() / n_chunks).collect();
         let matvec = |x: &[Vector6<f64>]| -> Vec<Vector6<f64>> {
@@ -2809,8 +2822,10 @@ fn solve_step(
                     let mut y = vec![Vector6::zeros(); n_free];
                     for e in bounds[c]..bounds[c + 1] {
                         let (a, b) = (edges[e].0 as usize, edges[e].1 as usize);
-                        let (ya, yb) = match &blocks32 {
-                            Some(blocks) => edge_product(blocks[e].as_slice(), &x[a], &x[b]),
+                        let (ya, yb) = match cpu_blocks32 {
+                            Some(blocks) => {
+                                edge_product(&blocks[36 * e..36 * e + 36], &x[a], &x[b])
+                            }
                             None => edge_product(flat_offdiag[e].as_slice(), &x[a], &x[b]),
                         };
                         y[a] += ya;
@@ -2843,22 +2858,13 @@ fn solve_step(
             .and_then(|g| coarse_correction(&frame_diag, edges, &flat_offdiag, first_extra, g));
         // A registered accelerator (e.g. visloc-ba-gpu's) runs the same
         // iteration; it may decline, and then the CPU solve below runs.
-        if let Some(accelerator) = crate::ba_accel::reduced_solve_accelerator() {
-            let mut offdiag = vec![0.0f32; flat_offdiag.len() * 36];
-            offdiag
-                .par_chunks_mut(36)
-                .zip(flat_offdiag.par_iter())
-                .for_each(|(out, blk)| {
-                    for (o, &v) in out.iter_mut().zip(blk.as_slice()) {
-                        *o = v as f32;
-                    }
-                });
+        if let (Some(accelerator), Some(offdiag)) = (accelerator, blocks32.as_deref()) {
             let coarse_inverse = coarse.as_ref().map(CoarseCorrection::inverse);
             let system = ReducedCameraSystem {
                 structure_id: problem.structure_id,
                 diag: &frame_diag,
                 edges,
-                offdiag: &offdiag,
+                offdiag,
                 rhs: &frame_bc,
                 clusters: clusters.as_deref(),
                 coarse: coarse

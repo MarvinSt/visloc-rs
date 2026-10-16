@@ -363,6 +363,7 @@ pub fn build_photo_dataset(
     }
 
     // Decode (oriented), scale, and read the EXIF focal in parallel.
+    let t_load = std::time::Instant::now();
     let decoded: Vec<(image::RgbImage, Option<f64>)> = files
         .par_iter()
         .map(|p| -> Result<_, EurocError> {
@@ -415,8 +416,10 @@ pub fn build_photo_dataset(
         .unzip();
     let n = files.len();
     log(&format!(
-        "{n} images at {width}x{height} ({resized} resized from within 1%; others dropped: {})",
-        sizes.len() - n
+        "{n} images at {width}x{height} ({resized} resized from within 1%; others dropped: {}; \
+         decoded in {:.1} s)",
+        sizes.len() - n,
+        t_load.elapsed().as_secs_f64()
     ));
     let long = width.max(height) as f64;
     let mut f35s: Vec<f64> = decoded.iter().filter_map(|d| d.1).collect();

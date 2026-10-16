@@ -317,20 +317,32 @@ built from source with CUDA and Caspar, its GPU bundle adjuster:
     incremental mapper scored 53.5 to 53.7 AUC@1° in all five Ceres runs
     (four above, one here) and 46.7 and 47.2 in the two Caspar runs.
     Caspar solves in f32.
-- **Front ends**, 13 scenes, each on its own features:
+- **Front ends**, 13 scenes, each on its own features. The last column is
+  a later run on another L4 machine (13 CPU threads, commit `580d699`) with
+  `gsplat_photos`' current defaults: GPU SIFT, GPU matching and completing
+  the largest model.
 
-  | Step | COLMAP | visloc-rs |
-  |---|---|---|
-  | Feature extraction | **22.2 s** (GPU) | 132.4 s (CPU) |
-  | Matching and verification | 44.2 s | **25.9 s** |
-  | Mapper | 158.6 s (global) | **37.4 s** |
-  | Total | 225.0 s | **195.7 s** |
+  | Step | COLMAP | visloc-rs, CPU SIFT | visloc-rs, GPU SIFT |
+  |---|---|---|---|
+  | Feature extraction | 22.2 s (GPU) | 132.4 s | **16.3 s** |
+  | Matching and verification | 44.2 s | 25.9 s | **23.3 s** |
+  | Mapper | 158.6 s (global) | 37.4 s | **33.8 s** |
+  | Total | 225.0 s | 195.7 s | **73.4 s** |
 
-  - visloc-rs's SIFT here is its VLFeat-compatible CPU extractor, the photo
-    pipeline's default; COLMAP extracts six times faster. visloc-rs's GPU
-    extractor is in the next point.
-  - COLMAP's extraction time includes decoding its images, resized to
-    1,600 px beforehand. visloc-rs's starts after decoding.
+  - **On the same GPU model, visloc-rs's GPU SIFT extracts 1.4 times faster
+    than COLMAP's CUDA extractor**, and its front end and mapper together
+    take a third of COLMAP's time. Its matching and mapper ran on 13 CPU
+    threads, COLMAP's on 21.
+  - The GPU SIFT run had COLMAP's input: the photos resized to 1,600 px
+    beforehand (PIL Lanczos, JPEG quality 95). Both extraction times include
+    decoding those (1.0 s of visloc-rs's 16.3 s). The CPU SIFT column's
+    132.4 s starts after decoding.
+  - It scores 53.33 / 79.98 / 87.05 with 452 of 454 registered. On the
+    original 24-megapixel photos (the protocol above) the same run scores
+    53.24 / 79.65 / 86.90, also 452 of 454; decoding and resizing them took
+    32.6 s on its 13 threads. The COLMAP runs got their resized photos from
+    the benchmark script, untimed.
+  - Per-scene times are in `benchmarks/eth3d_auc_gpu/l4_front_end/`.
 - **visloc-rs's GPU SIFT** (now `gsplat_photos`' default; `--cpu-sift`
   extracts on the CPU), the same 13 scenes with each extractor on another
   machine (RunPod: an RTX 3090, 13 CPU threads, commit `f8ee5b5`):
@@ -348,8 +360,7 @@ built from source with CUDA and Caspar, its GPU bundle adjuster:
     (courtyard at 1°); at 1° it goes up in six scenes and down in seven.
     The mean keypoint counts per image agree to within one in 12 scenes
     and differ by 0.6% on facade.
-  - The RTX 3090 is a faster GPU than the L4, so its 10.0 s does not
-    compare directly with COLMAP's 22.2 s.
+  - On an L4 the GPU extractor took 15.3 s (the front-end table above).
   - The results are in `benchmarks/eth3d_auc_gpu/gpu_sift/`.
 
 ### SmallCity
@@ -393,7 +404,9 @@ matches (6.6 min):
   like that across mapper seeds too (0.15 m to 0.65 m).
 - **The GPU bundle adjustment** is not faster on this GPU, and its run parts
   from the CPU run after its first solve
-  ([GPU bundle adjustment](gpu_bundle_adjustment.md)).
+  ([GPU bundle adjustment](gpu_bundle_adjustment.md)). A later version's
+  conjugate gradients run twice as fast as the CPU's, but the mapper's time
+  stays the same (845.0 s against 846.7 s on another L4 machine).
 - **GPU SIFT** (an RTX 3090 machine with 23 CPU threads): the 5,822
   photos at 1,024 px take 43.8 s, against 201.9 s for the CPU extractor on
   the same machine.

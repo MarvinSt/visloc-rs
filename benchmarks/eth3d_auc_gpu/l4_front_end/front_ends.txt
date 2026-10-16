@@ -1,0 +1,22 @@
+# ETH3D front ends on an NVIDIA L4 (RunPod, 13 CPU threads, commit 580d699):
+# gsplat_photos' defaults (GPU SIFT, GPU matching, completing the largest model),
+# then the visloc-rs mapper replayed for the score (its time). `orig`: the original
+# photos, decoded and resized to 1,600 px by gsplat_photos; `resized`: COLMAP's input
+# in the r26 L4 run, the photos resized to 1,600 px beforehand (PIL Lanczos, JPEG
+# quality 95). colmap_*: that run (another L4, 21 threads; ../front_ends.txt).
+# Mean keypoints per image, seconds.
+scene colmap_extract colmap_match resized_keypoints resized_decode resized_sift resized_match_verify resized_mapper orig_keypoints orig_decode orig_sift orig_match_verify orig_mapper
+pipes 0.9 0.3 2849 0.0 0.7 0.2 0.4 3365 1.3 1.2 0.8 0.4
+courtyard 1.9 4.2 9858 0.1 1.3 2.5 3.8 10635 3.1 1.4 2.8 3.9
+delivery_area 1.9 2.6 4723 0.1 1.3 1.2 2.3 5174 3.1 1.3 1.5 2.5
+electro 2.0 1.8 4561 0.1 1.3 1.2 2.3 5359 3.2 1.4 1.3 2.9
+facade 3.3 22.4 11715 0.1 2.3 10.6 11.8 12144 4.4 2.3 11.2 11.5
+kicker 1.6 1.8 4589 0.1 1.0 0.8 1.3 4415 2.4 1.0 0.8 1.5
+meadow 1.0 0.8 10569 0.0 0.8 0.5 0.8 10822 1.5 0.8 0.5 0.6
+office 1.2 0.3 1361 0.1 0.8 0.2 0.9 1452 1.7 0.9 0.2 0.9
+playground 2.0 4.5 10046 0.1 1.3 2.4 2.3 11071 2.3 1.4 2.6 2.5
+relief 1.7 1.6 6405 0.1 1.1 1.2 2.8 7002 2.1 1.1 1.3 3.2
+relief_2 1.5 0.9 4608 0.1 1.1 0.7 2.0 5085 2.3 1.0 0.8 2.2
+terrace 1.4 1.1 7322 0.0 1.0 0.7 1.5 8470 1.6 1.0 0.8 1.4
+terrains 1.8 1.9 5083 0.1 1.3 1.1 1.6 6055 3.6 1.3 1.4 2.4
+total 22.2 44.2 - 1.0 15.3 23.3 33.8 - 32.6 16.1 26.0 36.0

@@ -156,7 +156,9 @@ mapper. The global mapper failed on one scene in that run; without that
 scene the means are 53.7 / 79.7 / 86.7 against 52.7 / 76.3 / 82.7. GPU
 SIFT, also the default now, extracts those features at the same AUC (53.1 /
 78.9 / 85.7): 10.0 s for the 13 scenes on an RTX 3090, against 92.4 s on 13
-CPU threads of the same machine. On a large capture,
+CPU threads of the same machine. On an L4, the GPU of the COLMAP CUDA runs,
+it took 16.3 s with decoding against COLMAP's 22.2 s, and features, matches
+and mapper together took 73.4 s against COLMAP's 225.0 s. On a large capture,
 the 5,822 SmallCity photos, both mappers get visloc-rs's matches and 32 CPU
 threads: visloc-rs maps it in 21.7 min, and COLMAP's global mapper had not
 finished after 94 min, when a 100-minute cap stopped it.

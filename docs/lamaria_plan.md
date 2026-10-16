@@ -191,6 +191,29 @@ before/after on training sequences.
    ([`lamaria_drift_analysis.md`](lamaria_drift_analysis.md#with-the-online-mapper)).
    Earth-rotation compensation and a VIO outlier filter did not help and stay
    opt-in.
+11. **Online mapper on the refined VIO.** Status: **studied on four tracks
+   (2026-10-15); the submission driver now picks VIO or mapper per track.**
+   The mapper's relative-pose factors come from the window estimates at
+   marginalization, and with the big window each keyframe gets about 30 of
+   them. Without loops they chain up to a trajectory up to 3 m from the
+   VIO's. That chain is better than the VIO output on Medium and Moving
+   platform and worse on Short, Long and Low light. The loops are short
+   revisits that change little. Neither a higher relative-pose weight, fewer
+   factors per keyframe, nor factors measured on the VIO output
+   (`--relative-pose-max-neighbors`, `--mapper-vio-output-poses`, both
+   opt-in) beats the VIO on every track
+   ([`lamaria_drift_analysis.md`](lamaria_drift_analysis.md#with-the-online-mapper)).
+   The driver therefore submits the VIO on Short, Long and Low light and the
+   mapper on Medium and Moving platform: 53.27 on one training sequence per
+   track, against 51.44 with the mapper everywhere.
+12. **KLT round-trip threshold in low light.** Status: **measured on four
+   tracks (2026-10-16); Low light only.** 0.5 px instead of 0.2 px raises
+   the low-light VIO from 34.49 to 39.00 but costs 11 points on Medium
+   ([`lamaria_klt_threshold.md`](lamaria_klt_threshold.md)).
+13. **Remaining scale error on Moving platform.** sequence_5_11's VIO
+   measures the route about 6 % short, with or without the funicular ride.
+   Removing its fitted scale drift alone would be worth about +15 there, the
+   largest gain left on any track; the cause is still open.
 
 ## 5. Test-set operational pipeline
 

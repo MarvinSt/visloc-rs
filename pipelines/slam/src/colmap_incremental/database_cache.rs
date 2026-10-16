@@ -298,6 +298,21 @@ impl DatabaseCache {
         let mut frame_ids_seen: std::collections::BTreeSet<FrameT> =
             std::collections::BTreeSet::new();
 
+        // The feature files, parsed in parallel; the loop below takes each
+        // image's result in image order, so the first error is the same.
+        let mut parsed: Vec<Option<Result<Vec<Point2<f64>>, DatabaseCacheError>>> = {
+            use rayon::prelude::*;
+            pairs_export
+                .image_names
+                .par_iter()
+                .map(|name| {
+                    Some(parse_features_txt(
+                        &features_dir.join(format!("{}_features.txt", stem(name))),
+                    ))
+                })
+                .collect()
+        };
+
         for (image_index, name) in pairs_export.image_names.iter().enumerate() {
             let image_id = image_index as ImageT;
             let &(frame_idx, sensor_index) = frame_of_name.get(name.as_str()).ok_or_else(|| {
@@ -321,7 +336,7 @@ impl DatabaseCache {
                 .add_data_id(DataT::camera(camera_id, image_id));
 
             let features_path = features_dir.join(format!("{}_features.txt", stem(name)));
-            let keypoints = parse_features_txt(&features_path)?;
+            let keypoints = parsed[image_index].take().expect("parsed once")?;
             let expected = pairs_export.feature_counts[image_index] as usize;
             if keypoints.len() != expected {
                 return Err(DatabaseCacheError::Inconsistent(format!(

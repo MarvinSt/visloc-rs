@@ -499,11 +499,11 @@ impl Reconstruction {
             poses.push(Pose {
                 world_to_camera: cam_from_world,
             });
+            // The writer reads only the keypoints.
             let keypoints: Vec<Point2<f64>> = image.points2d.iter().map(|p| p.xy).collect();
-            let descriptors = vec![Vec::new(); keypoints.len()];
             features.push(FeatureSet {
                 keypoints,
-                descriptors,
+                descriptors: Vec::new(),
             });
             names.push(image.name.clone());
             output_index_of.insert(image_id, output_index);

@@ -443,9 +443,14 @@ impl CorrespondenceGraph {
         }
 
         let mut stats = IngestStats::default();
+        // Both entries looked up once (the ids differ, checked above).
+        let [Some(img1), Some(img2)] = self.images.get_disjoint_mut([&image_id1, &image_id2])
+        else {
+            unreachable!("both images exist (checked above)");
+        };
         for &(k1, k2) in matches {
-            let valid1 = k1 < self.images[&image_id1].num_points2d();
-            let valid2 = k2 < self.images[&image_id2].num_points2d();
+            let valid1 = k1 < img1.num_points2d();
+            let valid2 = k2 < img2.num_points2d();
             // `.cc:134-136, 174-189`: out-of-bounds indices are dropped.
             if !valid1 || !valid2 {
                 stats.out_of_bounds += 1;
@@ -453,7 +458,7 @@ impl CorrespondenceGraph {
             }
             // `.cc:143-149`: duplicate check from image1's side only — valid
             // because correspondences are always added bidirectionally below.
-            let duplicate = self.images[&image_id1].corrs[k1]
+            let duplicate = img1.corrs[k1]
                 .iter()
                 .any(|c| c.image_id == image_id2 && c.point2d_idx == k2);
             if duplicate {
@@ -462,19 +467,13 @@ impl CorrespondenceGraph {
             }
             // `.cc:163-173`: add bidirectionally; the first correspondence at
             // a point2D promotes it to an "observation".
-            {
-                let img1 = self.images.get_mut(&image_id1).unwrap();
-                img1.corrs[k1].push(Correspondence::new(image_id2, k2));
-                if img1.corrs[k1].len() == 1 {
-                    img1.num_observations += 1;
-                }
+            img1.corrs[k1].push(Correspondence::new(image_id2, k2));
+            if img1.corrs[k1].len() == 1 {
+                img1.num_observations += 1;
             }
-            {
-                let img2 = self.images.get_mut(&image_id2).unwrap();
-                img2.corrs[k2].push(Correspondence::new(image_id1, k1));
-                if img2.corrs[k2].len() == 1 {
-                    img2.num_observations += 1;
-                }
+            img2.corrs[k2].push(Correspondence::new(image_id1, k1));
+            if img2.corrs[k2].len() == 1 {
+                img2.num_observations += 1;
             }
             stats.added += 1;
         }
@@ -483,8 +482,8 @@ impl CorrespondenceGraph {
         // correspondences actually recorded for this pair (COLMAP increments
         // by the raw match count up front, then decrements per dropped match;
         // net effect is the same as incrementing by `stats.added` directly).
-        self.images.get_mut(&image_id1).unwrap().num_correspondences += stats.added;
-        self.images.get_mut(&image_id2).unwrap().num_correspondences += stats.added;
+        img1.num_correspondences += stats.added;
+        img2.num_correspondences += stats.added;
 
         self.image_pairs.insert(
             key,
@@ -617,7 +616,7 @@ impl CorrespondenceGraph {
 
         self.images.retain(|_, image| image.num_observations > 0);
 
-        for image in self.images.values_mut() {
+        let flatten = |image: &mut ImageEntry| {
             let num_points2d = image.corrs.len();
             let mut flat_corrs = Vec::with_capacity(image.num_correspondences);
             let mut flat_corr_begs = Vec::with_capacity(num_points2d + 1);
@@ -629,7 +628,17 @@ impl CorrespondenceGraph {
             image.flat_corrs = flat_corrs;
             image.flat_corr_begs = flat_corr_begs;
             image.corrs = Vec::new();
+        };
+        // Each image is flattened on its own, so the order does not matter.
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            self.images
+                .par_iter_mut()
+                .for_each(|(_, image)| flatten(image));
         }
+        #[cfg(not(feature = "parallel"))]
+        self.images.values_mut().for_each(flatten);
     }
 }
 

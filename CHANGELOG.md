@@ -578,6 +578,20 @@ All notable changes to `visloc-rs` will be documented here.
   `N images at WxH` line. COLMAP's extraction times include decoding;
   `gsplat_photos`' SIFT times do not.
 
+- **COLMAP-port mapper: faster loading and model export, byte-identical.**
+  - **Loading:** the replay export's feature files are parsed in
+    parallel, and the correspondence graph looks up a pair's two images
+    once instead of per match and flattens images in parallel.
+  - **Export:** the COLMAP text writer
+    (`write_colmap_reconstruction_for_3dgs_with_cameras`) appends numbers
+    to its buffers instead of allocating a string each, keeps keypoint ids
+    in dense arrays instead of maps, and formats `points3D.txt` and
+    `images.txt` in parallel chunks joined in order.
+  - **SmallCity pass 1** (1,499 photos, 4 threads): loading 6.3 s instead
+    of 8.8 s, export 3.1 s instead of 8.4 s, and the model files are
+    byte-identical.
+  - `colmap_incremental_mapper` now logs both times.
+
 - **`gsplat_photos` loads large photos faster, with the same pixels.** Its
   photos go to the working size through a Triangle resize that performs
   `image::imageops::resize`'s arithmetic in the same order, so the working

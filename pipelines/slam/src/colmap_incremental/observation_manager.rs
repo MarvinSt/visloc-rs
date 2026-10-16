@@ -504,7 +504,7 @@ impl ObservationManager {
         let corrs: Vec<(ImageT, Point2DT)> = graph
             .find_correspondences(image_id as usize, point2d_idx)
             .iter()
-            .map(|c| (c.image_id as ImageT, c.point2d_idx))
+            .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
             .collect();
         for (corr_image_id, corr_point2d_idx) in corrs {
             self.increment_correspondence_has_point3d(recon, corr_image_id, corr_point2d_idx);
@@ -533,7 +533,7 @@ impl ObservationManager {
         let corrs: Vec<(ImageT, Point2DT)> = graph
             .find_correspondences(image_id as usize, point2d_idx)
             .iter()
-            .map(|c| (c.image_id as ImageT, c.point2d_idx))
+            .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
             .collect();
         for (corr_image_id, corr_point2d_idx) in corrs {
             let corr_point3d_id = recon.image(corr_image_id).points2d[corr_point2d_idx].point3d_id;

@@ -126,15 +126,19 @@ use std::hash::{BuildHasherDefault, Hasher};
 use super::colmap_verification::ConfigurationType;
 
 /// One `(image, point2D)` correspondence target. Port of
-/// `CorrespondenceGraph::Correspondence` (`correspondence_graph.h:47-58`).
+/// `CorrespondenceGraph::Correspondence` (`correspondence_graph.h:47-58`),
+/// with COLMAP's 32-bit `image_t`/`point2D_t` fields: the graph holds two
+/// per match, which as `usize` pairs took 3.3 GB of SmallCity's 105M
+/// matches. [`CorrespondenceGraph::add_image`] checks that an image's id and
+/// point2D indices fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Correspondence {
-    pub image_id: usize,
-    pub point2d_idx: usize,
+    pub image_id: u32,
+    pub point2d_idx: u32,
 }
 
 impl Correspondence {
-    pub const fn new(image_id: usize, point2d_idx: usize) -> Self {
+    pub const fn new(image_id: u32, point2d_idx: u32) -> Self {
         Self {
             image_id,
             point2d_idx,
@@ -185,6 +189,19 @@ impl IngestStats {
     pub const fn total(&self) -> usize {
         self.added + self.out_of_bounds + self.duplicate
     }
+}
+
+/// One image pair's verified matches, as
+/// [`CorrespondenceGraph::finalized_from_pairs`] takes them: the arguments of
+/// one [`CorrespondenceGraph::add_two_view_geometry`] call, with the point2D
+/// indices in `u32`, the width COLMAP stores them in.
+#[derive(Debug, Clone, Copy)]
+pub struct PairMatches<'a> {
+    pub image_id1: usize,
+    pub image_id2: usize,
+    /// `(point2d_idx_in_image1, point2d_idx_in_image2)` pairs.
+    pub matches: &'a [(u32, u32)],
+    pub config: ConfigurationType,
 }
 
 /// Why [`CorrespondenceGraph::add_two_view_geometry`] could not be applied at
@@ -243,9 +260,10 @@ struct ImageEntry {
     /// Pre-finalize: correspondences per point2D index, grown lazily to
     /// `num_points2d` entries.
     corrs: Vec<Vec<Correspondence>>,
-    /// Post-finalize flattened form (`flat_corrs`/`flat_corr_begs` in COLMAP).
+    /// Post-finalize flattened form (`flat_corrs`/`flat_corr_begs` in COLMAP;
+    /// an image's offsets fit in 32 bits, checked when they are built).
     flat_corrs: Vec<Correspondence>,
-    flat_corr_begs: Vec<usize>,
+    flat_corr_begs: Vec<u32>,
 }
 
 impl ImageEntry {
@@ -312,6 +330,7 @@ impl CorrespondenceGraph {
     /// validate indices against it. Panics if `image_id` was already added
     /// (COLMAP: `THROW_CHECK(!ExistsImage(image_id))`).
     pub fn add_image(&mut self, image_id: usize, num_points2d: usize) {
+        assert_fits_u32(image_id, num_points2d);
         assert!(
             !self.images.contains_key(&image_id),
             "image {image_id} already added to the correspondence graph"
@@ -458,20 +477,19 @@ impl CorrespondenceGraph {
             }
             // `.cc:143-149`: duplicate check from image1's side only — valid
             // because correspondences are always added bidirectionally below.
-            let duplicate = img1.corrs[k1]
-                .iter()
-                .any(|c| c.image_id == image_id2 && c.point2d_idx == k2);
-            if duplicate {
+            // Ids and in-bounds indices fit in `u32` (`add_image`).
+            let forward = Correspondence::new(image_id2 as u32, k2 as u32);
+            if img1.corrs[k1].contains(&forward) {
                 stats.duplicate += 1;
                 continue;
             }
             // `.cc:163-173`: add bidirectionally; the first correspondence at
             // a point2D promotes it to an "observation".
-            img1.corrs[k1].push(Correspondence::new(image_id2, k2));
+            img1.corrs[k1].push(forward);
             if img1.corrs[k1].len() == 1 {
                 img1.num_observations += 1;
             }
-            img2.corrs[k2].push(Correspondence::new(image_id1, k1));
+            img2.corrs[k2].push(Correspondence::new(image_id1 as u32, k1 as u32));
             if img2.corrs[k2].len() == 1 {
                 img2.num_observations += 1;
             }
@@ -510,8 +528,8 @@ impl CorrespondenceGraph {
     pub fn find_correspondences(&self, image_id: usize, point2d_idx: usize) -> &[Correspondence] {
         let image = self.image(image_id);
         if self.finalized {
-            let beg = image.flat_corr_begs[point2d_idx];
-            let end = image.flat_corr_begs[point2d_idx + 1];
+            let beg = image.flat_corr_begs[point2d_idx] as usize;
+            let end = image.flat_corr_begs[point2d_idx + 1] as usize;
             &image.flat_corrs[beg..end]
         } else {
             &image.corrs[point2d_idx]
@@ -538,7 +556,7 @@ impl CorrespondenceGraph {
             return false;
         }
         let other = corrs[0];
-        self.find_correspondences(other.image_id, other.point2d_idx)
+        self.find_correspondences(other.image_id as usize, other.point2d_idx as usize)
             .len()
             == 1
     }
@@ -570,10 +588,12 @@ impl CorrespondenceGraph {
         }
 
         // `.cc:246-253`: seed the queue with the requested observation itself
-        // (removed again at the end), and a visited-set for dedup.
-        let mut corrs = vec![Correspondence::new(image_id, point2d_idx)];
-        let mut visited: HashSet<(usize, usize)> = HashSet::new();
-        visited.insert((image_id, point2d_idx));
+        // (removed again at the end), and a visited-set for dedup. The image
+        // exists, so its id and point2D index fit in `u32`.
+        let seed = Correspondence::new(image_id as u32, point2d_idx as u32);
+        let mut corrs = vec![seed];
+        let mut visited: HashSet<Correspondence> = HashSet::new();
+        visited.insert(seed);
 
         let mut queue_beg = 0usize;
         let mut queue_end = 1usize;
@@ -581,8 +601,11 @@ impl CorrespondenceGraph {
         for _level in 0..transitivity {
             for i in queue_beg..queue_end {
                 let reference = corrs[i];
-                for &next in self.find_correspondences(reference.image_id, reference.point2d_idx) {
-                    if visited.insert((next.image_id, next.point2d_idx)) {
+                for &next in self.find_correspondences(
+                    reference.image_id as usize,
+                    reference.point2d_idx as usize,
+                ) {
+                    if visited.insert(next) {
                         corrs.push(next);
                     }
                 }
@@ -618,13 +641,14 @@ impl CorrespondenceGraph {
 
         let flatten = |image: &mut ImageEntry| {
             let num_points2d = image.corrs.len();
+            assert_offsets_fit_u32(image.num_correspondences);
             let mut flat_corrs = Vec::with_capacity(image.num_correspondences);
             let mut flat_corr_begs = Vec::with_capacity(num_points2d + 1);
             for point2d_idx in 0..num_points2d {
-                flat_corr_begs.push(flat_corrs.len());
+                flat_corr_begs.push(flat_corrs.len() as u32);
                 flat_corrs.extend(image.corrs[point2d_idx].iter().copied());
             }
-            flat_corr_begs.push(flat_corrs.len());
+            flat_corr_begs.push(flat_corrs.len() as u32);
             image.flat_corrs = flat_corrs;
             image.flat_corr_begs = flat_corr_begs;
             image.corrs = Vec::new();
@@ -640,6 +664,258 @@ impl CorrespondenceGraph {
         #[cfg(not(feature = "parallel"))]
         self.images.values_mut().for_each(flatten);
     }
+
+    /// The finalized graph that [`Self::add_image`] for each of `images`
+    /// (`(image_id, num_points2d)`), [`Self::add_two_view_geometry`] for each
+    /// of `pairs` in order, and [`Self::finalize`] build, equal field for
+    /// field, without the per-point2D lists the incremental path keeps until
+    /// `finalize`. Those lists take about twice the memory of the flattened
+    /// correspondences they become, plus a `Vec` per point2D; this builds the
+    /// flattened form directly: per image, it counts each point2D's
+    /// correspondences, then writes them in place, pair by pair in order (the
+    /// incremental path's order). The images are independent, so they are
+    /// built in parallel with the `parallel` feature.
+    ///
+    /// Returns each pair's [`IngestStats`], or the index in `pairs` of the
+    /// first pair `add_two_view_geometry` would reject, with its error. Panics
+    /// if an image id repeats, as `add_image` does.
+    pub fn finalized_from_pairs(
+        images: &[(usize, usize)],
+        pairs: &[PairMatches<'_>],
+    ) -> Result<(Self, Vec<IngestStats>), (usize, CorrespondenceGraphError)> {
+        // Pair indices (and the scratch stamps, one past them) fit in `u32`.
+        assert!(pairs.len() < u32::MAX as usize, "too many image pairs");
+        let mut index_of: HashMap<usize, u32, BuildHasherDefault<IdHasher>> =
+            HashMap::with_capacity_and_hasher(images.len(), Default::default());
+        for (index, &(image_id, num_points2d)) in images.iter().enumerate() {
+            assert_fits_u32(image_id, num_points2d);
+            assert!(
+                index_of.insert(image_id, index as u32).is_none(),
+                "image {image_id} already added to the correspondence graph"
+            );
+        }
+
+        // `add_two_view_geometry`'s checks, in its order, pair by pair.
+        let mut pair_images = Vec::with_capacity(pairs.len());
+        let mut keys = HashSet::with_capacity(pairs.len());
+        for (index, pair) in pairs.iter().enumerate() {
+            let (id1, id2) = (pair.image_id1, pair.image_id2);
+            if id1 == id2 {
+                return Err((index, CorrespondenceGraphError::SelfMatch(id1)));
+            }
+            let Some(&index1) = index_of.get(&id1) else {
+                return Err((index, CorrespondenceGraphError::UnknownImage(id1)));
+            };
+            let Some(&index2) = index_of.get(&id2) else {
+                return Err((index, CorrespondenceGraphError::UnknownImage(id2)));
+            };
+            if !keys.insert(pair_key(id1, id2)) {
+                return Err((index, CorrespondenceGraphError::DuplicatePair(id1, id2)));
+            }
+            pair_images.push([index1, index2]);
+        }
+        drop(keys);
+
+        // The matches each pair drops, and its tally.
+        let num_points2d = |index: u32| images[index as usize].1;
+        let drop_list = |seen: &mut Vec<u32>, p: usize| {
+            let [index1, index2] = pair_images[p];
+            dropped_matches(
+                pairs[p].matches,
+                num_points2d(index1),
+                num_points2d(index2),
+                seen,
+                p as u32 + 1,
+            )
+        };
+        #[cfg(feature = "parallel")]
+        let dropped: Vec<(IngestStats, Vec<u32>)> = {
+            use rayon::prelude::*;
+            (0..pairs.len())
+                .into_par_iter()
+                .map_init(Vec::new, drop_list)
+                .collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let dropped: Vec<(IngestStats, Vec<u32>)> = {
+            let mut seen = Vec::new();
+            (0..pairs.len()).map(|p| drop_list(&mut seen, p)).collect()
+        };
+
+        // Each image's pairs, in pair order:
+        // `incident[incident_off[i]..incident_off[i + 1]]`.
+        let mut incident_off = vec![0usize; images.len() + 1];
+        for &[index1, index2] in &pair_images {
+            incident_off[index1 as usize + 1] += 1;
+            incident_off[index2 as usize + 1] += 1;
+        }
+        for i in 0..images.len() {
+            incident_off[i + 1] += incident_off[i];
+        }
+        let mut incident = vec![0u32; incident_off[images.len()]];
+        let mut next = incident_off.clone();
+        for (p, &[index1, index2]) in pair_images.iter().enumerate() {
+            for index in [index1, index2] {
+                incident[next[index as usize]] = p as u32;
+                next[index as usize] += 1;
+            }
+        }
+        drop(next);
+
+        let build = |i: usize| -> Option<ImageEntry> {
+            let (_, n) = images[i];
+            let incident = &incident[incident_off[i]..incident_off[i + 1]];
+            // `(this image's point2D, the other image, its point2D)` for each
+            // kept match of pair `p`, in match order.
+            let for_each_kept = |p: usize, f: &mut dyn FnMut(usize, usize, usize)| {
+                let pair = &pairs[p];
+                let first = pair_images[p][0] as usize == i;
+                let mut dropped = dropped[p].1.iter().copied().peekable();
+                for (m, &(k1, k2)) in pair.matches.iter().enumerate() {
+                    if dropped.next_if_eq(&(m as u32)).is_some() {
+                        continue;
+                    }
+                    if first {
+                        f(k1 as usize, pair.image_id2, k2 as usize);
+                    } else {
+                        f(k2 as usize, pair.image_id1, k1 as usize);
+                    }
+                }
+            };
+            // Each point2D's count in `begs[k + 1]`, then their prefix sums.
+            let num_correspondences: usize =
+                incident.iter().map(|&p| dropped[p as usize].0.added).sum();
+            assert_offsets_fit_u32(num_correspondences);
+            let mut begs = vec![0u32; n + 1];
+            for &p in incident {
+                for_each_kept(p as usize, &mut |k, _, _| begs[k + 1] += 1);
+            }
+            let num_observations = begs[1..].iter().filter(|&&count| count > 0).count();
+            // `finalize` drops the images without observations.
+            if num_observations == 0 {
+                return None;
+            }
+            for k in 0..n {
+                begs[k + 1] += begs[k];
+            }
+            let mut flat = vec![Correspondence::new(0, 0); num_correspondences];
+            let mut next = begs[..n].to_vec();
+            for &p in incident {
+                for_each_kept(p as usize, &mut |k, other_id, other_k| {
+                    // Ids and in-bounds indices fit in `u32` (checked above).
+                    flat[next[k] as usize] = Correspondence::new(other_id as u32, other_k as u32);
+                    next[k] += 1;
+                });
+            }
+            Some(ImageEntry {
+                num_observations,
+                num_correspondences,
+                corrs: Vec::new(),
+                flat_corrs: flat,
+                flat_corr_begs: begs,
+            })
+        };
+        #[cfg(feature = "parallel")]
+        let entries: Vec<Option<ImageEntry>> = {
+            use rayon::prelude::*;
+            (0..images.len()).into_par_iter().map(build).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let entries: Vec<Option<ImageEntry>> = (0..images.len()).map(build).collect();
+
+        let mut graph = Self {
+            finalized: true,
+            ..Self::default()
+        };
+        graph
+            .images
+            .reserve(entries.iter().filter(|entry| entry.is_some()).count());
+        for (&(image_id, _), entry) in images.iter().zip(entries) {
+            if let Some(entry) = entry {
+                graph.images.insert(image_id, entry);
+            }
+        }
+        graph.image_pairs.reserve(pairs.len());
+        let mut stats = Vec::with_capacity(pairs.len());
+        for (pair, (pair_stats, _)) in pairs.iter().zip(dropped) {
+            graph.image_pairs.insert(
+                pair_key(pair.image_id1, pair.image_id2),
+                EdgeMetadata {
+                    num_matches: pair_stats.added,
+                    config: pair.config,
+                },
+            );
+            stats.push(pair_stats);
+        }
+        Ok((graph, stats))
+    }
+}
+
+/// Panics unless an image's id and point2D indices fit [`Correspondence`]'s
+/// 32-bit fields.
+fn assert_fits_u32(image_id: usize, num_points2d: usize) {
+    assert!(
+        u32::try_from(image_id).is_ok() && u32::try_from(num_points2d).is_ok(),
+        "image {image_id} with {num_points2d} points2D exceeds the graph's 32-bit ids"
+    );
+}
+
+/// Panics unless an image's correspondences fit its 32-bit offsets.
+fn assert_offsets_fit_u32(num_correspondences: usize) {
+    assert!(
+        u32::try_from(num_correspondences).is_ok(),
+        "{num_correspondences} correspondences of one image exceed the graph's 32-bit offsets"
+    );
+}
+
+/// The matches [`CorrespondenceGraph::add_two_view_geometry`] drops from one
+/// pair's list, ascending, with the pair's tally: those out of bounds, and
+/// those repeating an earlier match of the list. A pair is added once, so
+/// an earlier match of the same pair is the only way the correspondence can
+/// already exist. `seen` is scratch, marked with `stamp` (distinct per call)
+/// for each first point2D index; only when one repeats is the list checked
+/// for repeated matches.
+fn dropped_matches(
+    matches: &[(u32, u32)],
+    num_points2d1: usize,
+    num_points2d2: usize,
+    seen: &mut Vec<u32>,
+    stamp: u32,
+) -> (IngestStats, Vec<u32>) {
+    let in_bounds =
+        |k1: u32, k2: u32| (k1 as usize) < num_points2d1 && (k2 as usize) < num_points2d2;
+    if seen.len() < num_points2d1 {
+        seen.resize(num_points2d1, 0);
+    }
+    let mut stats = IngestStats::default();
+    let mut dropped = Vec::new();
+    let mut repeated = false;
+    for (m, &(k1, k2)) in matches.iter().enumerate() {
+        if !in_bounds(k1, k2) {
+            stats.out_of_bounds += 1;
+            dropped.push(m as u32);
+            continue;
+        }
+        let mark = &mut seen[k1 as usize];
+        repeated |= *mark == stamp;
+        *mark = stamp;
+    }
+    if repeated {
+        let mut kept = HashSet::with_capacity(matches.len());
+        dropped.clear();
+        stats.out_of_bounds = 0;
+        for (m, &(k1, k2)) in matches.iter().enumerate() {
+            if !in_bounds(k1, k2) {
+                stats.out_of_bounds += 1;
+                dropped.push(m as u32);
+            } else if !kept.insert((k1, k2)) {
+                stats.duplicate += 1;
+                dropped.push(m as u32);
+            }
+        }
+    }
+    stats.added = matches.len() - stats.out_of_bounds - stats.duplicate;
+    (stats, dropped)
 }
 
 #[cfg(test)]
@@ -1190,5 +1466,159 @@ mod tests {
         assert_eq!(stats.added, 0);
         assert_eq!(graph.num_correspondences_for_image(0), 0);
         assert_eq!(graph.num_correspondences_for_image(1), 0);
+    }
+
+    /// The incremental path's result for `finalized_from_pairs`' arguments:
+    /// the graph and each pair's stats, or the first rejected pair.
+    fn incremental(
+        images: &[(usize, usize)],
+        pairs: &[PairMatches<'_>],
+    ) -> Result<(CorrespondenceGraph, Vec<IngestStats>), (usize, CorrespondenceGraphError)> {
+        let mut graph = CorrespondenceGraph::new();
+        for &(image_id, num_points2d) in images {
+            graph.add_image(image_id, num_points2d);
+        }
+        let mut stats = Vec::new();
+        for (index, pair) in pairs.iter().enumerate() {
+            let matches: Vec<(usize, usize)> = pair
+                .matches
+                .iter()
+                .map(|&(k1, k2)| (k1 as usize, k2 as usize))
+                .collect();
+            stats.push(
+                graph
+                    .add_two_view_geometry(pair.image_id1, pair.image_id2, &matches, pair.config)
+                    .map_err(|error| (index, error))?,
+            );
+        }
+        graph.finalize();
+        Ok((graph, stats))
+    }
+
+    /// One pair's `(image_id1, image_id2, matches)`.
+    type RawPair = (usize, usize, Vec<(u32, u32)>);
+
+    /// Random images (sparse ids, some without points or pairs) and pairs
+    /// whose matches include out-of-bounds indices, repeated first indices
+    /// and exact repeats.
+    fn random_scene(seed: u64) -> (Vec<(usize, usize)>, Vec<RawPair>) {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(seed);
+        let n_images = rng.gen_range(2..12);
+        let images: Vec<(usize, usize)> = (0..n_images)
+            .map(|i| {
+                let num_points2d = if rng.gen_bool(0.1) {
+                    0
+                } else {
+                    rng.gen_range(1..40)
+                };
+                (3 * i + 7, num_points2d)
+            })
+            .collect();
+        let mut pairs = Vec::new();
+        for a in 0..n_images {
+            for b in a + 1..n_images {
+                if rng.gen_bool(0.5) {
+                    continue;
+                }
+                let (id_a, n_a) = images[a];
+                let (id_b, n_b) = images[b];
+                let mut matches: Vec<(u32, u32)> = Vec::new();
+                for _ in 0..rng.gen_range(0..60) {
+                    let pick = rng.gen_range(0..10);
+                    if pick == 0 && !matches.is_empty() {
+                        // An exact repeat of an earlier match.
+                        matches.push(matches[rng.gen_range(0..matches.len())]);
+                    } else if pick == 1 && !matches.is_empty() {
+                        // An earlier first index with another second one.
+                        let k1 = matches[rng.gen_range(0..matches.len())].0;
+                        matches.push((k1, rng.gen_range(0..n_b as u32 + 2)));
+                    } else {
+                        // In bounds, or (rarely) up to two past either end.
+                        matches.push((
+                            rng.gen_range(0..n_a as u32 + 2),
+                            rng.gen_range(0..n_b as u32 + 2),
+                        ));
+                    }
+                }
+                // Either order of the pair.
+                if rng.gen_bool(0.5) {
+                    pairs.push((id_a, id_b, matches));
+                } else {
+                    let swapped = matches.iter().map(|&(k1, k2)| (k2, k1)).collect();
+                    pairs.push((id_b, id_a, swapped));
+                }
+            }
+        }
+        // Not in image order.
+        for i in (1..pairs.len()).rev() {
+            pairs.swap(i, rng.gen_range(0..=i));
+        }
+        (images, pairs)
+    }
+
+    fn pair_matches(pairs: &[RawPair]) -> Vec<PairMatches<'_>> {
+        const CONFIGS: [ConfigurationType; 3] = [
+            ConfigurationType::Calibrated,
+            ConfigurationType::Planar,
+            ConfigurationType::Panoramic,
+        ];
+        pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (image_id1, image_id2, matches))| PairMatches {
+                image_id1: *image_id1,
+                image_id2: *image_id2,
+                matches,
+                config: CONFIGS[index % CONFIGS.len()],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn finalized_from_pairs_equals_the_incremental_build() {
+        let mut dropped = IngestStats::default();
+        for seed in 0..300 {
+            let (images, pairs) = random_scene(seed);
+            let pairs = pair_matches(&pairs);
+            let expected = incremental(&images, &pairs).expect("valid scene");
+            let built =
+                CorrespondenceGraph::finalized_from_pairs(&images, &pairs).expect("valid scene");
+            assert_eq!(built, expected, "seed {seed}");
+            for stats in &built.1 {
+                dropped.out_of_bounds += stats.out_of_bounds;
+                dropped.duplicate += stats.duplicate;
+            }
+        }
+        // The scenes exercise both kinds of dropped match.
+        assert!(
+            dropped.out_of_bounds > 100 && dropped.duplicate > 100,
+            "{dropped:?}"
+        );
+    }
+
+    #[test]
+    fn finalized_from_pairs_rejects_the_first_pair_the_incremental_build_rejects() {
+        let (images, pairs) = random_scene(11);
+        assert!(pairs.len() > 3);
+        let (first_id, second_id) = (pairs[1].0, pairs[1].1);
+        let unknown = images.iter().map(|&(image_id, _)| image_id).max().unwrap() + 1;
+        let cases: [(usize, usize, usize); 4] = [
+            (2, first_id, first_id),  // a self-match
+            (1, unknown, second_id),  // an unknown first image
+            (3, first_id, unknown),   // an unknown second image
+            (3, second_id, first_id), // pair 1 again, swapped
+        ];
+        for (at, image_id1, image_id2) in cases {
+            let mut bad = pairs.clone();
+            bad.insert(at, (image_id1, image_id2, vec![(0, 0)]));
+            let bad = pair_matches(&bad);
+            let expected = incremental(&images, &bad).expect_err("invalid pair");
+            assert_eq!(
+                CorrespondenceGraph::finalized_from_pairs(&images, &bad).expect_err("invalid pair"),
+                expected
+            );
+            assert_eq!(expected.0, at);
+        }
     }
 }

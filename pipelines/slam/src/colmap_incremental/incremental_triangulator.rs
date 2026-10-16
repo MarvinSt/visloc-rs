@@ -187,13 +187,13 @@ impl IncrementalTriangulator {
             graph
                 .find_correspondences(image_id as usize, point2d_idx)
                 .iter()
-                .map(|c| (c.image_id as ImageT, c.point2d_idx))
+                .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
                 .collect()
         } else {
             graph
                 .extract_transitive_correspondences(image_id as usize, point2d_idx, transitivity)
                 .into_iter()
-                .map(|c| (c.image_id as ImageT, c.point2d_idx))
+                .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
                 .collect()
         };
 
@@ -989,7 +989,7 @@ impl IncrementalTriangulator {
             let corrs: Vec<(ImageT, Point2DT)> = graph
                 .find_correspondences(el.image_id as usize, el.point2d_idx)
                 .iter()
-                .map(|c| (c.image_id as ImageT, c.point2d_idx))
+                .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
                 .collect();
             for (corr_image_id, corr_point2d_idx) in corrs {
                 if !recon.is_image_registered(corr_image_id) {
@@ -1089,7 +1089,7 @@ impl IncrementalTriangulator {
                 let corrs: Vec<(ImageT, Point2DT)> = graph
                     .find_correspondences(elem.image_id as usize, elem.point2d_idx)
                     .iter()
-                    .map(|c| (c.image_id as ImageT, c.point2d_idx))
+                    .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
                     .collect();
                 for (corr_image_id, corr_point2d_idx) in corrs {
                     if !recon.is_image_registered(corr_image_id) {
@@ -1164,7 +1164,7 @@ fn points_reaching_free_2d_points(
                 }
                 for corr in graph.find_correspondences(image_id as usize, idx) {
                     let corr_image = recon.image(corr.image_id as ImageT);
-                    if let Some(id) = corr_image.points2d[corr.point2d_idx].point3d_id {
+                    if let Some(id) = corr_image.points2d[corr.point2d_idx as usize].point3d_id {
                         found.push(id);
                     }
                 }
@@ -1279,7 +1279,7 @@ fn plan_triangulate_image_point(
         graph
             .find_correspondences(image_id as usize, point2d_idx)
             .iter()
-            .map(|c| (c.image_id as ImageT, c.point2d_idx))
+            .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
             .collect()
     } else {
         graph
@@ -1289,7 +1289,7 @@ fn plan_triangulate_image_point(
                 options.max_transitivity,
             )
             .into_iter()
-            .map(|c| (c.image_id as ImageT, c.point2d_idx))
+            .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
             .collect()
     };
     let mut plan = TriangulatePlan {
@@ -1439,7 +1439,7 @@ fn plan_complete_image_point(
         graph
             .find_correspondences(image_id as usize, point2d_idx)
             .iter()
-            .map(|c| (c.image_id as ImageT, c.point2d_idx))
+            .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
             .collect()
     } else {
         graph
@@ -1449,7 +1449,7 @@ fn plan_complete_image_point(
                 options.max_transitivity,
             )
             .into_iter()
-            .map(|c| (c.image_id as ImageT, c.point2d_idx))
+            .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
             .collect()
     };
     // The usable correspondences (registered image, sane camera). A plan
@@ -1528,7 +1528,7 @@ fn plan_complete(
     for transitivity in 1..=max_transitivity {
         while let Some(elem) = curr_queue.pop() {
             for corr in graph.find_correspondences(elem.image_id as usize, elem.point2d_idx) {
-                let key = (corr.image_id as ImageT, corr.point2d_idx);
+                let key = (corr.image_id as ImageT, corr.point2d_idx as usize);
                 let (corr_image_id, corr_point2d_idx) = key;
                 let image = recon.image(corr_image_id);
                 if image.points2d[corr_point2d_idx].has_point3d()
@@ -1605,7 +1605,7 @@ fn plan_merge(
                 continue;
             }
             let Some(corr_point3d_id) =
-                recon.image(corr_image_id).points2d[corr.point2d_idx].point3d_id
+                recon.image(corr_image_id).points2d[corr.point2d_idx as usize].point3d_id
             else {
                 continue;
             };
@@ -2018,7 +2018,7 @@ pub(super) fn matches_between_images(
     for idx1 in 0..num_points2d {
         for corr in graph.find_correspondences(image_id1 as usize, idx1) {
             if corr.image_id as ImageT == image_id2 {
-                out.push((idx1, corr.point2d_idx));
+                out.push((idx1, corr.point2d_idx as usize));
             }
         }
     }

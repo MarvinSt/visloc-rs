@@ -580,8 +580,8 @@ impl IncrementalMapper {
                 };
                 let world_image = recon.image(world_id);
                 let world_camera = recon.camera(world_image.camera_id);
-                let Some(wn) =
-                    world_camera.normalize_pixel(&world_image.points2d[corr.point2d_idx].xy)
+                let Some(wn) = world_camera
+                    .normalize_pixel(&world_image.points2d[corr.point2d_idx as usize].xy)
                 else {
                     continue;
                 };
@@ -596,7 +596,7 @@ impl IncrementalMapper {
                     rig1: world_obs,
                     rig2: query_obs,
                 });
-                corrs.push((idx, world_id, corr.point2d_idx));
+                corrs.push((idx, world_id, corr.point2d_idx as usize));
             }
         }
         if corrs.len() < min_num_inliers {
@@ -737,7 +737,8 @@ impl IncrementalMapper {
                     continue;
                 }
                 let corr_image = recon.image(corr_image_id);
-                let Some(point3d_id) = corr_image.points2d[corr.point2d_idx].point3d_id else {
+                let Some(point3d_id) = corr_image.points2d[corr.point2d_idx as usize].point3d_id
+                else {
                     continue;
                 };
                 if !seen.insert(point3d_id) {
@@ -935,7 +936,9 @@ impl IncrementalMapper {
                         continue;
                     }
                     let corr_image = recon.image(corr_image_id);
-                    let Some(point3d_id) = corr_image.points2d[corr.point2d_idx].point3d_id else {
+                    let Some(point3d_id) =
+                        corr_image.points2d[corr.point2d_idx as usize].point3d_id
+                    else {
                         continue;
                     };
                     if !seen.insert(point3d_id) {

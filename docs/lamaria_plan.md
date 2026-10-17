@@ -236,7 +236,9 @@ before/after on training sequences.
    objective. `--modes yaw` corrects a start that drifts by degrees
    (sequence_1_20: 44.4 → 76.1) but costs points where the start is already
    good, so it stays opt-in. The G1276 sequences keep 1.4–3.5 % of scale
-   drift. Keyframes at 4 Hz, estimated camera translations, Earth's
+   drift; on sequence_2_11 the BA itself creates it (a solve started at the
+   pseudo-GT drifts as much, the VIO does not), for a cause still open.
+   Keyframes at 4 Hz, estimated camera translations, Earth's
    rotation, a loose first rotation prior and leaving out the cross-camera
    matches did not raise the mean
    ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).

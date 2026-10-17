@@ -116,6 +116,16 @@ The common rotation is the mean of the two cameras' segment estimates, in
 the IMU frame. The range is that of its component that varies most, and the
 correlation is that of the two cameras' estimates in that component.
 
+The number of segments matters little between four and eight. With the
+prior scaled to the same smoothness per unit of time (0.07° for four
+segments, 0.035° for sixteen), the first solve scores:
+
+| Sequence | One rotation | 4 segments | 8 segments | 16 segments |
+|---|---:|---:|---:|---:|
+| sequence_2_11 | 68.88 | **71.84** | 71.18 | 69.97 |
+| sequence_3_17 | 50.32 | 59.57 | **60.25** | 59.23 |
+| sequence_5_11 | **59.81** | 56.83 | 56.22 | |
+
 ## Results
 
 Official evaluator, one training sequence per track, plus sequence_1_20, a
@@ -226,6 +236,38 @@ slightly lower cost (229,625 against 229,821, with the first rotation prior
 loose, see [below](#the-first-keyframes-rotation-prior)). The scale is a weak
 direction of the objective; within a 60 s window the IMU constrains it to
 only about ±1.7 %.
+
+### Where the scale drift comes from
+
+The scale drift of sequence_2_11 is the BA's own. In Sim(3) fits of 60 s
+windows against the pseudo-GT, the VIO's local scale has no trend, the BA's
+grows by 2.5 % per 1,000 s, and a solve started at the pseudo-GT drifts as
+much: the objective prefers the drift. Changing one ingredient at a time
+(eight segments unless noted):
+
+| Run on sequence_2_11 | CP Score | Local scale, trend per 1,000 s |
+|---|---:|---:|
+| VIO | 49.68 | −0.3 % |
+| Batch BA | 71.18 | +2.5 % |
+| Started at the pseudo-GT (one rotation per camera, 10 px; diagnosis only) | 54.46 | +2.5 % |
+| cam0 only | 64.75 | +2.9 % |
+| cam1 only | 60.55 | +3.1 % |
+| Cross-camera matches left out | **72.70** | +1.7 % |
+| Matches at most 16 keyframes (8 s) apart | 68.19 | +1.7 % |
+| IMU noise densities ×0.5 | 66.66 | +3.3 % |
+| Intrinsics (fx, fy, cx, cy, k1, k2) estimated per segment too | 66.60 | **+1.2 %** |
+| Intrinsics estimated once per camera (one rotation per camera) | 62.19 | +2.3 % |
+
+Each camera alone drifts, so the rig does not cause it. Leaving out the
+cross-camera matches or the long matches takes a third of it away, but
+neither removes it. The solve leaves a small radial residual on
+1WM093701G1276: observations lie 0.02–0.04 px further out than their
+projections at 150–300 px from the principal point, on both cameras, against
+at most 0.02 px inwards on 1WM09370081264. Estimating the intrinsics finds a
+focal length 0.1–0.3 % longer and k1 ≈ +0.002 on both cameras of
+1WM093701G1276 (−0.1 % and 0 on sequence_1_19), but that reduces the drift
+only when the intrinsics may change per segment, and it costs points either
+way. The cause remains open.
 
 ### What the gain on sequence_1_19 comes from
 

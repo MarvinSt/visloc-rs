@@ -3,8 +3,9 @@
 //!
 //! The input is a COLMAP sparse model with pinhole cameras (undistorted
 //! images) and its images ([`model`], [`workspace`]). Depth estimation is
-//! ACMH with ACMM's geometric consistency (Xu and Tao, CVPR 2019); fusion
-//! keeps the points that enough source views agree on.
+//! ACMH with ACMP's planar prior ([`mod@planar_prior`]) and ACMM's geometric
+//! consistency (Xu and Tao, AAAI 2020 and CVPR 2019); fusion keeps the
+//! points that enough source views agree on.
 
 pub mod fusion;
 #[cfg(feature = "gpu")]
@@ -12,6 +13,7 @@ pub mod gpu;
 pub mod model;
 pub mod patch_match;
 pub mod pipeline;
+pub mod planar_prior;
 pub mod ply;
 pub mod workspace;
 
@@ -19,7 +21,13 @@ pub use fusion::{fuse, FusedPoint, FusionOptions};
 #[cfg(feature = "gpu")]
 pub use gpu::GpuPatchMatch;
 pub use model::{read_text_model, SparseModel};
-pub use patch_match::{estimate, photometric_score, DepthMap, PatchMatchOptions, ViewSelection};
-pub use pipeline::{geometric_pass, multi_scale_depth_maps, Estimator, MultiScaleOptions, Scorer};
+pub use patch_match::{
+    estimate, estimate_with_prior, photometric_score, DepthMap, PatchMatchOptions, ViewSelection,
+};
+pub use pipeline::{
+    geometric_pass, multi_scale_depth_maps, planar_prior_pass, Estimator, MultiScaleOptions,
+    PriorEstimator, Scorer,
+};
+pub use planar_prior::{planar_prior, PlanarPrior, PlanarPriorOptions};
 pub use ply::write_ply;
 pub use workspace::{View, Workspace, WorkspaceOptions};

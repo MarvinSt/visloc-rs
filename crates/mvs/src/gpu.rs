@@ -10,6 +10,7 @@ use visloc_gsplat_render::{GpuContext, GpuError};
 use crate::patch_match::{
     finish_depth_map, DepthMap, PatchMatchOptions, ViewSelection, MAX_COST, MAX_SOURCES,
 };
+use crate::planar_prior::{PlanarPrior, PlanarPriorOptions};
 use crate::workspace::{luma, Workspace};
 
 /// Uniform parameters of one dispatch (`Params` in the shader).
@@ -48,7 +49,12 @@ struct Params {
     view_selection: u32,
     inv_texture_width: f32,
     inv_texture_height: f32,
-    pad: u32,
+    /// 1 in the planar prior pass, with its posterior's terms.
+    planar_prior: u32,
+    prior_inv_alpha: f32,
+    prior_gamma: f32,
+    prior_depth_weight: f32,
+    prior_angle_weight: f32,
 }
 
 /// A source view as the shader reads it (`Source`).
@@ -121,7 +127,28 @@ impl GpuPatchMatch {
         prior: Option<&[DepthMap]>,
     ) -> DepthMap {
         let start = prior.map(|maps| &maps[view]);
-        let (planes, costs) = self.run(ws, view, options, prior, start);
+        let (planes, costs) = self.run(ws, view, options, prior, start, None);
+        finish_depth_map(&ws.views[view], &planes, costs, options)
+    }
+
+    /// [`crate::patch_match::estimate_with_prior`] on the GPU.
+    pub fn estimate_with_prior(
+        &self,
+        ws: &Workspace,
+        view: usize,
+        options: &PatchMatchOptions,
+        prior_options: &PlanarPriorOptions,
+        start: &DepthMap,
+        prior: &PlanarPrior,
+    ) -> DepthMap {
+        let (planes, costs) = self.run(
+            ws,
+            view,
+            options,
+            None,
+            Some(start),
+            Some((prior_options, prior)),
+        );
         finish_depth_map(&ws.views[view], &planes, costs, options)
     }
 
@@ -138,7 +165,7 @@ impl GpuPatchMatch {
             iterations: 0,
             ..options.clone()
         };
-        let (_, mut costs) = self.run(ws, view, &first_pass, None, Some(map));
+        let (_, mut costs) = self.run(ws, view, &first_pass, None, Some(map), None);
         for (cost, &depth) in costs.iter_mut().zip(&map.depth) {
             if depth <= 0.0 {
                 *cost = MAX_COST;
@@ -150,7 +177,8 @@ impl GpuPatchMatch {
     /// The per-pixel planes and costs after `options.iterations`
     /// iterations, starting from `start`'s planes (random ones where it
     /// has no depth, or everywhere without it), with geometric consistency
-    /// against `prior`.
+    /// against `prior`, or as the planar prior pass with `planar`'s prior
+    /// (where `start`'s cost is not credible, from the prior's plane).
     fn run(
         &self,
         ws: &Workspace,
@@ -158,6 +186,7 @@ impl GpuPatchMatch {
         options: &PatchMatchOptions,
         prior: Option<&[DepthMap]>,
         start: Option<&DepthMap>,
+        planar: Option<(&PlanarPriorOptions, &PlanarPrior)>,
     ) -> (Vec<[f32; 4]>, Vec<f32>) {
         let device = &self.ctx.device;
         let queue = &self.ctx.queue;
@@ -248,7 +277,7 @@ impl GpuPatchMatch {
             layers.resize(texture_width * texture_height, 0);
         }
         // The starting planes as (normal, depth), depth 0 for a random one.
-        let init_planes: Vec<[f32; 4]> = match start {
+        let mut init_planes: Vec<[f32; 4]> = match start {
             Some(map) => {
                 assert_eq!((map.width, map.height), (w, h), "starting depth map size");
                 map.depth
@@ -259,6 +288,26 @@ impl GpuPatchMatch {
             }
             None => vec![[0.0; 4]; w * h],
         };
+        if let (Some((prior_options, planar)), Some(map)) = (planar, start) {
+            assert_eq!((planar.width, planar.height), (w, h), "prior size");
+            assert_eq!(map.cost.len(), w * h, "the start needs its costs");
+            let (fx, fy) = (reference.fx as f32, reference.fy as f32);
+            let (cx, cy) = (reference.cx as f32, reference.cy as f32);
+            for (i, init) in init_planes.iter_mut().enumerate() {
+                let Some([nx, ny, nz, rho]) = planar.plane(i) else {
+                    continue;
+                };
+                if map.depth[i] > 0.0 && map.cost[i] < prior_options.credible_cost {
+                    continue;
+                }
+                let (x, y) = ((i % w) as f32 + 0.5, (i / w) as f32 + 0.5);
+                let denom = nx * (x - cx) / fx + ny * (y - cy) / fy + nz;
+                let depth = rho / denom;
+                if denom < -1e-6 && depth > 0.0 && depth.is_finite() {
+                    *init = [nx, ny, nz, depth];
+                }
+            }
+        }
 
         let base = Params {
             width: w as u32,
@@ -292,7 +341,17 @@ impl GpuPatchMatch {
             view_selection: u32::from(options.view_selection == ViewSelection::Sampled),
             inv_texture_width: 1.0 / texture_width as f32,
             inv_texture_height: 1.0 / texture_height as f32,
-            pad: 0,
+            planar_prior: u32::from(planar.is_some()),
+            prior_inv_alpha: planar.map_or(0.0, |(o, _)| 1.0 / o.alpha),
+            prior_gamma: planar.map_or(0.0, |(o, _)| o.gamma),
+            prior_depth_weight: planar.map_or(0.0, |(o, _)| {
+                let sigma = o.depth_bandwidth * (reference.depth_range.1 - reference.depth_range.0);
+                1.0 / (2.0 * sigma * sigma)
+            }),
+            prior_angle_weight: planar.map_or(0.0, |(o, _)| {
+                let sigma = o.angle_bandwidth_deg.to_radians();
+                1.0 / (2.0 * sigma * sigma)
+            }),
         };
         // Slot 0 for `init`, then one per (iteration, colour).
         let slots = 1 + 2 * options.iterations;
@@ -359,6 +418,10 @@ impl GpuPatchMatch {
         let costs_buf = zeroed("mvs-costs", w * h * 4);
         let best_buf = zeroed("mvs-best-views", w * h * 4);
         let init_buf = storage("mvs-init-planes", bytemuck::cast_slice(&init_planes));
+        let prior_planes_buf = match planar {
+            Some((_, planar)) => storage("mvs-prior-planes", bytemuck::cast_slice(&planar.planes)),
+            None => zeroed("mvs-prior-planes", 16),
+        };
         let texture_size = wgpu::Extent3d {
             width: texture_width as u32,
             height: texture_height as u32,
@@ -461,6 +524,7 @@ impl GpuPatchMatch {
                             binding: 9,
                             resource: wgpu::BindingResource::Sampler(&sampler),
                         },
+                        entry(10, &prior_planes_buf),
                     ],
                 })
             })
@@ -570,6 +634,33 @@ fn read_into<T: bytemuck::Pod>(
 mod tests {
     use super::*;
     use crate::patch_match::{estimate, photometric_score, plane_scene, plane_scene_truth};
+    use crate::planar_prior::{mean_relative_error, planar_prior, textureless_scene};
+
+    /// The planar prior pass fills a textureless region on the GPU as on the
+    /// CPU (`planar_prior`'s test).
+    #[test]
+    fn gpu_prior_fills_a_textureless_region() {
+        let Some(ctx) = visloc_gsplat_render::try_context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let gpu = GpuPatchMatch::with_context(ctx);
+        let (ws, inner) = textureless_scene();
+        let options = PatchMatchOptions::default();
+        let photometric = gpu.estimate(&ws, 0, &options, None);
+        let prior_options = PlanarPriorOptions::default();
+        let prior = planar_prior(&ws.views[0], &photometric, &prior_options);
+        let with_prior =
+            gpu.estimate_with_prior(&ws, 0, &options, &prior_options, &photometric, &prior);
+        let truth = plane_scene_truth(&ws, 0);
+        let before = mean_relative_error(&photometric, &truth, &inner);
+        let after = mean_relative_error(&with_prior, &truth, &inner);
+        assert!(after < 0.01, "with the prior: {after}");
+        assert!(
+            before > 5.0 * after,
+            "photometric {before} vs prior {after}"
+        );
+    }
 
     /// The GPU recovers the synthetic plane like the CPU path, with and
     /// without geometric consistency, under either view selection.

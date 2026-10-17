@@ -8,20 +8,23 @@
 //!     --images <image dir> --out <dir> [--max-image-size 3200] \
 //!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 1] [--gpu] \
 //!     [--view-selection confidence|sampled] [--init-top-k 3] [--detail-threshold 0.1] \
-//!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
-//!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 15]
+//!     [--no-planar-prior] [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
+//!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 10]
 //! ```
 //!
-//! `--scales 3` runs ACMM's multi-scale scheme; `--gpu` (a `--features gpu`
-//! build) runs PatchMatch on the GPU.
+//! With one scale, ACMP's planar prior pass runs between the photometric
+//! and the geometric passes (`--no-planar-prior` leaves it out); `--scales 3`
+//! runs ACMM's multi-scale scheme instead, without it; `--gpu` (a
+//! `--features gpu` build) runs PatchMatch on the GPU.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use visloc_mvs::{
-    estimate, fuse, geometric_pass, multi_scale_depth_maps, photometric_score, read_text_model,
-    write_ply, FusionOptions, MultiScaleOptions, PatchMatchOptions, ViewSelection, Workspace,
-    WorkspaceOptions,
+    estimate, estimate_with_prior, fuse, geometric_pass, multi_scale_depth_maps, photometric_score,
+    planar_prior_pass, read_text_model, write_ply, DepthMap, Estimator, FusionOptions,
+    MultiScaleOptions, PatchMatchOptions, PlanarPrior, PlanarPriorOptions, ViewSelection,
+    Workspace, WorkspaceOptions,
 };
 
 fn main() {
@@ -38,6 +41,8 @@ fn main() {
     let mut save_depth = false;
     let mut save_maps = false;
     let mut load_maps = false;
+    let mut planar_prior = None;
+    let prior_options = PlanarPriorOptions::default();
     let mut fusion_options = fusion_options;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -61,6 +66,8 @@ fn main() {
             "--scales" => scales = value().parse().unwrap(),
             "--detail-threshold" => detail_threshold = Some(value().parse().unwrap()),
             "--gpu" => use_gpu = true,
+            "--planar-prior" => planar_prior = Some(true),
+            "--no-planar-prior" => planar_prior = Some(false),
             "--save-depth" => save_depth = true,
             "--save-maps" => save_maps = true,
             "--load-maps" => load_maps = true,
@@ -74,6 +81,12 @@ fn main() {
     let sparse = sparse.expect("--sparse is required");
     let images = images.expect("--images is required");
     let out = out.expect("--out is required");
+    // The planar prior pass runs with one scale (by default).
+    assert!(
+        !(planar_prior == Some(true) && scales > 1),
+        "--planar-prior runs with one scale"
+    );
+    let planar_prior = planar_prior.unwrap_or(scales == 1);
     std::fs::create_dir_all(&out).expect("creating the output directory");
 
     let started = Instant::now();
@@ -116,6 +129,25 @@ fn main() {
         }
         map
     };
+    let run_prior = |ws: &Workspace,
+                     view: usize,
+                     options: &PatchMatchOptions,
+                     prior_options: &PlanarPriorOptions,
+                     start: &DepthMap,
+                     prior: &PlanarPrior| {
+        let estimate_prior = || {
+            #[cfg(feature = "gpu")]
+            if let Some(gpu) = &gpu {
+                return gpu.estimate_with_prior(ws, view, options, prior_options, start, prior);
+            }
+            estimate_with_prior(ws, view, options, prior_options, start, prior)
+        };
+        let mut map = estimate_prior();
+        if !save_maps {
+            map.cost = Vec::new();
+        }
+        map
+    };
     let score =
         |ws: &Workspace, view: usize, options: &PatchMatchOptions, map: &visloc_mvs::DepthMap| {
             #[cfg(feature = "gpu")]
@@ -140,10 +172,24 @@ fn main() {
         multi_scale_depth_maps(&ws, &options, &run, &score, &mut |line| eprintln!("{line}"))
     } else {
         let t = Instant::now();
+        // The planar prior is built from the photometric costs.
+        let photometric: &Estimator = if planar_prior { &estimate_one } else { &run };
         let mut maps: Vec<_> = (0..ws.views.len())
-            .map(|v| run(&ws, v, &pm_options, None))
+            .map(|v| photometric(&ws, v, &pm_options, None))
             .collect();
         eprintln!("photometric pass: {:.1} s", t.elapsed().as_secs_f64());
+        if planar_prior {
+            let t = Instant::now();
+            maps = planar_prior_pass(
+                &ws,
+                maps,
+                &pm_options,
+                &prior_options,
+                &run_prior,
+                &mut |line| eprintln!("{line}"),
+            );
+            eprintln!("planar prior pass: {:.1} s", t.elapsed().as_secs_f64());
+        }
         for pass in 0..geom_passes {
             let t = Instant::now();
             maps = geometric_pass(&ws, maps, &pm_options, &run);

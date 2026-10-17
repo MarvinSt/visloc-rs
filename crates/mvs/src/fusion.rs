@@ -9,11 +9,12 @@ use crate::workspace::Workspace;
 
 /// When a source view's depth agrees with a pixel's, and how many must.
 ///
-/// By default one agreeing source view within 15° of normal angle keeps a
-/// point; ACMM's code asks for two (and 10°). Over the 13 ETH3D training
-/// scenes at 3200 px, F1 at 2 cm is 79.4% with these defaults, 79.5% at
-/// 10°, 78.8% at 30° and 77.3% with two views at 30°. On pipes at 1600 px,
-/// one view instead of two raises F1 from 66.9% to 76.0%.
+/// By default one agreeing source view within 10° of normal angle keeps a
+/// point; ACMM's and ACMP's code ask for two. Over the 13 ETH3D training
+/// scenes at 3200 px (with the planar prior), F1 at 2 cm is 81.4% with
+/// these defaults, 81.3% at 15°, 80.6% at 30° and 79.3% with two views at
+/// 30°. On pipes at 1600 px, one view instead of two raises F1 from 66.9%
+/// to 76.0%.
 #[derive(Debug, Clone)]
 pub struct FusionOptions {
     /// Pixels between the pixel and the source depth's point projected back.
@@ -31,7 +32,7 @@ impl Default for FusionOptions {
         Self {
             max_reproj_error: 2.0,
             max_relative_depth_diff: 0.01,
-            max_normal_angle_deg: 15.0,
+            max_normal_angle_deg: 10.0,
             min_consistent_views: 1,
         }
     }

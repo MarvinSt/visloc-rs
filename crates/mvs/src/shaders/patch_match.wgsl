@@ -47,7 +47,13 @@ struct Params {
     // One over the source texture's size, for normalized coordinates.
     inv_texture_width: f32,
     inv_texture_height: f32,
-    pad0: u32,
+    // 1: ACMP's planar prior pass (`prior_planes`); its posterior's terms:
+    // 1 / alpha, gamma, 1 / (2 sigma_depth^2), 1 / (2 sigma_angle^2).
+    planar_prior: u32,
+    prior_inv_alpha: f32,
+    prior_gamma: f32,
+    prior_depth_weight: f32,
+    prior_angle_weight: f32,
 }
 
 // Reference camera frame to source camera frame: rows of R with t in w.
@@ -78,6 +84,9 @@ struct Source {
 // the texture unit.
 @group(0) @binding(8) var source_images: texture_2d_array<f32>;
 @group(0) @binding(9) var bilinear: sampler;
+// `propagate` in the planar prior pass: per pixel, the prior plane
+// `(n.xyz, rho)`, all zeros for none.
+@group(0) @binding(10) var<storage, read> prior_planes: array<vec4<f32>>;
 
 // The reference window of the current pixel, row by row.
 var<private> patch_values: array<f32, 64>;
@@ -390,6 +399,31 @@ fn init(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// Hypotheses rank by cost, or by ACMP's posterior where the planar prior
+// pass has a prior (`prior_depth > 0`, the prior's depth on the ray):
+// larger is better either way.
+fn hypothesis_score(
+    cost: f32,
+    plane: vec4<f32>,
+    ray: vec3<f32>,
+    prior_plane: vec4<f32>,
+    prior_depth: f32,
+) -> f32 {
+    if (prior_depth <= 0.0) {
+        return -cost;
+    }
+    let depth = plane_depth(plane, ray);
+    if (depth <= 0.0) {
+        return -3.0e38;
+    }
+    let dd = depth - prior_depth;
+    let angle = acos(clamp(dot(plane.xyz, prior_plane.xyz), -1.0, 1.0));
+    return exp(-cost * cost * params.prior_inv_alpha)
+        * (params.prior_gamma
+            + exp(-dd * dd * params.prior_depth_weight)
+                * exp(-angle * angle * params.prior_angle_weight));
+}
+
 // A plane's cost in source view `j`: photometric plus geometric.
 fn view_cost(j: u32, x: u32, y: u32, ray: vec3<f32>, plane: vec4<f32>) -> f32 {
     return photometric_cost(j, ray, plane) + geometric_cost(j, x, y, ray, plane);
@@ -435,6 +469,15 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let ray = pixel_ray(x, y);
     load_patch(x, y);
+    // The planar prior pass's prior here, and its depth on the ray.
+    var prior_plane = vec4<f32>(0.0);
+    var prior_depth = -1.0;
+    if (params.planar_prior == 1u) {
+        prior_plane = prior_planes[i];
+        if (any(prior_plane.xyz != vec3<f32>(0.0))) {
+            prior_depth = plane_depth(prior_plane, ray);
+        }
+    }
 
     // Adaptive checkerboard sampling.
     var cand: array<vec4<f32>, 9>;
@@ -617,6 +660,7 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         best_cost = agg_w[8] / weight_sum;
     }
+    var best_score = hypothesis_score(best_cost, best_plane, ray, prior_plane, prior_depth);
     var adopted = false;
     for (var r = 0u; r < 8u; r++) {
         if (!valid[r]) {
@@ -628,8 +672,10 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
         } else {
             c = agg_w[r] / weight_sum;
         }
-        if (c < best_cost && plane_depth(cand[r], ray) > 0.0) {
+        let s = hypothesis_score(c, cand[r], ray, prior_plane, prior_depth);
+        if (s > best_score && plane_depth(cand[r], ray) > 0.0) {
             best_cost = c;
+            best_score = s;
             best_plane = cand[r];
             adopted = true;
         }
@@ -670,8 +716,10 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
         let c = sum / weight_sum;
-        if (c < best_cost) {
+        let s = hypothesis_score(c, plane, ray, prior_plane, prior_depth);
+        if (s > best_score) {
             best_cost = c;
+            best_score = s;
             best_plane = plane;
         }
     }

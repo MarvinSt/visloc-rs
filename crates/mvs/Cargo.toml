@@ -24,6 +24,7 @@ gpu = ["dep:wgpu", "dep:bytemuck", "dep:visloc-gsplat-render", "visloc-gsplat-re
 
 [dependencies]
 bytemuck = { workspace = true, optional = true }
+delaunator = "1.1"
 image = { version = "=0.25.5", default-features = false, features = ["png", "jpeg"] }
 nalgebra = { workspace = true }
 rayon = { workspace = true }

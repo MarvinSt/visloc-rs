@@ -109,11 +109,13 @@ fn global_add(i: u32, v: f32) {
 @compute @workgroup_size(256)
 fn rasterize_backward(
     @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(subgroup_invocation_id) lane: u32,
     @builtin(subgroup_size) sg_size: u32,
 ) {
-    let tile = wid.x;
+    let tile = wid.x + wid.y * nwg.x;
+    if (tile >= u.tile_bw * u.tile_bh) { return; }
     let tid = lid.x;
     let tile_x = tile % u.tile_bw;
     let tile_y = tile / u.tile_bw;

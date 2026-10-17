@@ -209,7 +209,7 @@ impl Renderer {
                     let mut pass =
                         encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     if frame.ni > 0 {
-                        super::dispatch(&mut pass, raster_bwd, frame.num_tiles);
+                        super::dispatch_groups_2d(&mut pass, raster_bwd, frame.num_tiles);
                     }
                 }
                 queue.submit(Some(encoder.finish()));
@@ -241,7 +241,7 @@ impl Renderer {
             }
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             if frame.ni > 0 {
-                super::dispatch(&mut pass, raster_bwd, frame.num_tiles);
+                super::dispatch_groups_2d(&mut pass, raster_bwd, frame.num_tiles);
             }
             super::dispatch_groups_2d(&mut pass, project_bwd, (frame.nv as u32).div_ceil(64));
         }

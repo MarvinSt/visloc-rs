@@ -552,6 +552,30 @@ agrees with them already (0.10–0.18 m at the median). They cannot correct its
 slow heading drift, and the 10 % of edges that disagree by more than a metre
 cost a point.
 
+### With the focal lengths, the keypoint sizes and denoising
+
+The same pipeline (first solve, `loop-correct`, second solve), each solve
+with the focal lengths estimated per segment (`--est-focal`, see [Where the
+scale drift comes from](#where-the-scale-drift-comes-from)) and the pixel
+noise by keypoint size (`--sigma-size 2.7 --sigma-size-pow 0.35`, see
+[Keypoint size](#keypoint-size)); on sequence_4_10 the features are denoised
+first ([Low light](#low-light-features-after-denoising)), and on the moving
+platform the focal lengths stay at the calibration. Final CP Score (pose
+recall at 1 m):
+
+| Sequence | Track | Before (eight segments) | Focal lengths | Focal lengths and keypoint sizes |
+|---|---|---:|---:|---:|
+| sequence_1_19 | Short | **87.22** (96.5 %) | 84.47 (95.9 %) | 84.14 (**99.3 %**) |
+| sequence_2_11 | Medium | 77.31 (75.8 %) | 77.72 (94.1 %) | **81.26** (**98.3 %**) |
+| sequence_3_17 | Long | 60.00 (55.5 %) | **66.16** (**63.4 %**) | 65.38 (61.1 %) |
+| sequence_4_10 | Low light | 49.52 (24.1 %) | **64.30** (66.9 %), denoised | 63.99 (59.6 %), denoised |
+| sequence_5_11 | Moving platform | 57.15 | 57.15 | **57.70** (keypoint sizes only) |
+| **Mean of the five tracks** | | 66.24 | 69.96 | **70.49** |
+| sequence_1_20 | Short | 43.41 (12.7 %) | 44.79 (14.1 %) | **45.36** (**17.0 %**) |
+
+The denoised features alone, without the focal lengths, give sequence_4_10
+63.73 (68.0 %).
+
 ### IMU-camera time offset
 
 The BA reports the whitened IMU residual per factor. A sweep of the gyroscope
@@ -770,7 +794,20 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   drift of its starting trajectory (see [Slow heading drift](#slow-heading-drift)).
 - **Low light.** `features --clahe` equalizes the contrast before SIFT. On
   sequence_4_10 frames it raises the detections from 130–300 to 1,100–1,500
-  per image.
+  per image. `--denoise 7` runs non-local means first (see [Low
+  light](#low-light-features-after-denoising)).
+- **Focal lengths.** `solve --est-focal` estimates each camera's focal
+  length per time segment (`--focal-seg-sigma`, `--focal-sigma`,
+  `--focal-mean-sigma`); leave it off on a moving platform. `loop-correct`
+  takes the estimates from the states.
+- **Keypoint sizes.** `solve --sigma-size 2.7 --sigma-size-pow 0.35` gives
+  larger keypoints a larger pixel sigma. `features` stores the sizes; for a
+  `features.npz` written before, `sizes --mav0 ... --work ...` (with the
+  same `--clahe`/`--denoise`) recovers them into `kp_size.npz`.
+- **Recommended.** The [table above](#with-the-focal-lengths-the-keypoint-sizes-and-denoising)
+  uses `--est-focal --sigma-size 2.7 --sigma-size-pow 0.35` in both solves,
+  `features --clahe --denoise 7` in low light, and no `--est-focal` on the
+  moving platform.
 - **Cost.** On this 4-core container, a 15-minute sequence takes about
   15 min for the features (2 processes) and 3 min for the matching (with
   numba). The solve takes 10–21 min on one thread (7–12 min with one

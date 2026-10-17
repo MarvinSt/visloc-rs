@@ -23,7 +23,7 @@ named inline; nothing is tuned against ground truth unless stated.
   2026-10-17)**. Aria's SLAM is the LaMAria team's run of the closed-source
   Aria system, from which the pseudo-GT pipeline is initialized. The page
   recorded on 2026-09-15 listed microSLAM at 64.5–85.6; it now shows the
-  numbers below. Our row is one training sequence per track (batch BA with
+  numbers below. Our rows are one training sequence per track (batch BA with
   the revisits, lever 14), not a submission:
 
   | Method | Sensors | Short | Medium | Long | Low light | Moving | Mean |
@@ -35,7 +35,8 @@ named inline; nothing is tuned against ground truth unless stated.
   | OpenVINS+Maplab | bino + IMU | 27.7 | 23.4 | 12.8 | 19.8 | 13.9 | 19.5 |
   | microSLAM | mono | 35.8 | 20.3 | 10.0 | 22.9 | 4.9 | 18.8 |
   | OKVIS2 | bino + IMU | 20.0 | 11.6 | 2.6 | 14.5 | 4.7 | 10.7 |
-  | **Ours (training: 1_19, 2_11, 3_17, 4_10, 5_11)** | bino + IMU | 87.22 | 77.31 | 60.00 | 49.52 | 57.15 | 66.24 |
+  | Ours, eight rotation segments (training: 1_19, 2_11, 3_17, 4_10, 5_11) | bino + IMU | 87.22 | 77.31 | 60.00 | 49.52 | 57.15 | 66.24 |
+  | **Ours, + focal lengths, keypoint sizes, low-light denoising (training)** | bino + IMU | 84.14 | **81.26** | 65.38 | 63.99 | **57.70** | 70.49 |
 
 - Test data must be **streamed and deleted** (~862 GB total; server throttles
   per connection — use `aria2c -x16`, ~57 MB/s, from the official file list).
@@ -244,11 +245,18 @@ before/after on training sequences.
    (sequence_1_20: 44.4 → 76.1) but costs points where the start is already
    good, so it stays opt-in. The G1276 sequences keep 1.4–3.5 % of scale
    drift; on sequence_2_11 the BA itself creates it (a solve started at the
-   pseudo-GT drifts as much, the VIO does not), for a cause still open.
-   Keyframes at 4 Hz, estimated camera translations, Earth's
-   rotation, a loose first rotation prior and leaving out the cross-camera
-   matches did not raise the mean
-   ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).
+   pseudo-GT drifts as much, the VIO does not). Keyframes at 4 Hz, estimated
+   camera translations, Earth's rotation, a loose first rotation prior and
+   leaving out the cross-camera matches did not raise the mean. The drift
+   follows the ratio of the image's angular scale to the gyroscope's:
+   estimating each camera's focal length per time segment (`--est-focal`;
+   +0.3–0.4 % on 1WM093701G1276 by day, −0.04 % at night, −0.1 % on
+   1WM09370081264) with the pixel noise growing with the SIFT keypoint size,
+   and non-local means before CLAHE in low light (sequence_4_10:
+   49.52 → 63.99, scale drift +3.5 % → +0.8 %), raise the mean to **70.49**
+   (2026-10-17); sequence_2_11 reaches 81.26 with a pose recall of 98 %. The
+   focal lengths go wrong on the moving platform, which keeps the
+   calibration ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).
 
 ## 5. Test-set operational pipeline
 

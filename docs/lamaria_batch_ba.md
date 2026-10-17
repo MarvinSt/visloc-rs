@@ -495,6 +495,28 @@ is NaN in the VRS records). Letting the bias move does not help in general
 | The same with 300 s | | 49.29 |
 | Accelerometer bias random walk ×30 at the start, 120 s | 68.36 | |
 
+sequence_4_11, the second low-light sequence, shows how much is at stake.
+Its VIO drifts in heading (−1.5° fitted to the CPs), and the BA keeps most
+of it (−1.3°, CP Score 55.30 after the first solve). With the gyro bias
+random walk ×100, the gyro bias of its first keyframe triples (2.8 mrad/s on
+the y axis, then 0.45 mrad/s after nine minutes), the heading drift falls to
+−0.5° and the first solve scores **70.47** (pose recall 28 % → 60 %). The
+other sequences of 1WM093701G1276 let their gyro bias move as much with the
+looser random walk (by 1–5 mrad/s on the y axis), and lose; the stable
+1WM09370081264 gains a little. First solve with `--est-focal --sigma-size 2.7
+--sigma-size-pow 0.35` (sequence_5_11 without `--est-focal`):
+
+| Gyro bias random walk | sequence_1_19 | sequence_1_20 | sequence_2_11 | sequence_3_17 | sequence_4_10 | sequence_4_11 | sequence_5_11 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ×1 (1e-7, the default) | 84.12 | 46.64 | **70.93** | 65.24 | 62.18 | 55.30 | **56.54** |
+| ×10 | **86.36** | **47.22** | 68.27 | **66.12** | **62.49** | 54.67 | 53.91 |
+| ×100 | 85.64 | 46.66 | 64.10 | 61.47 | 55.21 | **70.47** | 55.30 |
+
+Neither the costs nor the IMU residuals tell the cases apart: the cost falls
+by 900–1,050 with ×100 on both sequence_4_11 and sequence_2_11, and
+sequence_4_11 has the smallest whitened gyroscope residual of all with the
+default (1.7 per factor, against 3.5–8.1 elsewhere). The default stays.
+
 ### What the gain on sequence_1_19 comes from
 
 First version of the solver:

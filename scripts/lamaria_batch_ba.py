@@ -10,7 +10,8 @@ afterwards with one batch optimization over the whole sequence:
             the default 2 Hz) apart, guided by the VIO's relative poses.
   solve     union-find tracks -> midpoint triangulation -> Levenberg-Marquardt
             over every keyframe's pose, velocity and IMU biases, every
-            landmark, and each camera's IMU-camera rotation, with GTSAM's
+            landmark, and each camera's IMU-camera rotation (one per eighth
+            of the sequence, --ext-segments), with GTSAM's
             preintegrated IMU factors and Huber reprojection terms. The
             landmarks are eliminated by the Schur complement; because every
             landmark is seen within --band keyframes, the reduced system is
@@ -486,9 +487,35 @@ def so3_exp(w):
     return np.eye(3) + np.sin(th) * k + (1 - np.cos(th)) * k @ k
 
 
+def so3_log(r):
+    """Rotation vector of a rotation matrix (not near 180 degrees)."""
+    w = np.array([r[2, 1] - r[1, 2], r[0, 2] - r[2, 0], r[1, 0] - r[0, 1]]) / 2  # sin(angle) * axis
+    s = np.linalg.norm(w)
+    return w if s < 1e-12 else w * (np.arctan2(s, (np.trace(r) - 1) / 2) / s)
+
+
 def so3_log_deg(r):
-    from scipy.spatial.transform import Rotation
-    return np.degrees(Rotation.from_matrix(r).as_rotvec())
+    return np.degrees(so3_log(r))
+
+
+def segment_prior(r_ic, pairs, slot, n_ext, w):
+    """Prior 0.5 w |Log(R_a^T R_b)|^2 between consecutive time segments (a, b) of a camera's rotation.
+
+    Returns the cost and its Gauss-Newton normal equations H phi = b in the increments
+    R <- R Exp(phi) of the estimated rotations, stacked by slot: Log(R_a^T R_b) ~ e0 - phi_a + phi_b.
+    """
+    h, b, cost = np.zeros((3 * n_ext, 3 * n_ext)), np.zeros(3 * n_ext), 0.0
+    for ca, cb in pairs:
+        e0 = so3_log(r_ic[ca].T @ r_ic[cb])
+        cost += 0.5 * w * float(e0 @ e0)
+        ia, ib = slot[ca] * 3 + np.arange(3), slot[cb] * 3 + np.arange(3)
+        h[ia, ia] += w
+        h[ib, ib] += w
+        h[ia, ib] -= w
+        h[ib, ia] -= w
+        b[ia] += w * e0
+        b[ib] -= w * e0
+    return cost, h, b
 
 
 class Reprojection:
@@ -506,8 +533,8 @@ class Reprojection:
         self.active = np.ones(len(self.kf), bool)  # observations not rejected as outliers
         for name, i, j in (("fx", 0, 0), ("fy", 1, 1), ("cx", 0, 2), ("cy", 1, 2)):
             setattr(self, name, np.array([c["K"][i, j] for c in cams])[self.cam])
-        self.est = np.array([c in est_cams for c in range(2)])
-        self.ext_slot = np.full(2, -1)
+        self.est = np.array([c in est_cams for c in range(len(cams))])
+        self.ext_slot = np.full(len(cams), -1)
         for i, c in enumerate(est_cams):
             self.ext_slot[c] = i
         self.n_ext = len(est_cams)
@@ -538,7 +565,7 @@ class Reprojection:
         slot = self.ext_slot[self.cam]
         if self.n_ext:
             hb = np.flatnonzero(slot[pb] >= 0)
-            key = self.kf[pa[hb]].astype(np.int64) * 2 + slot[pb[hb]]
+            key = self.kf[pa[hb]].astype(np.int64) * self.n_ext + slot[pb[hb]]
             o = np.argsort(key, kind="stable")
             self.bd_a, self.bd_b, self.bd_key = pa[hb][o].astype(np.int32), pb[hb][o].astype(np.int32), key[o]
             both = np.flatnonzero((slot[pa] >= 0) & (slot[pb] >= 0))
@@ -765,9 +792,18 @@ def cmd_solve(a):
     pts = pts[used].copy()
     print(f"tracks {len(tracks)} (dropped {conflicts} with conflicts), landmarks {len(pts)}, "
           f"{time.time() - t0:.0f} s", flush=True)
-    est_cams = [int(ch) for ch in a.est_extrinsic]
-    rp = Reprojection(np.concatenate(obs_kf), np.concatenate(obs_cam), remap[obs_lm], np.concatenate(obs_z),
-                      len(pts), cams, est_cams, a.pixel_sigma, a.huber, a.band)
+    phys_est = [int(ch) for ch in a.est_extrinsic]
+    est_cams, n_seg = phys_est, max(a.ext_segments, 1)
+    obs_kf, obs_cam = np.concatenate(obs_kf), np.concatenate(obs_cam)
+    seg_of_kf = np.minimum(np.arange(len(kf_ns)) * n_seg // len(kf_ns), n_seg - 1)
+    if n_seg > 1:
+        # an IMU-camera rotation per time segment: camera c in segment s becomes camera c * n_seg + s
+        obs_cam = obs_cam * n_seg + seg_of_kf[obs_kf]
+        cams = [cams[c] for c in range(2) for _ in range(n_seg)]
+        est_cams = [c * n_seg + s for c in phys_est for s in range(n_seg)]
+        print(f"  {n_seg} time segments per camera rotation", flush=True)
+    rp = Reprojection(obs_kf, obs_cam, remap[obs_lm], np.concatenate(obs_z), len(pts), cams, est_cams,
+                      a.pixel_sigma, a.huber, a.band)
     omega = [float(v) for v in a.omega_coriolis.split(",")] if a.omega_coriolis else None
     graph, values, index, imu_factors = _imu_graph(kf_ns, kf_p, kf_r, vio, a.imu, noise, a.imu_noise_scale,
                                                    a.accel_rw_scale, a.gyro_rw_scale, a.prior_rot_sigma, omega)
@@ -785,13 +821,19 @@ def cmd_solve(a):
           flush=True)
     r_ic = np.array([c["R_ic"] for c in cams])
     t_ic = np.array([c["t_ic"] for c in cams])
+    # consecutive time segments of a camera rotate alike, within --ext-seg-sigma
+    seg_pairs = [(c * n_seg + s, c * n_seg + s + 1) for c in phys_est for s in range(n_seg - 1)]
+    seg_w = 1.0 / np.radians(a.ext_seg_sigma) ** 2
+
+    def seg_cost(ric):
+        return segment_prior(ric, seg_pairs, rp.ext_slot, rp.n_ext, seg_w)[0]
 
     def poses(vals):
         return (np.array([vals.atPose3(X(k)).rotation().matrix() for k in range(n)]),
                 np.array([vals.atPose3(X(k)).translation() for k in range(n)]))
 
     r_wi, t_wi = poses(values)
-    cost = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[0] + graph.error(values)
+    cost = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[0] + graph.error(values) + seg_cost(r_ic)
     print(f"initial cost {cost:.6g}", flush=True)
     lam = a.lambda0
     mu = 0.0  # damping of the modes relative to their own curvature: none until a step with them fails
@@ -806,7 +848,7 @@ def cmd_solve(a):
                 rp.active &= ~bad
                 lone = rp.active & (np.bincount(rp.lm[rp.active], minlength=rp.n_lm)[rp.lm] < 2)
                 rp.active &= ~lone
-                cost = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[0] + graph.error(values)
+                cost = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[0] + graph.error(values) + seg_cost(r_ic)
                 print(f"  outliers: {bad.sum()} observations over {thr} px (+{lone.sum()} left alone), "
                       f"{rp.active.sum()} active, cost {cost:.6g}", flush=True)
         res, jx, jl, w = rp.linearize(r_wi, t_wi, r_ic, t_ic, pts)
@@ -881,17 +923,17 @@ def cmd_solve(a):
             if ne:
                 slot = rp.ext_slot[rp.cam]
                 has = slot >= 0
-                bsum = np.zeros((n * 2, 6, 3))
+                bsum = np.zeros((n * rp.n_ext, 6, 3))
                 for s in range(0, len(rp.bd_a), rp.chunk):
                     e = min(s + rp.chunk, len(rp.bd_a))
                     prod = -np.einsum("nij,nkj->nik", m_o[rp.bd_a[s:e], 0:6, :], h_xl[rp.bd_b[s:e], 6:9, :])
                     key = rp.bd_key[s:e]
                     st = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
                     bsum[key[st]] += np.add.reduceat(prod, st, axis=0)
-                np.add.at(bsum, rp.kf[has].astype(np.int64) * 2 + slot[has], h_xx[has][:, 0:6, 6:9])
+                np.add.at(bsum, rp.kf[has].astype(np.int64) * rp.n_ext + slot[has], h_xx[has][:, 0:6, 6:9])
                 for sl in range(rp.n_ext):
-                    border.reshape(n, DOF, nz)[:, 0:6, sl * 3:sl * 3 + 3] += bsum[sl::2]
-                csum = np.zeros((2, 2, 3, 3))
+                    border.reshape(n, DOF, nz)[:, 0:6, sl * 3:sl * 3 + 3] += bsum[sl::rp.n_ext]
+                csum = np.zeros((rp.n_ext, rp.n_ext, 3, 3))
                 for s in range(0, len(rp.cn_a), rp.chunk):
                     e = min(s + rp.chunk, len(rp.cn_a))
                     prod = -np.einsum("nij,nkj->nik", m_o[rp.cn_a[s:e], 6:9, :], h_xl[rp.cn_b[s:e], 6:9, :])
@@ -904,6 +946,10 @@ def cmd_solve(a):
             np.add.at(rhs, (rp.kf * DOF)[:, None] + np.arange(6)[None, :], red[:, 0:6])
             if ne:
                 np.add.at(rhs, nb + (slot[has] * 3)[:, None] + np.arange(3)[None, :], red[has, 6:9])
+                if seg_pairs:
+                    _, h_s, b_s = segment_prior(r_ic, seg_pairs, rp.ext_slot, rp.n_ext, seg_w)
+                    corner[:ne, :ne] += h_s
+                    rhs[nb:nb + ne] += b_s
             ab[0] += lam * ab[0] + 1e-9
             if ne:
                 corner[np.arange(ne), np.arange(ne)] += lam * np.diag(corner)[:ne] + 1e-9
@@ -986,7 +1032,7 @@ def cmd_solve(a):
                     new_values.insert(V(k), st[2][k])
                     new_values.insert(B(k), gtsam.imuBias.ConstantBias(st[3][k, 0:3], st[3][k, 3:6]))
                 nr, nt, new_pts = st[0], st[1], st[4]
-            new_cost = rp.cost(nr, nt, new_ric, t_ic, new_pts)[0] + graph.error(new_values)
+            new_cost = rp.cost(nr, nt, new_ric, t_ic, new_pts)[0] + graph.error(new_values) + seg_cost(new_ric)
             if new_cost < cost:
                 rel = (cost - new_cost) / cost
                 values, r_ic, pts, r_wi, t_wi, cost = new_values, new_ric, new_pts, nr, nt, new_cost
@@ -1000,8 +1046,9 @@ def cmd_solve(a):
         msg = f"iter {it:2d}: cost {cost:.6g} lambda {lam:.1e} {time.time() - ti:.0f} s"
         if modes_on and accepted:
             msg += " | " + " ".join(f"{mo} {d_:+.2e}" for mo, d_ in zip(modes, dk))
-        for c in est_cams:
-            msg += f" | cam{c} rotation {np.round(so3_log_deg(cams[c]['R_ic'].T @ r_ic[c]), 3)}"
+        for c in phys_est:  # change from the calibration; with segments, the first and the last one
+            ch = [np.round(so3_log_deg(cams[c * n_seg]["R_ic"].T @ r_ic[c * n_seg + s]), 3) for s in (0, n_seg - 1)]
+            msg += f" | cam{c} rotation {ch[0]}" + (f" .. {ch[1]}" if n_seg > 1 else "")
         print(msg, flush=True)
         if not accepted or rel < a.rel_tol:
             break
@@ -1016,12 +1063,14 @@ def cmd_solve(a):
         "keyframes": n, "landmarks": int(rp.n_lm), "observations": int(len(rp.kf)),
         "active_observations": int(rp.active.sum()),
         "final_cost": cost, "reprojection_cost": reproj, "imu_prior_cost": graph.error(values),
+        "segment_prior_cost": seg_cost(r_ic),
         "median_reprojection_px": float(np.median(err_px)),
         "reprojection_over_4px_percent": float(np.mean(err_px > 4) * 100),
         "imu_residual_per_factor": dict(zip(("rotation", "position", "velocity", "accel_bias", "gyro_bias"),
                                             comp.round(3).tolist())),
-        "camera_rotation_change_deg": {f"cam{c}": so3_log_deg(cams[c]["R_ic"].T @ r_ic[c]).tolist()
-                                       for c in est_cams},
+        "camera_rotation_change_deg": {  # per time segment with --ext-segments
+            f"cam{c}": [so3_log_deg(cams[c * n_seg]["R_ic"].T @ r_ic[c * n_seg + s]).tolist() for s in range(n_seg)]
+            if n_seg > 1 else so3_log_deg(cams[c]["R_ic"].T @ r_ic[c]).tolist() for c in phys_est},
         "keyframe_displacement_m": {"median": float(np.median(np.linalg.norm(t_wi - kf_p, axis=1))),
                                     "max": float(np.linalg.norm(t_wi - kf_p, axis=1).max())},
         "biases": {str(k): {"accel": values.atConstantBias(B(k)).accelerometer().tolist(),
@@ -1032,8 +1081,10 @@ def cmd_solve(a):
     json.dump(summary, open(os.path.splitext(a.out)[0] + "_summary.json", "w"), indent=1)
     write_corrected(a.out, vio, kf_ns, kf_p, kf_r, t_wi, r_wi)
     if a.save_states:  # what loop-correct needs: keyframe poses, landmarks and their observations
+        # r_ic per physical camera and time segment (camera c, segment s at c * ext_segments + s)
         np.savez(os.path.splitext(a.out)[0] + "_states.npz", k0=k0, kf_ns=kf_ns, r_wi=r_wi, t_wi=t_wi, r_ic=r_ic,
-                 pts=pts, obs_kf=rp.kf, obs_cam=rp.cam, obs_lm=rp.lm, obs_z=rp.z, active=rp.active)
+                 ext_segments=n_seg, pts=pts, obs_kf=rp.kf, obs_cam=rp.cam // n_seg, obs_lm=rp.lm, obs_z=rp.z,
+                 active=rp.active)
 
 
 def _pcg(rp, m_o, h_xl, ab, u, nb, ne, border, corner, precond, rhs):
@@ -1140,13 +1191,14 @@ def cmd_loop_correct(a):
     st = np.load(a.states)
     cams, _ = load_calib(a.calib)
     k0, kf_ns, r_wi, t_wi, r_ic, pts = (st[k] for k in ("k0", "kf_ns", "r_wi", "t_wi", "r_ic", "pts"))
-    k0 = int(k0)
+    k0, n = int(k0), len(kf_ns)
     t_ic = np.array([c["t_ic"] for c in cams])
+    n_seg = int(st["ext_segments"]) if "ext_segments" in st else 1
+    seg_of_kf = np.minimum(np.arange(n) * n_seg // n, n_seg - 1)  # as in solve
     act = st["active"]
     okf, ocam, olm, oz = st["obs_kf"][act], st["obs_cam"][act], st["obs_lm"][act], st["obs_z"][act]
     _, offsets, xy, _ = load_features(a.work)
     lp = np.load(os.path.join(a.work, a.loops_file))
-    n = len(kf_ns)
     sel = (lp["pairs"][:, 0] >= k0) & (lp["pairs"][:, 2] < k0 + n)
     pairs, matches = lp["pairs"][sel].astype(np.int64), lp["matches"][sel]
     pairs[:, [0, 2]] -= k0
@@ -1161,8 +1213,8 @@ def cmd_loop_correct(a):
         ok = lms >= 0
         if ok.sum() < a.min_inliers:
             return None
-        placed = pnp_body_pose(pts[lms[ok]], xy[f2[ok]].astype(np.float64), cams[c2]["K"], r_ic[c2], t_ic[c2],
-                               r_wi[k2], t_wi[k2], a.min_inliers)
+        placed = pnp_body_pose(pts[lms[ok]], xy[f2[ok]].astype(np.float64), cams[c2]["K"],
+                               r_ic[c2 * n_seg + seg_of_kf[k2]], t_ic[c2], r_wi[k2], t_wi[k2], a.min_inliers)
         if placed is None:
             return None
         r_wb, t_wb = placed
@@ -1261,6 +1313,11 @@ def main():
     s.add_argument("--vio", required=True)
     s.add_argument("--out", required=True, help="corrected trajectory (TUM)")
     s.add_argument("--est-extrinsic", default="01", help="cameras whose IMU-camera rotation is estimated")
+    s.add_argument("--ext-segments", type=int, default=8,
+                   help="estimate each such rotation in this many equal time segments of the keyframes "
+                        "(1: one rotation per camera)")
+    s.add_argument("--ext-seg-sigma", type=float, default=0.05,
+                   help="prior on the rotation change between consecutive segments (deg)")
     s.add_argument("--max-offset", type=int, default=64, help="use matches up to this keyframe offset")
     s.add_argument("--band", type=int, default=64, help="landmark observations within this many keyframes")
     s.add_argument("--max-reproj", type=float, default=4.0, help="triangulation inlier threshold (px)")

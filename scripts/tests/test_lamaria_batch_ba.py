@@ -92,6 +92,31 @@ class OutlierMaskTest(unittest.TestCase):
         self.assertGreater(err[1], 2.0)  # the error is still reported for an inactive observation
 
 
+class SegmentPriorTest(unittest.TestCase):
+    def test_normal_equations_match_finite_differences(self):
+        rng = np.random.default_rng(4)
+        # cam1 in three time segments (virtual cameras 3, 4, 5) estimated, cam0's segments (0, 1, 2) not
+        base = [rot(rng), rot(rng)]
+        r_ic = np.array([base[c] @ lb.so3_exp(rng.normal(size=3) * 0.003) for c in range(2) for _ in range(3)])
+        slot = np.array([-1, -1, -1, 0, 1, 2])
+        pairs, w = [(3, 4), (4, 5)], 1.0 / np.radians(0.05) ** 2
+
+        def cost(phi):
+            ric = r_ic.copy()
+            for c in (3, 4, 5):
+                ric[c] = r_ic[c] @ lb.so3_exp(phi[slot[c] * 3:slot[c] * 3 + 3])
+            return lb.segment_prior(ric, pairs, slot, 3, w)[0]
+
+        def grad(phi, eps=1e-6):
+            return np.array([(cost(phi + eps * e) - cost(phi - eps * e)) / (2 * eps) for e in np.eye(9)])
+
+        c0, h, b = lb.segment_prior(r_ic, pairs, slot, 3, w)
+        self.assertAlmostEqual(c0, cost(np.zeros(9)))
+        np.testing.assert_allclose(b, -grad(np.zeros(9)), rtol=1e-5, atol=1e-3)
+        h_num = np.array([(grad(1e-5 * e) - grad(-1e-5 * e)) / 2e-5 for e in np.eye(9)])
+        np.testing.assert_allclose(h, h_num, atol=0.01 * w)  # Gauss-Newton: exact up to O(|e0|)
+
+
 class ModeVectorTest(unittest.TestCase):
     def test_modes_match_small_drifts(self):
         rng = np.random.default_rng(2)

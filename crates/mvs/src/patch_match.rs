@@ -237,6 +237,56 @@ pub fn estimate(
     ctx.depth_map(&state)
 }
 
+/// Which pixels of a photometric pass from a start map (a coarser scale's
+/// estimate, upsampled) may leave their start plane: ACMM's detail
+/// restorer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DetailRestorer {
+    /// Every pixel takes the best plane it finds.
+    Off,
+    /// A pixel takes a new plane only if its cost is lower than its start
+    /// plane's by this margin (ACMM's paper).
+    Start(f32),
+    /// A pixel takes a new plane only if its cost is lower than that of the
+    /// plane at infinity (the rotation's homography) by this margin: what
+    /// ACMM's and ACMMP's released code compute, their baseline plane
+    /// having no normal. Where weak texture leaves every plane about as
+    /// costly, the start plane stays; elsewhere the pass re-estimates.
+    Infinity(f32),
+}
+
+/// A photometric pass for `ws.views[view]` that starts from `start` (a
+/// random plane where it has no depth), with `restorer` deciding which
+/// pixels may leave their start plane.
+pub fn estimate_from(
+    ws: &Workspace,
+    view: usize,
+    options: &PatchMatchOptions,
+    start: &DepthMap,
+    restorer: DetailRestorer,
+) -> DepthMap {
+    let reference = &ws.views[view];
+    let sources: Vec<Source<'_>> = reference
+        .sources
+        .iter()
+        .take(MAX_SOURCES)
+        .map(|&s| Source::new(reference, &ws.views[s], None))
+        .collect();
+    let mut ctx = Context::new(reference, sources, options, view as u32, false);
+    let mut state = ctx.state_from(start, None);
+    ctx.restore = match restorer {
+        DetailRestorer::Off => None,
+        DetailRestorer::Start(margin) => Some((state.cost.clone(), margin)),
+        DetailRestorer::Infinity(margin) => Some((ctx.infinity_costs(), margin)),
+    };
+    for iteration in 0..options.iterations {
+        for color in [0, 1] {
+            ctx.pass(&mut state, iteration, color);
+        }
+    }
+    ctx.depth_map(&state)
+}
+
 /// ACMP's planar prior assisted pass for `ws.views[view]`, from photometric
 /// consistency and `prior` (see [`mod@crate::planar_prior`]). It starts from
 /// `start`, the view's photometric depth map with its costs, except where
@@ -438,7 +488,9 @@ struct Prior<'a> {
     planes: &'a [[f32; 4]],
     inv_alpha: f32,
     gamma: f32,
-    /// `1 / (2 σd²)` and `1 / (2 σθ²)`.
+    /// `σd` and `σθ` (radians), and `1 / (2 σd²)` and `1 / (2 σθ²)`.
+    sigma_depth: f32,
+    sigma_angle: f32,
     depth_weight: f32,
     angle_weight: f32,
 }
@@ -451,6 +503,8 @@ impl<'a> Prior<'a> {
             planes: &prior.planes,
             inv_alpha: 1.0 / options.alpha,
             gamma: options.gamma,
+            sigma_depth,
+            sigma_angle,
             depth_weight: 1.0 / (2.0 * sigma_depth * sigma_depth),
             angle_weight: 1.0 / (2.0 * sigma_angle * sigma_angle),
         }
@@ -499,6 +553,10 @@ struct Context<'a> {
     geometric: bool,
     /// The planar prior pass's prior.
     prior: Option<Prior<'a>>,
+    /// The detail restorer's per-pixel baseline costs and margin: a pixel
+    /// takes a new plane only if its cost is below its baseline by the
+    /// margin.
+    restore: Option<(Vec<f32>, f32)>,
     fx: f32,
     fy: f32,
     cx: f32,
@@ -545,6 +603,7 @@ impl<'a> Context<'a> {
             view_id,
             geometric,
             prior: None,
+            restore: None,
             fx: reference.fx as f32,
             fy: reference.fy as f32,
             cx: reference.cx as f32,
@@ -825,6 +884,31 @@ impl<'a> Context<'a> {
         State::from_rows(rows, w * h)
     }
 
+    /// Per pixel, the cost of the plane at infinity as a first plane's (the
+    /// mean of its best `init_top_k` views): with no normal, a plane's
+    /// homography is the rotation's.
+    fn infinity_costs(&self) -> Vec<f32> {
+        let (w, h) = (self.reference.width, self.reference.height);
+        let infinity = Plane {
+            n: [0.0; 3],
+            rho: 1.0,
+        };
+        (0..h)
+            .into_par_iter()
+            .flat_map_iter(|y| {
+                let (mut photo, mut geo) = ([0.0; MAX_SOURCES], [0.0; MAX_SOURCES]);
+                (0..w)
+                    .map(|x| {
+                        let patch = self.ref_patch(x, y);
+                        let ray = self.ray(x, y);
+                        self.view_costs(&patch, (x, y), ray, &infinity, (&mut photo, &mut geo));
+                        self.initial_cost(&photo, &geo).0
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// The state of an earlier depth map, with costs recomputed under this
     /// pass's terms (the mean of the best `init_top_k` views). With a planar
     /// prior and a credible cost, a pixel whose map cost is not credible
@@ -1060,8 +1144,9 @@ impl<'a> Context<'a> {
 
         // Views without weight add nothing, so the current plane and the
         // refinement's are only matched in the others.
+        let current_cost = self.weighted_cost(&patch, (x, y), ray, &current, &weights, weight_sum);
         let mut best_plane = current;
-        let mut best_cost = self.weighted_cost(&patch, (x, y), ray, &current, &weights, weight_sum);
+        let mut best_cost = current_cost;
         let mut best_score = score(best_cost, &best_plane);
         let mut adopted = false;
         for (row, candidate) in candidates.iter().enumerate() {
@@ -1086,14 +1171,24 @@ impl<'a> Context<'a> {
         };
 
         // Refinement: a random and a perturbed depth and normal combined
-        // with the current ones.
+        // with the current ones. Where the pixel has a prior, the random
+        // ones are drawn around it (ACMP's code): the depth within 3 σd of
+        // the prior's, the normal perturbed from the prior's by σθ.
         let mut rng = Rng::new(opt.seed, self.view_id, x, y, (iteration * 2 + color) as u32);
         let depth_now = best_plane
             .depth(ray)
             .unwrap_or(0.5 * (self.depth_min + self.depth_max));
         let normal_now = best_plane.n;
-        let depth_random = self.depth_min + rng.uniform() * (self.depth_max - self.depth_min);
-        let normal_random = random_normal(&mut rng, ray);
+        let (depth_random, normal_random) = match prior {
+            None => (
+                self.depth_min + rng.uniform() * (self.depth_max - self.depth_min),
+                random_normal(&mut rng, ray),
+            ),
+            Some((p, (prior_plane, prior_depth))) => (
+                prior_depth + (rng.uniform() - 0.5) * 6.0 * p.sigma_depth,
+                perturb_normal(&mut rng, prior_plane.n, ray, p.sigma_angle),
+            ),
+        };
         let depth_perturbed = depth_now * (1.0 + (rng.uniform() - 0.5) * opt.depth_perturbation);
         let normal_perturbed = perturb_normal(&mut rng, normal_now, ray, opt.normal_perturbation);
         let hypotheses = [
@@ -1115,6 +1210,11 @@ impl<'a> Context<'a> {
                 best_cost = cost;
                 best_score = hypothesis_score;
                 best_plane = plane;
+            }
+        }
+        if let Some((baseline, margin)) = &self.restore {
+            if best_cost >= baseline[i] - margin {
+                return (current, current_cost, views);
             }
         }
         (best_plane, best_cost, views)
@@ -1517,6 +1617,32 @@ mod tests {
     }
 
     /// Maps round-trip through their files, with or without costs.
+    /// A start 2% too deep costs less than 0.1 more than the true plane on
+    /// this texture: against its own cost (ACMM's paper) the restorer keeps
+    /// it, against the plane at infinity (ACMM's code) the textured pixels
+    /// re-estimate, as without a restorer.
+    #[test]
+    fn the_restorer_against_infinity_re_estimates_texture() {
+        let ws = plane_scene();
+        let truth = plane_scene_truth(&ws, 0);
+        let mut start = truth.clone();
+        start.depth.iter_mut().for_each(|d| *d *= 1.02);
+        let options = PatchMatchOptions::default();
+        let inside: Vec<usize> = (8..40)
+            .flat_map(|y| (12..52).map(move |x| y * 64 + x))
+            .collect();
+        let error = |restorer| {
+            let map = estimate_from(&ws, 0, &options, &start, restorer);
+            crate::planar_prior::mean_relative_error(&map, &truth, &inside)
+        };
+        let kept = error(DetailRestorer::Start(0.1));
+        assert!(kept > 0.015, "against the start: {kept}");
+        for restorer in [DetailRestorer::Infinity(0.1), DetailRestorer::Off] {
+            let error = error(restorer);
+            assert!(error < 0.002, "{restorer:?}: {error}");
+        }
+    }
+
     #[test]
     fn depth_maps_round_trip_with_or_without_costs() {
         let ws = plane_scene();

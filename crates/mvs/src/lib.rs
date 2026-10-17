@@ -22,11 +22,12 @@ pub use fusion::{fuse, FusedPoint, FusionOptions};
 pub use gpu::GpuPatchMatch;
 pub use model::{read_text_model, SparseModel};
 pub use patch_match::{
-    estimate, estimate_with_prior, photometric_score, DepthMap, PatchMatchOptions, ViewSelection,
+    estimate, estimate_from, estimate_with_prior, photometric_score, DepthMap, DetailRestorer,
+    PatchMatchOptions, ViewSelection,
 };
 pub use pipeline::{
     geometric_pass, multi_scale_depth_maps, planar_prior_pass, Estimator, MultiScaleOptions,
-    PriorEstimator, Scorer,
+    PriorEstimator, StartEstimator,
 };
 pub use planar_prior::{planar_prior, PlanarPrior, PlanarPriorOptions};
 pub use ply::write_ply;

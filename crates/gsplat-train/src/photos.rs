@@ -54,7 +54,9 @@ pub struct PhotoSfmConfig {
     /// SIFT detections kept per image, before the up-to-two orientations
     /// each (COLMAP's `max_num_features`, 8192).
     pub sift_max_keypoints: usize,
-    /// Every n-th registered image is held out for evaluation (0: none).
+    /// Every n-th registered image is held out for evaluation (0: none);
+    /// with `equirect`, every n-th panorama with a registered face, all its
+    /// faces (every n-th face would hold out the same face of each).
     pub eval_every: usize,
     pub gpu: bool,
     /// Refine the shared intrinsics in a final global bundle adjustment.
@@ -1103,18 +1105,25 @@ pub fn build_photo_dataset(
 
     let mut train = Vec::new();
     let mut eval = Vec::new();
-    for (k, (i, pose)) in poses
+    // `k`: the rank of the image's source among the sources with a
+    // registered image (one image per source without `equirect`).
+    let mut k = 0usize;
+    let mut last_source = None;
+    for (i, pose) in poses
         .iter()
         .enumerate()
         .filter_map(|(i, p)| p.as_ref().map(|p| (i, p)))
-        .enumerate()
     {
+        if last_source.is_some_and(|s| s != source(i)) {
+            k += 1;
+        }
+        last_source = Some(source(i));
         let view = View {
             name: names[i].clone(),
             camera: camera_view_from(&cam, pose).map_err(|e| EurocError::Camera(e.to_string()))?,
             image_path: images_out.join(&names[i]),
         };
-        if cfg.eval_every > 0 && k % cfg.eval_every == 0 {
+        if cfg.eval_every > 0 && k.is_multiple_of(cfg.eval_every) {
             eval.push(view);
         } else {
             train.push(view);
@@ -1615,6 +1624,15 @@ mod tests {
         assert_eq!(report.focal, 128.0);
         assert!(report.registered >= 24, "{} registered", report.registered);
         assert_eq!(dataset.train.len(), report.registered);
+        // Held out by panorama: every 2nd one's faces.
+        cfg.eval_every = 2;
+        let (dataset, _, _) =
+            super::build_photo_dataset(&images, &root.join("split"), &cfg, &mut |_: &str| {})
+                .unwrap();
+        let panorama = |v: &crate::dataset::View| v.name[6..11].parse::<usize>().unwrap() / 6;
+        assert!(dataset.eval.iter().all(|v| panorama(v) % 2 == 0));
+        assert!(dataset.train.iter().all(|v| panorama(v) % 2 == 1));
+        assert_eq!(dataset.eval.len() + dataset.train.len(), report.registered);
 
         // Against the truth, free of the gauge: face k of panorama i looks
         // along yaw_i * R_k (camera to world) from centre_i.

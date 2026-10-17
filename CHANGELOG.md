@@ -23,6 +23,13 @@ All notable changes to `visloc-rs` will be documented here.
     the up and down faces (sky, the camera mount) do not. Panorama
     distances match ScanVan's own trajectory within 0.4%. As pinhole
     images the same panoramas reconstruct nothing.
+  - The same five on an RTX 5080 (GPU SIFT and matching, 30k steps): the
+    same 20 faces register, and SfM, training and the mesh take 5 min.
+  - With `equirect`, the held-out views are whole panoramas. Every 8th
+    registered face would have held out the same face of every
+    panorama: on ScanVan it took 3 of the 5 front faces, which left the
+    view ahead with two training images (held-out PSNR 17.8 dB, against
+    35 to 37 dB on the training faces).
 - **A warning for panoramas fed as pinhole photos.** When at least half the
   images look equirectangular, `build_photo_dataset` logs a warning that
   points to `--equirect`. An image counts when it is 2:1 with left and

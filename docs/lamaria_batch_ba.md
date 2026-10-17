@@ -460,9 +460,9 @@ the CP Score of this one-way route follows the drift over minutes.
 
 The VIO's KLT tracks cannot fill in either. `basalt_euroc_vio_demo
 --dump-tracks` writes the tracked points of every frame. A track lives a
-median of one frame, 1.6 frames on average on sequence_4_11 at night and
+median of one frame, 1.8 frames on average on sequence_4_11 at night and
 2.5 by day (the first 2,000 frames of sequence_3_17); sampled at the 2 Hz
-keyframes, 16–28 tracks per keyframe are seen twice or more, against 45–162
+keyframes, 20–28 tracks per keyframe are seen twice or more, against 45–162
 SIFT landmarks.
 
 ### The first minutes of a recording

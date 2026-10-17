@@ -374,6 +374,36 @@ class ModeVectorTest(unittest.TestCase):
         np.testing.assert_allclose(vx[0, :, 12:15], -up_body.mean(0)[None].repeat(n, 0) / (kf_s[-1] - kf_s[0]))
         np.testing.assert_array_equal(vx[1, :, 9:15], 0.0)
 
+    def test_yaw_pieces_add_up_to_the_yaw_mode(self):
+        rng = np.random.default_rng(3)
+        n = 21
+        kf_s = np.arange(n) * 0.5
+        r_wi = np.array([rot(rng, 0.5) for _ in range(n)])
+        t_wi = np.cumsum(rng.normal(size=(n, 3)), axis=0)
+        vel = rng.normal(size=(n, 3))
+        pts = rng.normal(size=(4, 3)) * 5
+        lm_first = np.array([0, 6, 13, 20])
+        pieces = lb.expand_modes("yaw4,scale")
+        self.assertEqual(pieces, ["yaw:0:4", "yaw:1:4", "yaw:2:4", "yaw:3:4", "scale"])
+        vx, vl = lb.mode_vectors(pieces[:4] + ["yaw"], kf_s, r_wi, t_wi, vel, pts, lm_first)
+        # the four pieces together, each turning by one, are the linear heading drift by four
+        np.testing.assert_allclose(vx[:4].sum(0), 4 * vx[4], atol=1e-9)
+        np.testing.assert_allclose(vl[:4].sum(0), 4 * vl[4], atol=1e-9)
+        # a piece turns the heading within its quarter only: nothing before, all of it after
+        s1 = lb._mode_profile("yaw:1:4", kf_s)
+        np.testing.assert_allclose(s1[:6], 0.0)
+        np.testing.assert_allclose(s1[10:], 1.0)
+        # and deform follows the piece's tangent to first order
+        k_ = 1e-6
+        bias = rng.normal(size=(n, 6)) * 1e-3
+        r2, t2, v2, b2, p2 = lb.deform("yaw:1:4", k_, kf_s, r_wi, t_wi, vel, bias, pts, lm_first)
+        for k in range(n):
+            w = np.radians(lb.so3_log_deg(r_wi[k].T @ r2[k])) / k_
+            np.testing.assert_allclose(w, vx[1, k, 0:3], atol=1e-4)
+            np.testing.assert_allclose(r_wi[k].T @ (t2[k] - t_wi[k]) / k_, vx[1, k, 3:6], atol=1e-4)
+        np.testing.assert_allclose((b2 - bias) / k_, vx[1, :, 9:15], atol=1e-6)
+        np.testing.assert_allclose((p2 - pts) / k_, vl[1], atol=1e-4)
+
 
 class MatchingTest(unittest.TestCase):
     def test_best_two(self):

@@ -1055,6 +1055,27 @@ def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_r
     return graph, values, index, imu_factors
 
 
+def expand_modes(spec):
+    """The --modes list; yawN stands for N pieces yaw:0:N .. yaw:N-1:N of the heading drift."""
+    out = []
+    for m in (x for x in spec.split(",") if x):
+        if m.startswith("yaw") and m[3:].isdigit():
+            out += [f"yaw:{j}:{m[3:]}" for j in range(int(m[3:]))]
+        else:
+            out.append(m)
+    return out
+
+
+def _mode_profile(mode, kf_s):
+    """Each keyframe's share s of a mode's amplitude: from 0 at the first keyframe to 1 at the last, or
+    for the piece yaw:j:N, from 0 to 1 over the j-th of N equal time pieces (0 before, 1 after)."""
+    s = (kf_s - kf_s[0]) / max(kf_s[-1] - kf_s[0], 1e-9)
+    if mode.startswith("yaw:"):
+        j, npieces = (int(x) for x in mode.split(":")[1:])
+        s = np.clip(s * npieces - j, 0.0, 1.0)
+    return s
+
+
 def mode_vectors(modes, kf_s, r_wi, t_wi, vel, pts, lm_first):
     """Tangent directions of slow deformations of the whole solution, per unit amplitude at the end.
 
@@ -1062,17 +1083,20 @@ def mode_vectors(modes, kf_s, r_wi, t_wi, vel, pts, lm_first):
     last); positions are re-integrated from the turned displacements, velocities turn, landmarks
     move with their first keyframe and the gyro bias takes one offset, the mean body-frame vertical,
     so that the preintegrated rotations still agree. scale: displacements stretch by 1 + s_k.
+    yaw:j:N: the heading turns over the j-th of N time pieces only. The gyro bias takes the same
+    offset as for yaw, the piece's turn spread over the whole recording: the pieces' mean rate is
+    what a constant bias absorbs, their differences the gyroscope sees.
     Returns V_x (m, n, DOF) in the tangent space of each keyframe and V_l (m, n_lm, 3).
     """
     up = np.array([0.0, 0.0, 1.0])
     dur = max(kf_s[-1] - kf_s[0], 1e-9)
-    s = (kf_s - kf_s[0]) / dur
-    s_mid = 0.5 * (s[1:] + s[:-1])
     dp = np.diff(t_wi, axis=0)
     out_x, out_l = [], []
     for mode in modes:
+        s = _mode_profile(mode, kf_s)
+        s_mid = 0.5 * (s[1:] + s[:-1])
         v = np.zeros((len(kf_s), DOF))
-        if mode == "yaw":
+        if mode == "yaw" or mode.startswith("yaw:"):
             shift = np.vstack([np.zeros(3), np.cumsum(np.cross(up, dp) * s_mid[:, None], axis=0)])
             up_body = np.einsum("nji,j->ni", r_wi, up)
             v[:, 0:3] = s[:, None] * up_body
@@ -1098,12 +1122,12 @@ def deform(mode, beta, kf_s, r_wi, t_wi, vel, bias, pts, lm_first):
     rotation and translation, and a heading turn of 0.05 rad would move far keyframes by decimetres.
     """
     dur = max(kf_s[-1] - kf_s[0], 1e-9)
-    s = (kf_s - kf_s[0]) / dur
+    s = _mode_profile(mode, kf_s)
     s_mid = 0.5 * (s[1:] + s[:-1])
     dp = np.diff(t_wi, axis=0)
     k = lm_first
     bias = bias.copy()
-    if mode == "yaw":
+    if mode == "yaw" or mode.startswith("yaw:"):
         def rz(angle):
             c, sn, zero, one = np.cos(angle), np.sin(angle), np.zeros_like(angle), np.ones_like(angle)
             return np.stack([np.stack([c, -sn, zero], -1), np.stack([sn, c, zero], -1),
@@ -1212,7 +1236,7 @@ def cmd_solve(a):
                                                    a.gyro_rw_warmup, a.gyro_rw_warmup_scale, a.accel_rw_warmup_scale)
     n = len(kf_ns)
     nb, ne, npar = n * DOF, rp.n_par * rp.n_ext, rp.n_par
-    modes = [m for m in a.modes.split(",") if m]
+    modes = expand_modes(a.modes)
     nm = len(modes)
     nz = ne + nm  # border: the camera rotations, then the deformation modes (undamped)
     order = np.argsort(rp.lm, kind="stable")
@@ -1361,7 +1385,7 @@ def cmd_solve(a):
                 if modes_on and len(rp.off_keys) == 0:
                     # trust region: damp the modes further until each step is within its cap
                     rz = rhs[nb:] - zb.T @ _tri_banded(cfac, rhs[:nb])
-                    cap = np.array([a.mode_cap_yaw if m_ == "yaw" else a.mode_cap_scale for m_ in modes])
+                    cap = np.array([a.mode_cap_yaw if m_.startswith("yaw") else a.mode_cap_scale for m_ in modes])
                     extra = 0.0
                     for _ in range(30):
                         if np.all(np.abs((s_inv @ rz)[ne:]) <= cap):
@@ -1874,7 +1898,8 @@ def main():
                    help="the same for the accelerometer bias random walk, with --gyro-rw-warmup")
     s.add_argument("--loops", action="store_true", help="add the revisit matches of the loops stage")
     s.add_argument("--modes", default="", help="undamped deformation modes of the whole solution: yaw, scale "
-                   "(comma-separated); they let LM move along slow drifts the damped steps cannot follow")
+                   "(comma-separated); they let LM move along slow drifts the damped steps cannot follow. "
+                   "yawN splits the heading drift into N time pieces")
     s.add_argument("--modes-start", type=int, default=3, help="first iteration that uses the modes")
     s.add_argument("--mode-cap-yaw", type=float, default=0.01, help="largest yaw-mode step per iteration (rad)")
     s.add_argument("--mode-cap-scale", type=float, default=0.01, help="largest scale-mode step per iteration")

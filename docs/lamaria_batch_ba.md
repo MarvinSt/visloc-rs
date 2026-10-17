@@ -809,8 +809,11 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   `features --clahe --denoise 7` in low light, and no `--est-focal` on the
   moving platform.
 - **Cost.** On this 4-core container, a 15-minute sequence takes about
-  15 min for the features (2 processes) and 3 min for the matching (with
-  numba). The solve takes 10–21 min on one thread (7–12 min with one
-  rotation per camera); the longest, on the 30-minute sequence_3_17. `loops`
-  takes 8–40 min on one process (the unguided matching of every candidate
-  pair), `loop-correct` a minute, and the second solve 22–40 min.
+  15 min for the features (2 processes; non-local means adds about as much)
+  and 1–7 min for the matching (with numba). The solve uses
+  `NUMBA_NUM_THREADS` threads for the reprojection terms and the BLAS
+  threads for the banded factor: on the 20-minute sequence_2_11 the first
+  solve takes 269 s on one thread and 181 s on four (the same result), the
+  second solve with the revisits 483 s on four. `loops` takes 3–6 min with
+  four processes and `loop-correct` a minute. sequence_3_17's solves need
+  about 6.5 GB of memory.

@@ -1486,18 +1486,50 @@ def _tri_banded(cfac, b, trans="N"):
     return x
 
 
+def _band_forward(cfac, z, starts):
+    """z <- L^-1 z in place for the lower banded factor cfac (LAPACK storage). The columns of z are sorted by
+    starts, the first row that may be nonzero (rows above stay zero).
+
+    Column-oriented over L and over every right-hand side started so far, so that each band entry is
+    read once per row (plain loops, for numba).
+    """
+    kd, n, m = cfac.shape[0] - 1, cfac.shape[1], z.shape[1]
+    na = 0
+    for j in range(starts[0] if m else n, n):
+        while na < m and starts[na] <= j:
+            na += 1
+        d0 = cfac[0, j]
+        for c in range(na):
+            z[j, c] /= d0
+        for d in range(1, min(kd, n - 1 - j) + 1):
+            lv = cfac[d, j]
+            if lv != 0.0:
+                for c in range(na):
+                    z[j + d, c] -= lv * z[j, c]
+
+
+_band_forward_jit = njit(nogil=True)(_band_forward) if njit is not None else None
+
+
 def _forward_border(cfac, border):
     """L^-1 border, each column solved from the keyframe of its first nonzero row on (the rows above stay 0)."""
-    z = np.zeros_like(border)
     nonzero = border != 0
     first = np.where(nonzero.any(0), nonzero.argmax(0) // DOF * DOF, border.shape[0])
+    if _band_forward_jit is not None:  # every column in one pass, in the order of their first rows
+        order = np.argsort(first, kind="stable")
+        z = np.ascontiguousarray(border[:, order])
+        _band_forward_jit(cfac, z, first[order].astype(np.int64))
+        out = np.empty_like(z)
+        out[:, order] = z
+        return out
+    z = np.zeros_like(border)
     for r0 in np.unique(first[first < border.shape[0]]):
         cols = np.flatnonzero(first == r0)
         z[r0:, cols] = _tri_banded(cfac[:, r0:], border[r0:, cols])
     return z
 
 
-def _pcg(rp, m_o, h_xl, ab, u, nb, ne, border, corner, precond, rhs, tol=1e-9, max_iter=200):
+def _pcg(rp, m_o, h_xl, ab, u, nb, ne, border, corner, precond, rhs, tol=1e-4, max_iter=200):
     """Conjugate gradients on the full reduced system; the bordered banded factor preconditions it."""
     blocks = np.zeros((len(rp.off_keys), 6, 6))
     for s in range(0, len(rp.off_a), rp.chunk):
@@ -1804,7 +1836,7 @@ def main():
                    "a tight one keeps the calibration's focal length on average and lets only its course change")
     s.add_argument("--focal-trend", type=float, default=0.0,
                    help="diagnosis: relative focal length change from the first to the last segment")
-    s.add_argument("--pcg-tol", type=float, default=1e-9,
+    s.add_argument("--pcg-tol", type=float, default=1e-4,
                    help="relative residual at which conjugate gradients stop (with revisit matches)")
     s.add_argument("--pcg-iters", type=int, default=200, help="most conjugate-gradient iterations per step")
     s.add_argument("--max-size-ratio", type=float, default=0.0,

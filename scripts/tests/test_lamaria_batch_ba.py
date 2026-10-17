@@ -230,6 +230,25 @@ class FocalPriorTest(unittest.TestCase):
         self.assertTrue(np.all(h[np.ix_(np.arange(24) % 4 != 3, np.arange(24))] == 0))  # rotations untouched
 
 
+class BandForwardTest(unittest.TestCase):
+    def test_matches_a_dense_triangular_solve(self):
+        rng = np.random.default_rng(8)
+        n, kd = 60, 7
+        dense = np.tril(rng.normal(size=(n, n)) * 0.3)
+        dense[np.tril_indices(n, -kd - 1)] = 0.0
+        dense[np.diag_indices(n)] = 2.0 + rng.uniform(size=n)
+        cfac = np.zeros((kd + 1, n))  # LAPACK lower band storage: cfac[i - j, j] = L[i, j]
+        for d in range(kd + 1):
+            cfac[d, :n - d] = np.diagonal(dense, -d)
+        starts = np.array([0, 12, 12, 30, 59, 60])  # sorted; the last column is all zero
+        b = rng.normal(size=(n, len(starts)))
+        for c, r0 in enumerate(starts):
+            b[:r0, c] = 0.0
+        z = b.copy()
+        lb._band_forward(cfac, z, starts)
+        np.testing.assert_allclose(z, np.linalg.solve(dense, b), rtol=1e-12, atol=1e-12)
+
+
 class TriangulateTest(unittest.TestCase):
     def test_drops_bad_observations_and_narrow_tracks(self):
         rng = np.random.default_rng(8)

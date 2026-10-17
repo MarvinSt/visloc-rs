@@ -19,16 +19,23 @@ named inline; nothing is tuned against ground truth unless stated.
   and `evaluate_wrt_pgt` pose recall at 1 m/5 m (pseudo-GT), using the same
   Sim(3). Submission is TUM `ns`, `world_from_imu`, all image timestamps, zipped
   as `slam/<seq>.txt`, with a 24 h submission rate limit.
-- **Headlines on the leaderboard (bino+imu track, as recorded 2026-09-15)**:
+- **Headlines on the leaderboard (Score per challenge, test set, as shown on
+  2026-10-17)**. Aria's SLAM is the LaMAria team's run of the closed-source
+  Aria system, from which the pseudo-GT pipeline is initialized. The page
+  recorded on 2026-09-15 listed microSLAM at 64.5–85.6; it now shows the
+  numbers below. Our row is one training sequence per track (batch BA with
+  the revisits, lever 14), not a submission:
 
-  | Method | Short | Medium | Long | Low light | Moving |
-  |---|---:|---:|---:|---:|---:|
-  | Aria's own SLAM (proprietary, non-causal) | 90.7 | 78.5 | 70.9 | 84.2 | 55.0 |
-  | microSLAM (mono) | 64.5 | 74.5 | 82.3 | 78.3 | 85.6 |
-  | GroundedSI / RoboCap (bino+IMU; avg 62.3 — per their arXiv 2610.07217 report, unverified) | 80.2 | 61.6 | 59.9 | 67.7 | 41.9 |
-  | **Ours (training, R_11_5cp VIO+mapper)** | **57.66** | — | — | — | — |
-  | Best academic (OpenVINS+Maplab) | 27.7 | 23.4 | 12.8 | 19.8 | 13.9 |
-  | OKVIS2 | 20.0 | 11.6 | 2.6 | 14.5 | 4.7 |
+  | Method | Sensors | Short | Medium | Long | Low light | Moving | Mean |
+  |---|---|---:|---:|---:|---:|---:|---:|
+  | Aria's SLAM (closed source) | bino + IMU | 90.7 | 78.5 | 70.9 | 84.2 | 55.0 | 75.9 |
+  | GroundedSLAM | bino + IMU | 80.2 | 61.6 | 59.9 | 67.7 | 41.9 | 62.3 |
+  | AnonSLAM | mono + IMU | 43.3 | 33.6 | 30.0 | 41.7 | 19.1 | 33.5 |
+  | Mighty Camera | mono + IMU | 57.1 | 38.8 | 18.5 | 36.9 | 15.8 | 33.4 |
+  | OpenVINS+Maplab | bino + IMU | 27.7 | 23.4 | 12.8 | 19.8 | 13.9 | 19.5 |
+  | microSLAM | mono | 35.8 | 20.3 | 10.0 | 22.9 | 4.9 | 18.8 |
+  | OKVIS2 | bino + IMU | 20.0 | 11.6 | 2.6 | 14.5 | 4.7 | 10.7 |
+  | **Ours (training: 1_19, 2_11, 3_17, 4_10, 5_11)** | bino + IMU | 87.22 | 77.31 | 60.00 | 49.52 | 57.15 | 66.24 |
 
 - Test data must be **streamed and deleted** (~862 GB total; server throttles
   per connection — use `aria2c -x16`, ~57 MB/s, from the official file list).
@@ -75,7 +82,7 @@ sequences only (test scores are only obtainable by submission).
 | # | Milestone | Exit criterion | Status |
 |---|---|---|---|
 | M0 | Stage 0: first official scores; mapper usable at scale | R_11_5cp 49.65 VIO / 57.66 mapper; sequence_1_19 VIO 12.75; mapper perf/memory fixes merged | **done** (PR #156) |
-| M1 | Beat the best academic baseline on Short | mapper-scored sequences ≥ 27.7, toward microSLAM's 64.5 — already **R_11_5cp VIO-only 63.19** (CP@1m 60 %) with the larger window, and sequence_1_19 VIO-only 27.09 (default window: R_11 49.65 / seq_1_19 12.75) | in progress |
+| M1 | Beat the best academic baseline on Short | mapper-scored sequences ≥ 27.7, toward GroundedSLAM's 80.2 — already **R_11_5cp VIO-only 63.19** (CP@1m 60 %) with the larger window, and sequence_1_19 VIO-only 27.09 (default window: R_11 49.65 / seq_1_19 12.75) | in progress |
 | M2 | Medium/Long consistency | loop-closure/mapper holds at km scale; mean Short/Medium/Long Score clearly above 27.7; no >2 km drift blow-up | not started |
 | M3 | Low-light robustness | low-light training sequences score comparably to Short; no tracking loss | not started |
 | M4 | Moving-platform handling | moving-platform training sequences tracked without divergence | not started |

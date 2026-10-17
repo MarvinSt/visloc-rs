@@ -267,7 +267,191 @@ at most 0.02 px inwards on 1WM09370081264. Estimating the intrinsics finds a
 focal length 0.1–0.3 % longer and k1 ≈ +0.002 on both cameras of
 1WM093701G1276 (−0.1 % and 0 on sequence_1_19), but that reduces the drift
 only when the intrinsics may change per segment, and it costs points either
-way. The cause remains open.
+way.
+
+The radial residual grows with the SIFT keypoint size, on both devices. At
+200–250 px from the principal point (about 45° off axis, where the pinhole
+image stretches fastest radially), by keypoint octave:
+
+| Sequence | Octave −1 (upsampled) | Octave 0 | Octave 1 | Octave 2 |
+|---|---:|---:|---:|---:|
+| sequence_2_11 | +0.024 px | +0.038 px | +0.058 px | +0.075 px |
+| sequence_1_19 | −0.007 px | −0.001 px | +0.012 px | +0.051 px |
+
+Only the offset common to all octaves differs between the devices. Moving
+every keypoint by its octave's and radius's mean residual (`--xy-correction`,
+a table from the first solve) leaves the local scale trend of
+sequence_2_11 at +2.55 % per 1,000 s (+2.53 % with three times the
+correction; CP Score 71.75 and 68.01), and keeping only matches between
+keypoints of similar size raises it (+3.22 % within a size ratio of 1.25,
++2.82 % within 1.5). Neither the detector nor the residual distortion drives
+the drift.
+
+The ratio of the image's angular scale to the gyroscope's does. Changing the
+focal lengths linearly over the recording (`--focal-trend`, the mean
+unchanged; first solve, eight segments) moves the trend in proportion:
+
+| Focal length change from the first to the last segment | CP Score | Pose recall at 1 m | Local scale trend per 1,000 s |
+|---|---:|---:|---:|
+| −0.4 % | 63.42 | 55.8 % | +3.80 % |
+| 0 (the calibration) | 71.18 | 76.8 % | +2.48 % |
+| +0.4 % | **74.93** | **84.5 %** | +1.32 % |
+| +1.2 % | 70.59 | 81.5 % | (fitted scale drift −1.2 %) |
+
+Without outlier rejection, so that every run keeps the same observations,
+the objective itself is lowest near +0.4 %: final costs 256,222 (−0.4 %),
+254,336 (0), 253,950 (+0.4 %) and 255,206 (+0.8 %). Scaling the gyroscope
+instead changes the scale drift alike but turns the heading: a gyroscope
+scale from 1.003 to 0.997 over the recording raises the trend to +3.78 %
+(CP Score 65.82), the opposite to +1.73 % (60.37, heading drift +0.21°). A
+constant gyroscope scale of 1.003 gives 72.79 (pose recall 83.2 %) at a much
+higher cost (190,737 against 181,127; the rotation residual per factor goes
+from 7.6 to 13.4), so the gyroscope's own scale is right.
+
+The same +0.4 % does not suit every sequence (first solve):
+
+| Sequence | Device | Calibration | Focal length +0.4 % over the recording |
+|---|---|---:|---:|
+| sequence_1_19 | 1WM09370081264 | **86.53** | 81.24 |
+| sequence_2_11 | 1WM093701G1276 | 71.18 | **74.93** |
+| sequence_4_10 | 1WM093701G1276 | 47.65 | **50.97** |
+| sequence_5_11 | 1WM093701G1276 | **56.22** | 51.27 |
+| sequence_1_20 | 1WM09370081264 | 44.41 | **45.29** |
+
+`--est-focal` estimates the focal lengths instead: one scale per camera and
+time segment, next to its rotation, with priors on its change between
+segments (0.05 %, `--focal-seg-sigma`) and on its value (1 %). The fit
+improves on both sides: on sequence_2_11 the reprojection cost falls from
+164,733 to 160,559 and the IMU cost from 16,386 to 15,489, and the IMU
+position, velocity and rotation residuals per factor all shrink. The
+estimates are consistent by device and conditions, which suggests the
+temperature:
+
+| Sequence | Device | Conditions | Focal length against the calibration, cam0 / cam1 (mean of the segments) | First and last segment, cam0 |
+|---|---|---|---:|---:|
+| sequence_1_19 | 1WM09370081264 | day | −0.11 % / −0.08 % | −0.15 % .. −0.15 % |
+| sequence_1_20 | 1WM09370081264 | day | −0.11 % / −0.06 % | −0.13 % .. −0.10 % |
+| sequence_2_11 | 1WM093701G1276 | day | +0.34 % / +0.26 % | +0.18 % .. +0.36 % |
+| sequence_3_17 | 1WM093701G1276 | day | +0.41 % / +0.37 % | +0.32 % .. +0.45 % |
+| sequence_4_10 | 1WM093701G1276 | night | −0.04 % / −0.04 % | −0.08 % .. +0.01 % |
+| sequence_5_11 | 1WM093701G1276 | day, funicular | +0.57 % / +0.53 % | +0.41 % .. +0.59 % |
+
+The pipeline with the revisits (first solve, `loop-correct`, second solve,
+each with `--est-focal`):
+
+| Sequence | First solve | `--est-focal` | Pipeline | `--est-focal` | Pose recall at 1 m, pipeline / `--est-focal` |
+|---|---:|---:|---:|---:|---:|
+| sequence_1_19 | **86.53** | 83.28 | 87.22 | | 96.5 % / |
+| sequence_2_11 | **71.18** | 68.74 | 77.31 | **77.72** | 75.8 % / **94.1 %** |
+| sequence_3_17 | 60.25 | **65.96** | 60.00 | **66.16** | 55.5 % / **63.4 %** |
+| sequence_4_10 | 47.65 | **48.86** | 49.52 | **50.75** | 24.1 % / **25.8 %** |
+| sequence_5_11 | **56.22** | 46.96 | **57.15** | 48.02 | |
+| sequence_1_20 | 44.41 | **46.18** | 43.41 | **44.79** | 12.7 % / **14.1 %** |
+
+On the moving platform the estimate goes wrong: there the IMU feels the
+funicular, which the scene inside the car does not show, and the focal
+lengths absorb the conflict (the fitted scale drift grows from −6.5 % to
+−8.6 %). Pinning the mean of each camera's scales to the calibration
+(`--focal-mean-sigma 0.00001`) does not save it (48.14).
+
+### Keypoint size
+
+A SIFT keypoint detected at a coarser scale is located less precisely. The
+residuals of the first solve (robust spread, 1.4826 × MAD of the x residual)
+by keypoint octave:
+
+| Sequence | Octave −1 (2.7 px) | Octave 0 (4.8 px) | Octave 1 (9.3 px) | Octave 2 (18 px) | Octave 3 (37 px) |
+|---|---:|---:|---:|---:|---:|
+| sequence_1_19 | 0.19 px | 0.23 px | 0.32 px | 0.49 px | 0.59 px |
+| sequence_2_11 | 0.24 px | 0.30 px | 0.40 px | 0.51 px | 0.59 px |
+| sequence_4_10 | 0.42 px | 0.43 px | 0.51 px | 0.60 px | 0.66 px |
+
+About ×1.27 per octave, that is σ ∝ size^0.35, except at the finest scale in
+low light, where noise dominates. `--sigma-size 2.7 --sigma-size-pow 0.35`
+gives each observation σ = 1 px × max(1, size / 2.7 px)^0.35 (first solve):
+
+| Sequence | σ = 1 px | σ by keypoint size |
+|---|---:|---:|
+| sequence_1_19 | 86.53 | **87.46** |
+| sequence_2_11 | 71.18 | **72.57** |
+| sequence_3_17 | **60.25** | 60.09 |
+| sequence_4_10 | **47.65** | 46.65 |
+| sequence_5_11 | 56.22 | **56.54** |
+| **Mean of the five tracks** | 64.36 | **64.66** |
+| sequence_1_20 | 44.41 | **44.94** |
+
+### Low light: features after denoising
+
+On sequence_4_10 the BA keeps 191 observations per keyframe, against 360–500
+on the other sequences, and its 60 s segments are twice as far off (0.32 m
+RMSE). The images are dark (median grey level 10–30) and noisy at gain 15,
+and the CLAHE equalization amplifies the noise: half the matches between
+consecutive keyframes of the other sequences survive (137 instead of 259–362
+per image pair), and 72 % of the keypoints come from the upsampled octave,
+where the residuals are no smaller than one octave up (0.42 px MAD on
+sequence_4_10, against 0.24 px on sequence_2_11).
+
+Non-local means denoising (OpenCV, h = 7) before the equalization
+(`features --denoise 7`) leaves fewer keypoints, but the ones that match agree
+with the IMU. Each variant below runs features, matching and a solve on one
+200 s window of keyframes; the RMSE is that of a Sim(3) fit to the pseudo-GT
+over the window, and the IMU column the whitened position residual per
+factor:
+
+| Variant | Keypoints per image | Observations | RMSE, keyframes 1000–1400 | IMU | RMSE, 200–600 | RMSE, 2200–2600 |
+|---|---:|---:|---:|---:|---:|---:|
+| CLAHE (the default for low light) | 1,500 | 87,593 | 0.890 m | 2.09 | 0.706 m | **0.440 m** |
+| No equalization | 1,403 | 81,460 | 0.809 m | 1.80 | | |
+| CLAHE, clip limit 1.5 instead of 3 | 1,500 | 85,757 | 0.904 m | 2.27 | | |
+| Gaussian blur (σ 1 px) before CLAHE | 1,500 | 95,751 | 0.889 m | 2.20 | | |
+| 3,000 keypoints | 3,000 | 127,258 | 0.864 m | 4.58 | | |
+| Non-local means, h = 4 | 1,083 | 82,983 | 0.476 m | 1.16 | | |
+| Non-local means, h = 7 | 679 | 62,415 | **0.399 m** | 0.69 | **0.462 m** | 0.471 m |
+| Non-local means, h = 10 | 508 | 50,101 | 0.428 m | 0.43 | | |
+| Non-local means, h = 7, contrast threshold 0.005 | 1,326 | 74,238 | 0.900 m | 1.96 | | |
+
+The weak keypoints are the problem: with the denoising but a lower contrast
+threshold, the window is as far off as without it.
+
+On the whole sequence the denoised features (556 per image, 2.6 million
+matches against 4.1 million) take the fitted scale drift from +3.5 % to
++0.8 % and most CP errors under a metre:
+
+| sequence_4_10 | First solve | + `loop-correct` | + second solve | Pose recall at 1 m |
+|---|---:|---:|---:|---:|
+| CLAHE | 47.65 | 47.54 | 49.52 | 24.1 % |
+| Non-local means (h = 7), then CLAHE | 63.31 | 62.52 | 63.73 | **68.0 %** |
+| The same, with `--est-focal` | **63.64** | **63.26** | **64.30** | 66.9 % |
+
+### The first minutes of a recording
+
+The gyroscope disagrees with the solved rotations at the start of every
+recording. The whitened rotation residual per IMU factor (median over 15 s,
+eight-segment solves) falls to its usual 1–2 within about two minutes:
+
+| Sequence | 0–15 s | 15–30 s | 30–45 s | 45–60 s | 60–75 s | 75–90 s | 90–105 s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| sequence_1_19 | 25.9 | 13.6 | 2.4 | 2.3 | 1.9 | 6.2 | 1.9 |
+| sequence_2_11 | 96.8 | 10.9 | 9.3 | 7.7 | 4.6 | 3.9 | 3.2 |
+| sequence_3_17 | 11.7 | 8.1 | 5.7 | 2.9 | 2.6 | 3.7 | 1.1 |
+| sequence_4_10 | 305.6 | 16.0 | 16.3 | 9.9 | 10.6 | 4.6 | 3.6 |
+
+On sequence_4_10 the residual of the first two minutes does not depend on
+how far the head turns between keyframes (about 10 for turns of 2–5° and of
+more than 20°), which points at a bias rather than a scale: the gyro bias
+still settles while the device warms up, and the tight bias random walk
+(1e-7) keeps it constant. The recordings carry no IMU temperature (the field
+is NaN in the VRS records). Letting the bias move does not help in general
+(first solve):
+
+| Run | sequence_2_11 | sequence_4_10 |
+|---|---:|---:|
+| Default | **71.18** | 47.65 |
+| Gyro bias random walk ×100 | | 49.38 |
+| Gyro bias random walk ×1000 | 66.56 | 50.53 |
+| ×1000 at the start, decaying with a time constant of 120 s (`--gyro-rw-warmup 120`) | 67.51 | **50.72** |
+| The same with 300 s | | 49.29 |
+| Accelerometer bias random walk ×30 at the start, 120 s | 68.36 | |
 
 ### What the gain on sequence_1_19 comes from
 
@@ -298,8 +482,10 @@ accepts 1,566 keyframe pairs:
 
 Landmarks seen on both visits couple keyframes outside the band. The solver
 then runs conjugate gradients on the full reduced system, preconditioned by
-the banded factor: 25–200 iterations per step (to a relative residual of
-1e-9, at most 200).
+the banded factor, to a relative residual of 1e-4 (`--pcg-tol`, at most 200
+iterations). Solving each step to 1e-9 instead took 5,816 iterations over the
+30 steps of sequence_2_11's second solve, against 3,156, for the same result
+(CP Score 77.31 and 77.30).
 
 Added straight to the solve, the revisits do not close the loops. The
 solved sequence_2_11 is about 1.3 m off between its two visits, and a revisit
@@ -373,6 +559,20 @@ time offset on top of the per-device alignment (±2 ms, 150 s windows)
 minimizes the total cost within 0.5 ms of the device table on both devices
 (−0.4 ms on sequence_1_19, −0.5 ms on sequence_2_11). The time alignment
 is therefore not what limits the sequences of 1WM093701G1276.
+
+Nor does the exposure shift it. sequence_4_10's SLAM cameras expose for
+13.98 ms throughout (gain 15), sequence_2_11's for 0.08 ms at the median (the
+VRS image records), so a timestamp at the start or the end of the exposure
+would move sequence_4_10 by 7 ms against the device table. Shifting both IMU
+channels instead raises the cost of 150 s windowed solves (keyframes 100–400
+and 1500–1800, one rotation per camera) on both sides:
+
+| IMU shifted by | 0 ms | −6 ms | +6 ms | −12 ms | +12 ms |
+|---|---:|---:|---:|---:|---:|
+| Final cost, window 1 | **23,201** | 30,381 | 30,663 | 40,583 | 40,596 |
+| Final cost, window 2 | **19,785** | 24,655 | 24,846 | 31,228 | 30,672 |
+
+The timestamps are the middle of the exposure.
 
 ## Slow heading drift
 

@@ -119,7 +119,8 @@ impl SsimKernels {
         for (p, b) in [(&self.fwd, &binds.fwd), (&self.bwd, &binds.bwd)] {
             pass.set_pipeline(p);
             pass.set_bind_group(0, b, &[]);
-            pass.dispatch_workgroups(tiles, 1, 1);
+            let x = tiles.min(65535).max(1);
+            pass.dispatch_workgroups(x, tiles.div_ceil(x), 1);
         }
     }
 }

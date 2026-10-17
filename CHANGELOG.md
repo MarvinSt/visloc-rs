@@ -12,15 +12,25 @@ All notable changes to `visloc-rs` will be documented here.
   square, before SfM and training. Their focal length `size / 2` is exact
   and stays fixed. Faces of one panorama are not matched with each other,
   and the window counts panoramas. The faces are still separate cameras.
-  The log reports how far apart each panorama's face centres land. On five
-  synthetic room panoramas (`equirect_end_to_end`, an ignored test), all
-  30 faces registered, at a median 0.8% of the spacing between panoramas.
-  Off by default.
+  The log reports how far apart each panorama's face centres land. Off by
+  default.
+  - Five synthetic room panoramas (`equirect_end_to_end`, an ignored
+    test): all 30 faces register. Relative rotations are within 0.13° of
+    the truth, and panorama distances within 0.4 mm over 0.58 m spacing.
+  - The five real panoramas of the
+    [ScanVan example](https://github.com/ScanVan/sfs-framework-example)
+    (CPU, `--steps 0`): the four side faces of every panorama register;
+    the up and down faces (sky, the camera mount) do not. Panorama
+    distances match ScanVan's own trajectory within 0.4%. As pinhole
+    images the same panoramas reconstruct nothing.
 - **A warning for panoramas fed as pinhole photos.** When at least half the
   images look equirectangular, `build_photo_dataset` logs a warning that
   points to `--equirect`. An image counts when it is 2:1 with left and
   right edges that meet and smooth pole rows, or when its metadata says
-  equirectangular (Photo Sphere XMP). Outputs are unchanged.
+  equirectangular (Photo Sphere XMP). Outputs are unchanged. It flags
+  three stitched Poly Haven panoramas and none of the 128 south-building
+  photos or their 2:1 crops. It misses the ScanVan panoramas, whose left
+  and right edges are lens rims that do not meet.
 
 ### Fixed
 

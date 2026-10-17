@@ -1572,10 +1572,19 @@ mod tests {
         let root = std::env::temp_dir().join(format!("visloc_equirect_{}", std::process::id()));
         let images = root.join("in");
         std::fs::create_dir_all(&images).unwrap();
-        for k in 0..5 {
-            let c =
-                nalgebra::Vector3::new(-1.0 + 0.5 * k as f64, 0.1 * (k % 2) as f64, 0.3 * k as f64);
-            room_panorama(1024, c, 0.4 * k as f64)
+        // (centre, yaw) of each panorama.
+        let truth: Vec<(nalgebra::Vector3<f64>, f64)> = (0..5)
+            .map(|k| {
+                let c = nalgebra::Vector3::new(
+                    -1.0 + 0.5 * k as f64,
+                    0.1 * (k % 2) as f64,
+                    0.3 * k as f64,
+                );
+                (c, 0.4 * k as f64)
+            })
+            .collect();
+        for (k, &(c, yaw)) in truth.iter().enumerate() {
+            room_panorama(1024, c, yaw)
                 .save(images.join(format!("pano_{k}.png")))
                 .unwrap();
         }
@@ -1606,6 +1615,72 @@ mod tests {
         assert_eq!(report.focal, 128.0);
         assert!(report.registered >= 24, "{} registered", report.registered);
         assert_eq!(dataset.train.len(), report.registered);
+
+        // Against the truth, free of the gauge: face k of panorama i looks
+        // along yaw_i * R_k (camera to world) from centre_i.
+        let faces = crate::equirect::cube_face_rotations();
+        let true_rotation = |i: usize| {
+            let (_, yaw) = truth[i / 6];
+            nalgebra::Rotation3::from_axis_angle(&nalgebra::Vector3::y_axis(), yaw).matrix()
+                * faces[i % 6].1
+        };
+        // Recovered world-to-camera rotations and centres, by image index.
+        let text = std::fs::read_to_string(root.join("faces/sparse/0/images.txt")).unwrap();
+        let mut est: Vec<(usize, nalgebra::Matrix3<f64>, nalgebra::Vector3<f64>)> = Vec::new();
+        for line in text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let t: Vec<&str> = line.split_whitespace().collect();
+            let v: Vec<f64> = t[1..8].iter().map(|x| x.parse().unwrap()).collect();
+            let q = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+                v[0], v[1], v[2], v[3],
+            ));
+            let r = *q.to_rotation_matrix().matrix();
+            let centre = -r.transpose() * nalgebra::Vector3::new(v[4], v[5], v[6]);
+            let i: usize = t[9][6..11].parse().unwrap();
+            est.push((i, r, centre));
+        }
+        assert_eq!(est.len(), report.registered);
+        // Relative rotation of every pair of faces, recovered vs true.
+        let mut worst_deg = 0.0f64;
+        for (a, ra, _) in &est {
+            for (b, rb, _) in &est {
+                let recovered = ra * rb.transpose();
+                let truth = true_rotation(*a).transpose() * true_rotation(*b);
+                let angle =
+                    nalgebra::Rotation3::from_matrix_unchecked(recovered.transpose() * truth)
+                        .angle();
+                worst_deg = worst_deg.max(angle.to_degrees());
+            }
+        }
+        // Distances between the panoramas' mean face centres, recovered vs
+        // true, after the least-squares scale.
+        let mean_centre = |p: usize| {
+            let c: Vec<_> = est.iter().filter(|e| e.0 / 6 == p).map(|e| e.2).collect();
+            c.iter().sum::<nalgebra::Vector3<f64>>() / c.len() as f64
+        };
+        let (mut dt, mut de) = (Vec::new(), Vec::new());
+        for p in 0..5 {
+            for q in p + 1..5 {
+                dt.push((truth[p].0 - truth[q].0).norm());
+                de.push((mean_centre(p) - mean_centre(q)).norm());
+            }
+        }
+        let scale = dt.iter().zip(&de).map(|(t, e)| t * e).sum::<f64>()
+            / de.iter().map(|e| e * e).sum::<f64>();
+        let worst_m = dt
+            .iter()
+            .zip(&de)
+            .map(|(t, e)| (scale * e - t).abs())
+            .fold(0.0, f64::max);
+        println!(
+            "vs truth: worst relative rotation {worst_deg:.3} deg, worst panorama distance \
+             error {:.1} mm (spacing 0.58 m)",
+            1000.0 * worst_m
+        );
+        assert!(worst_deg < 0.5, "{worst_deg} deg");
+        assert!(worst_m < 0.02, "{worst_m} m");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

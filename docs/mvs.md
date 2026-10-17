@@ -137,37 +137,72 @@ camera poses (`dslr_calibration_undistorted`).
 
 ### All 13 training scenes on a GPU
 
-One run on an NVIDIA L4 pod at commit `21b6596` with what are now the
+One run on an NVIDIA L4 pod at commit `2c9cebe` with what are now the
 example's defaults: images at 3200 px, 10 source views, three iterations
-per pass, one scale, the photometric pass, the planar prior pass and two
-geometric passes. The depth maps were fused four ways. F1, accuracy and
-completeness are for the default fusion (one agreeing source view within
-10°); the other columns are the F1 of the run before the planar prior
-(commit `3f05992`, the same fusion) and of the same maps fused with 15°
-and with two agreeing views at 30°. Times cover the whole `mvs` run:
-loading, depth maps, a fusion and writing the cloud and the maps.
+per pass, three scales (800, 1600 and 3200 px) in ACMMP's order, each
+with a photometric pass, the planar prior pass and two geometric passes.
+The same run estimated every scene with one scale too (`--scales 1`, the
+previous default). F1, accuracy and completeness are for three scales and
+the default fusion (one agreeing source view within 10°); the other F1
+columns are for one scale (the same fusion) and for three scales fused
+within 15°. Times cover the whole `mvs` run: loading, depth maps, a
+fusion and writing the cloud and the maps. (Facade ran on a second pod,
+the same GPU type and driver, after its upload failed.)
 
-| Scene | Images | F1 | Accuracy | Completeness | F1 without the prior | F1, 15° | F1, two views | Time |
+| Scene | Images | F1 | Accuracy | Completeness | F1, one scale | F1, 15° | Time | Time, one scale |
 |---|---|---|---|---|---|---|---|---|
-| pipes | 14 | 81.3% | 93.8% | 71.8% | 78.0% | 81.2% | 73.7% | 1:54 |
-| meadow | 15 | 64.2% | 90.7% | 49.7% | 60.4% | 64.9% | 60.3% | 2:49 |
-| terrace | 23 | 90.0% | 95.4% | 85.3% | 88.8% | 89.9% | 89.3% | 3:48 |
-| office | 26 | 78.5% | 79.1% | 77.9% | 71.3% | 77.6% | 76.9% | 3:59 |
-| kicker | 31 | 77.6% | 77.9% | 77.3% | 75.4% | 76.8% | 75.6% | 5:33 |
-| relief | 31 | 87.9% | 92.4% | 83.9% | 87.7% | 87.5% | 87.1% | 5:30 |
-| relief 2 | 31 | 87.0% | 90.4% | 83.9% | 86.9% | 86.7% | 85.0% | 5:12 |
-| courtyard | 38 | 89.2% | 89.9% | 88.4% | 88.5% | 89.3% | 86.6% | 6:18 |
-| playground | 38 | 67.6% | 78.8% | 59.3% | 67.4% | 67.7% | 65.9% | 6:36 |
-| terrains | 42 | 91.4% | 91.4% | 91.4% | 89.7% | 91.2% | 90.8% | 7:23 |
-| delivery area | 44 | 89.7% | 88.8% | 90.6% | 87.8% | 89.3% | 87.5% | 6:48 |
-| electro | 45 | 88.8% | 95.9% | 82.6% | 86.7% | 88.8% | 87.5% | 7:14 |
-| facade | 76 | 65.5% | 76.3% | 57.3% | 64.9% | 65.5% | 64.0% | 14:17 |
+| pipes | 14 | 84.4% | 93.9% | 76.7% | 81.2% | 84.1% | 1:53 | 1:40 |
+| meadow | 15 | 76.0% | 84.9% | 68.8% | 63.9% | 76.2% | 2:34 | 2:27 |
+| terrace | 23 | 91.0% | 94.8% | 87.5% | 90.0% | 90.7% | 3:43 | 3:12 |
+| office | 26 | 79.0% | 76.6% | 81.7% | 78.6% | 77.8% | 3:47 | 3:19 |
+| kicker | 31 | 82.3% | 78.9% | 85.9% | 77.6% | 81.3% | 4:54 | 4:24 |
+| relief | 31 | 87.8% | 91.6% | 84.3% | 87.9% | 87.4% | 5:20 | 4:31 |
+| relief 2 | 31 | 86.5% | 89.3% | 83.9% | 86.9% | 86.1% | 5:24 | 4:26 |
+| courtyard | 38 | 90.4% | 90.0% | 90.7% | 89.1% | 90.4% | 6:05 | 5:07 |
+| playground | 38 | 69.8% | 77.2% | 63.7% | 67.4% | 69.5% | 6:28 | 5:45 |
+| terrains | 42 | 91.2% | 90.9% | 91.5% | 91.3% | 91.0% | 6:54 | 6:09 |
+| delivery area | 44 | 90.1% | 89.0% | 91.1% | 89.6% | 89.8% | 6:44 | 5:40 |
+| electro | 45 | 89.4% | 94.5% | 84.9% | 88.7% | 89.2% | 6:55 | 6:03 |
+| facade | 76 | 67.5% | 74.4% | 61.7% | 65.4% | 67.3% | 13:46 | 11:53 |
+MEAN s avg      : 13 scenes, F1 81.36, accuracy 87.64, completeness 76.84  (r36 on these: 81.44)
+MEAN s one15    : 13 scenes, F1 81.16, accuracy 85.94, completeness 77.81  (r36 on these: 81.44)
+MEAN m avg      : 13 scenes, F1 83.49, accuracy 86.62, completeness 80.95  (r36 on these: 81.44)
+MEAN m one15    : 13 scenes, F1 83.13, accuracy 85.04, completeness 81.70  (r36 on these: 81.44)
+
+- **Mean over the 13 scenes:** F1 83.5%, accuracy 86.6%, completeness
+  81.0%, against 81.4% (87.6%, 76.8%) with one scale. Over the same
+  scenes at 2 cm, ACMMP reports F1 83.42%, HPM-MVS 84.58%, ACMP 79.79%,
+  ACMM 78.86% (accuracy 90.67%, completeness 70.42%) and COLMAP 67.66%
+  (91.85%, 55.13%) (arXiv 2303.09758, 2210.07582); later methods reach
+  84 to 89% (arXiv 2503.13721).
+- **Three scales against one:** +2.1 points on average, most in weak
+  texture: meadow +12.1, kicker +4.7, pipes +3.2, playground +2.4 and
+  facade +2.1. The detailed scenes stay within half a point (relief
+  −0.1, relief 2 −0.4, terrains −0.1), where the earlier multi-scale
+  scheme lost 3.6 to 6.3 points (below). Completeness rises by 4.1 points
+  for 1.0 point of accuracy.
+- **The planar prior's draws** around the prior change little: with one
+  scale, 81.36% against 81.44% in the previous run (commit `21b6596`,
+  below), within 0.3 point on every scene.
+- **Fusion:** 10° beats 15° with three scales too (83.1% at 15°).
+- **Time:** 74 minutes for all 13 scenes with three scales, 65 with one,
+  from 1:53 (14 images) to 13:46 (76 images). On facade the finest scale
+  takes 2:27 for the photometric pass, 2:27 for the planar prior pass and
+  2:08 and 2:05 for the geometric passes; the two coarser scales take
+  2:26 together. Peak memory 14.6 GiB on facade (13.7 GiB with one scale;
+  `--save-maps` keeps the costs).
+
+### One scale and the planar prior
+
+One run at commit `21b6596`: one scale, the photometric pass, the planar
+prior pass (its random draws not yet around the prior) and two geometric
+passes. F1, accuracy and completeness are for the default fusion; the
+other columns are the F1 of the run before the planar prior (commit
+`3f05992`, the same fusion) and of the same maps fused with 15° and with
+two agreeing views at 30°.
 
 - **Mean over the 13 scenes:** F1 81.4%, accuracy 87.7%, completeness
-  76.9%. Over the same scenes at 2 cm, ACMMP reports F1 83.42%, ACMP
-  79.79%, ACMM 78.86% (accuracy 90.67%, completeness 70.42%) and COLMAP
-  67.66% (91.85%, 55.13%) (arXiv 2303.09758, 2210.07582); later methods
-  reach 84 to 89% (arXiv 2503.13721).
+  76.9%.
 - **The planar prior raises F1 on all 13 scenes,** from 79.5% to 81.4%
   on average. It adds the most in weak texture, on office (+7.2 points),
   meadow (+3.8) and pipes (+3.4), and 0.1 to 0.3 points on the detailed
@@ -175,7 +210,7 @@ loading, depth maps, a fusion and writing the cloud and the maps.
   about the same accuracy (88.0%, 87.7%).
 - **The angle:** 10° and 15° are close (81.3% at 15°); 10° is higher on
   eight scenes and lower on three, and it is ACMM's and ACMP's angle, so
-  it is now the default. 30° scores 80.6%. Two agreeing views at 30°
+  it is the default. 30° scores 80.6%. Two agreeing views at 30°
   score 79.3% (accuracy 89.0%, completeness 72.5%).
 - **Time:** 77 minutes for all 13 scenes (65 without the planar prior),
   from 1:54 (14 images) to 14:17 (76 images). On facade the photometric
@@ -194,11 +229,13 @@ the NaN fix, the skipped unweighted views and the texture sampling), the
 two-view F1 agrees within 0.1 point on each of the 12 scenes that run
 covered, which took 53 minutes instead of 99.
 
-### Multi-scale
+### Multi-scale with the paper's detail restorer
 
-The same scenes with ACMM's three scales (`--scales 3`), two geometric
-passes at each and no planar prior, at commit `33b7418`, whose PatchMatch
-code is that of `3f05992`. F1, accuracy and completeness are for one
+The same scenes with our first multi-scale scheme: three scales, two
+geometric passes at each and no planar prior, at commit `33b7418`, whose
+PatchMatch code is that of `3f05992`. A finer scale ran an independent
+photometric pass, kept where its photometric cost beat the upsampled
+plane's by more than 0.1. F1, accuracy and completeness are for one
 agreeing view within 15°; the last F1 column is the single-scale run
 without the prior, with the same fusion.
 
@@ -224,6 +261,10 @@ without the prior, with the same fusion.
   ones:** +7.0 points on meadow, +4.9 on kicker and +1.6 on pipes, but
   −6.3 on delivery area, −5.2 on terrains, −4.8 on relief 2 and −4.7 on
   office. The better of the two runs per scene would average 80.5%.
+  Upsampled planes that are slightly off cost less than 0.1 more than the
+  right ones, so they stayed, and geometric consistency between views
+  that all inherited them held them there; ACMMP's order with the
+  restorer against the plane at infinity (above) re-estimates them.
 - **Fusion:** the variants rank as with one scale: 77.3% with 30°, 76.4%
   without the normal check, 76.0% with two views at 30°.
 - **Time:** 76 minutes, 1.2 times the single-scale run. Peak memory

@@ -4,6 +4,24 @@ All notable changes to `visloc-rs` will be documented here.
 
 ## Unreleased
 
+### Added
+
+- **`gsplat_photos --equirect`: 360° panoramas as cube faces** (#301).
+  `PhotoSfmConfig::equirect` cuts each 2:1 equirectangular panorama into
+  six 90° cube faces (`visloc_gsplat_train::equirect`), at most `max_size`
+  square, before SfM and training. Their focal length `size / 2` is exact
+  and stays fixed. Faces of one panorama are not matched with each other,
+  and the window counts panoramas. The faces are still separate cameras.
+  The log reports how far apart each panorama's face centres land. On five
+  synthetic room panoramas (`equirect_end_to_end`, an ignored test), all
+  30 faces registered, at a median 0.8% of the spacing between panoramas.
+  Off by default.
+- **A warning for panoramas fed as pinhole photos.** When at least half the
+  images look equirectangular, `build_photo_dataset` logs a warning that
+  points to `--equirect`. An image counts when it is 2:1 with left and
+  right edges that meet and smooth pole rows, or when its metadata says
+  equirectangular (Photo Sphere XMP). Outputs are unchanged.
+
 ### Fixed
 
 - **COLMAP-port mapper: resuming a reconstruction with 3D points

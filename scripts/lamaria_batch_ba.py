@@ -6,8 +6,9 @@ scale drift slowly over a sequence. This tool refines the VIO trajectory
 afterwards with one batch optimization over the whole sequence:
 
   features  SIFT on every --kf-step-th VIO frame, both cameras.
-  match     epipolar matching between keyframes up to 64 keyframes (32 s at
-            the default 2 Hz) apart, guided by the VIO's relative poses.
+  match     epipolar matching between keyframes up to 256 keyframes (128 s
+            at the default 2 Hz) and 200 m apart, guided by the VIO's
+            relative poses.
   solve     union-find tracks -> midpoint triangulation -> Levenberg-Marquardt
             over every keyframe's pose, velocity and IMU biases, every
             landmark, and each camera's IMU-camera rotation (one per eighth
@@ -1781,9 +1782,10 @@ def main():
     m.add_argument("--work", required=True)
     m.add_argument("--vio", required=True)
     m.add_argument("--calib", required=True, help="Basalt calibration (pinhole)")
-    m.add_argument("--offsets", default="1,2,3,4,6,8,12,16,24,32,48,64", help="keyframe offsets to match")
+    m.add_argument("--offsets", default="1,2,3,4,6,8,12,16,24,32,48,64,96,128,192,256",
+                   help="keyframe offsets to match")
     m.add_argument("--max-axis-angle", type=float, default=75.0, help="skip pairs whose optical axes differ more")
-    m.add_argument("--max-dist", type=float, default=80.0, help="skip pairs whose cameras are further apart (m)")
+    m.add_argument("--max-dist", type=float, default=200.0, help="skip pairs whose cameras are further apart (m)")
     m.add_argument("--tau0", type=float, default=2.0, help="epipolar band (px) at offset 0")
     m.add_argument("--tau-slope", type=float, default=0.1, help="band growth per keyframe offset (px)")
     m.add_argument("--tau-max", type=float, default=6.0)
@@ -1816,7 +1818,7 @@ def main():
                         "(1: one rotation per camera)")
     s.add_argument("--ext-seg-sigma", type=float, default=0.05,
                    help="prior on the rotation change between consecutive segments (deg)")
-    s.add_argument("--max-offset", type=int, default=64, help="use matches up to this keyframe offset")
+    s.add_argument("--max-offset", type=int, default=256, help="use matches up to this keyframe offset")
     s.add_argument("--band", type=int, default=64, help="landmark observations within this many keyframes")
     s.add_argument("--max-reproj", type=float, default=4.0, help="triangulation inlier threshold (px)")
     s.add_argument("--min-angle", type=float, default=1.0, help="minimum triangulation angle (deg)")

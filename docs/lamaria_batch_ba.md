@@ -18,8 +18,10 @@ sequence. It uses no ground truth.
 2. **Features.** SIFT on both cameras (OpenCV, 1,500 per image, contrast
    threshold 0.01).
 3. **Matching.** Each keyframe is matched against the keyframes 1, 2, 3, 4,
-   6, 8, 12, 16, 24, 32, 48 and 64 steps later (0.5 to 32 s), within and
-   across the two cameras, if their optical axes differ by less than 75°. A
+   6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192 and 256 steps later (0.5 to
+   128 s), within and across the two cameras, if their optical axes differ
+   by less than 75° and the VIO puts them less than 200 m apart (see
+   [Matches further apart](#matches-further-apart)). A
    candidate must lie within an epipolar band around the VIO's relative pose:
    2 px plus 0.1 px per keyframe step, at most 6 px. The descriptor ratio
    test (0.8) and a mutual check run among those candidates.
@@ -35,10 +37,11 @@ sequence. It uses no ground truth.
    - each camera's IMU-camera rotation, one per eighth of the sequence (see
      [During a recording](#during-a-recording)).
 
-   The landmarks are eliminated by the Schur complement. Every landmark is
-   observed within 64 keyframes, so the reduced system is banded and is
-   factored by LAPACK's banded Cholesky. The camera rotations form a dense
-   border. A prior on the first pose fixes the gauge.
+   The landmarks are eliminated by the Schur complement. A landmark keeps
+   its observations within 64 keyframes of its first one (`--band`), so the
+   reduced system is banded and is factored by LAPACK's banded Cholesky.
+   The camera rotations form a dense border. A prior on the first pose fixes
+   the gauge.
 
    Each iteration first drops the observations more than 10 px off, then
    the landmarks left with a single observation. A landmark's damping is its
@@ -640,6 +643,40 @@ recall at 1 m):
 The denoised features alone, without the focal lengths, give sequence_4_10
 63.73 (68.0 %).
 
+### Matches further apart
+
+`match` used to stop at 64 keyframes (32 s) and 80 m. Matching also the
+keyframes 96, 128, 192 and 256 steps later (up to 128 s), up to 200 m apart,
+adds 23–24 % image pairs and 4–6 % matches (sequence_2_11: 81,565 pairs and
+6.30 million matches, against 66,322 and 6.04 million) and takes up to
+twice as long. The solve must take them in: its `--max-offset` was 64 as
+well, which dropped them again and gave the same result as before.
+
+The first solve still keeps a landmark's observations within 64 keyframes
+of its first one; there the longer matches only merge tracks. The second
+solve, which keeps every observation of a landmark, gains the most
+(sequence_4_10: 62.18 → 63.44 after the first solve, 63.99 → 67.81 after the
+second). The merged tracks are fewer and longer, 8–11 % fewer observations
+pass the triangulation check against the starting trajectory, and the
+solves take no longer. Final CP Score (pose recall at 1 m), the pipeline and
+options of the table above:
+
+| Sequence | Track | Up to 64 keyframes, 80 m | Up to 256 keyframes, 200 m |
+|---|---|---:|---:|
+| sequence_1_19 | Short | **84.14** (**99.3 %**) | 83.15 (93.4 %) |
+| sequence_2_11 | Medium | 81.26 (98.3 %) | **83.83** (**99.3 %**) |
+| sequence_3_17 | Long | 65.38 (61.1 %) | **65.41** (**61.7 %**) |
+| sequence_4_10 | Low light | 63.99 (59.6 %) | **67.81** (**68.4 %**) |
+| sequence_5_11 | Moving platform | **57.70** | 57.17 |
+| **Mean of the five tracks** | | 70.49 | **71.47** |
+| sequence_1_20 | Short | 45.36 (17.0 %) | **46.76** (**23.0 %**) |
+| sequence_4_11 | Low light | 54.09 (27.2 %) | **56.49** (**37.6 %**) |
+
+sequence_4_11 starts from the VIO of the test-submission pipeline
+(`scripts/run_lamaria_test_submission.py --split training`), with denoised
+features. These are now the defaults (`match --offsets`, `match
+--max-dist`, `solve --max-offset`).
+
 ### What is left on sequence_3_17
 
 The CP errors left on the Long sequence are not a slow drift: fitting a
@@ -905,7 +942,7 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   moving platform.
 - **Cost.** On this 4-core container, a 15-minute sequence takes about
   15 min for the features (2 processes; non-local means adds about as much)
-  and 1–7 min for the matching (with numba). The solve uses
+  and 2–7 min for the matching (with numba). The solve uses
   `NUMBA_NUM_THREADS` threads for the reprojection terms and the BLAS
   threads for the banded factor: on the 20-minute sequence_2_11 the first
   solve takes 269 s on one thread and 181 s on four (the same result), the

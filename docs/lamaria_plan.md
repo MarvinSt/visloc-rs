@@ -39,7 +39,8 @@ named inline; nothing is tuned against ground truth unless stated.
   | microSLAM | mono | 35.8 | 20.3 | 10.0 | 22.9 | 4.9 | 18.8 |
   | OKVIS2 | bino + IMU | 20.0 | 11.6 | 2.6 | 14.5 | 4.7 | 10.7 |
   | Ours, eight rotation segments (training: 1_19, 2_11, 3_17, 4_10, 5_11) | bino + IMU | 87.22 | 77.31 | 60.00 | 49.52 | 57.15 | 66.24 |
-  | **Ours, + focal lengths, keypoint sizes, low-light denoising (training)** | bino + IMU | 84.14 | **81.26** | 65.38 | 63.99 | **57.70** | 70.49 |
+  | Ours, + focal lengths, keypoint sizes, low-light denoising (training) | bino + IMU | 84.14 | 81.26 | 65.38 | 63.99 | 57.70 | 70.49 |
+  | **Ours, + matches up to 128 s apart (training)** | bino + IMU | 83.15 | **83.83** | 65.41 | 67.81 | **57.17** | 71.47 |
 
 - Test data must be **streamed and deleted** (~862 GB total; server throttles
   per connection — use `aria2c -x16`, ~57 MB/s, from the official file list).
@@ -229,10 +230,11 @@ before/after on training sequences.
 14. **Offline batch VI bundle adjustment.** Status: **measured on one
    training sequence per track and on sequence_1_20 (2026-10-17).**
    `scripts/lamaria_batch_ba.py` refines the VIO trajectory afterwards: SIFT
-   on 2 Hz keyframes, matches up to 32 s apart under the VIO's epipolar
-   geometry, and one Levenberg-Marquardt solve over every keyframe (pose,
-   velocity and IMU biases with GTSAM's preintegrated factors), every
-   landmark and each camera's IMU-camera rotation, with no ground truth. On
+   on 2 Hz keyframes, matches up to 128 s apart (32 s at first) under the
+   VIO's epipolar geometry, and one Levenberg-Marquardt solve over every
+   keyframe (pose, velocity and IMU biases with GTSAM's preintegrated
+   factors), every landmark and each camera's IMU-camera rotation, with no
+   ground truth. On
    1WM093701G1276 both cameras turn by about 0.1° against the IMU during a
    recording, so the solve estimates the rotations in eight time segments.
    It raises the mean over the five tracks to **64.36** (2026-10-17; 61.41
@@ -259,7 +261,10 @@ before/after on training sequences.
    49.52 → 63.99, scale drift +3.5 % → +0.8 %), raise the mean to **70.49**
    (2026-10-17); sequence_2_11 reaches 81.26 with a pose recall of 98 %. The
    focal lengths go wrong on the moving platform, which keeps the
-   calibration ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).
+   calibration. Matching keyframes up to 256 steps (128 s) and 200 m apart
+   instead of 64 steps and 80 m raises the mean to **71.47** (sequence_4_10:
+   67.81; the second Low light sequence, sequence_4_11, 54.09 → 56.49)
+   ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).
 
 ## 5. Test-set operational pipeline
 

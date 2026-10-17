@@ -92,9 +92,9 @@ def load_tum(path):
     return ns, d[:, 1:4].copy(), rot
 
 
-def load_features(work):
-    f = np.load(os.path.join(work, "features.npz"))
-    return f["kf_ns"], f["offsets"], f["xy"], f["desc"]
+def load_features(work, desc=True):
+    f = np.load(os.path.join(work, "features.npz"))  # lazy: the descriptors are read only when asked for
+    return f["kf_ns"], f["offsets"], f["xy"], f["desc"] if desc else None
 
 
 def keyframe_poses(kf_ns, vio):
@@ -426,7 +426,12 @@ def build_tracks(offsets, pairs, matches, max_offset):
 
 
 def triangulate(tracks, image_of, xy, kf_p, kf_r, cams, max_err, min_angle_deg):
-    """Midpoint triangulation with the VIO poses; drops observations off by more than max_err pixels."""
+    """Midpoint triangulation with the VIO poses; drops observations off by more than max_err pixels.
+
+    Every track gets up to three rounds: triangulate it from its observations, drop those behind the camera
+    or more than max_err off, and keep it once a round drops nothing, with at least two observations and a
+    triangulation angle of min_angle_deg. All tracks at once; returns the points and the kept features.
+    """
     nimg = len(kf_p) * 2
     centers = np.zeros((nimg, 3))
     rots = np.zeros((nimg, 3, 3))
@@ -434,39 +439,61 @@ def triangulate(tracks, image_of, xy, kf_p, kf_r, cams, max_err, min_angle_deg):
         for c in range(2):
             rots[2 * k + c] = kf_r[k] @ cams[c]["R_ic"]
             centers[2 * k + c] = kf_r[k] @ cams[c]["t_ic"] + kf_p[k]
-    kinv = [np.linalg.inv(cams[c]["K"]) for c in range(2)]
-    cos_min = np.cos(np.radians(min_angle_deg))
-    pts, kept = [], []
-    for feats in tracks:
-        ok = False
-        for _ in range(3):
-            if len(feats) < 2:
-                break
-            imgs = image_of[feats]
-            cams_i = imgs % 2
-            uv1 = np.c_[xy[feats], np.ones(len(feats))]
-            rays = np.einsum("nij,nj->ni", rots[imgs],
-                             np.where(cams_i[:, None] == 0, uv1 @ kinv[0].T, uv1 @ kinv[1].T))
-            rays /= np.linalg.norm(rays, axis=1, keepdims=True)
-            proj = np.eye(3)[None] - rays[:, :, None] * rays[:, None, :]
-            try:
-                x = np.linalg.solve(proj.sum(0), np.einsum("nij,nj->i", proj, centers[imgs]))
-            except np.linalg.LinAlgError:
-                break
-            pc = np.einsum("nji,nj->ni", rots[imgs], x[None] - centers[imgs])
-            kmat = np.where(cams_i[:, None, None] == 0, cams[0]["K"][None], cams[1]["K"][None])
-            proj_px = np.einsum("nij,nj->ni", kmat, pc)
-            err = np.linalg.norm(proj_px[:, :2] / np.maximum(proj_px[:, 2:3], 1e-9) - xy[feats], axis=1)
-            good = (pc[:, 2] > 0.2) & (err < max_err)
-            if good.all():
-                ok = True
-                break
-            feats = feats[good]
-        if not ok or (rays @ rays.T).min() > cos_min:
-            continue
-        pts.append(x)
-        kept.append(feats)
-    return np.array(pts), kept
+    kmat = np.array([cams[c]["K"] for c in range(2)])
+    kinv = np.linalg.inv(kmat)
+    n_t = len(tracks)
+    lens = np.array([len(t) for t in tracks], np.int64)
+    feats = np.concatenate(tracks).astype(np.int64) if n_t else np.zeros(0, np.int64)
+    tid = np.repeat(np.arange(n_t), lens)
+    imgs = image_of[feats]
+    cam = imgs % 2
+    rays = np.einsum("nij,nj->ni", kinv[cam], np.c_[xy[feats], np.ones(len(feats))])
+    rays = np.einsum("nij,nj->ni", rots[imgs], rays)
+    rays /= np.linalg.norm(rays, axis=1, keepdims=True)
+    proj = (np.eye(3)[None] - rays[:, :, None] * rays[:, None, :]).reshape(-1, 9)
+    proj_c = np.einsum("nij,nj->ni", proj.reshape(-1, 3, 3), centers[imgs])
+    active = np.ones(len(feats), bool)
+    state = np.zeros(n_t, np.int8)  # 0 open, 1 kept, 2 dropped
+    x = np.zeros((n_t, 3))
+    for _ in range(3):
+        state[(state == 0) & (np.bincount(tid[active], minlength=n_t) < 2)] = 2
+        sel = np.flatnonzero(active & (state[tid] == 0))
+        if not len(sel):
+            break
+        a_m = np.stack([np.bincount(tid[sel], proj[sel, i], n_t) for i in range(9)], 1).reshape(-1, 3, 3)
+        b_v = np.stack([np.bincount(tid[sel], proj_c[sel, i], n_t) for i in range(3)], 1)
+        open_t = np.flatnonzero(state == 0)
+        singular = np.linalg.det(a_m[open_t]) == 0
+        state[open_t[singular]] = 2
+        open_t = open_t[~singular]
+        x[open_t] = np.linalg.solve(a_m[open_t], b_v[open_t][..., None])[..., 0]
+        o = sel[state[tid[sel]] == 0]
+        pc = np.einsum("nji,nj->ni", rots[imgs[o]], x[tid[o]] - centers[imgs[o]])
+        px = np.einsum("nij,nj->ni", kmat[cam[o]], pc)
+        err = np.linalg.norm(px[:, :2] / np.maximum(px[:, 2:3], 1e-9) - xy[feats[o]], axis=1)
+        bad = o[~((pc[:, 2] > 0.2) & (err < max_err))]
+        clean = np.ones(n_t, bool)
+        clean[tid[bad]] = False
+        state[open_t[clean[open_t]]] = 1
+        active[bad] = False
+    # the widest pair of a kept track's rays must reach min_angle_deg
+    o = np.flatnonzero(active & (state[tid] == 1))
+    if not len(o):
+        return np.zeros((0, 3)), []
+    t_o = tid[o]
+    first = np.r_[0, np.flatnonzero(np.diff(t_o)) + 1]
+    cnt = np.diff(np.r_[first, len(o)])
+    m = np.repeat(cnt, cnt)
+    pa = np.repeat(np.arange(len(o)), m)
+    pb = np.repeat(first, cnt)[pa] + np.arange(len(pa)) - np.repeat(np.r_[0, np.cumsum(m)[:-1]], m)
+    min_cos = np.minimum.reduceat(np.einsum("ni,ni->n", rays[o[pa]], rays[o[pb]]), np.r_[0, np.cumsum(m)[:-1]][first])
+    wide = min_cos <= np.cos(np.radians(min_angle_deg))
+    kept_t = t_o[first][wide]
+    if not len(kept_t):
+        return np.zeros((0, 3)), []
+    keep_o = o[np.isin(t_o, kept_t)]
+    split = np.cumsum(np.bincount(tid[keep_o], minlength=n_t)[kept_t])[:-1]
+    return x[kept_t], np.split(feats[keep_o], split)
 
 
 # ----------------------------------------------------------------------------- solver
@@ -518,6 +545,66 @@ def segment_prior(r_ic, pairs, slot, n_ext, w):
     return cost, h, b
 
 
+def _row_dot(x, a, i, y, b, j):
+    """sum_k x[a, i, k] y[b, j, k] over the landmark's 3 coordinates."""
+    return x[a, i, 0] * y[b, j, 0] + x[a, i, 1] * y[b, j, 1] + x[a, i, 2] * y[b, j, 2]
+
+
+if njit is not None:
+    _row_dot = njit(inline="always")(_row_dot)
+
+
+def _schur_add(m_o, h_xl, h_xx, g_x, g_l, kf, slot, lm, lm_start, band, nb, ab, border, corner, rhs):
+    """Eliminates the landmarks into the reduced system, one landmark at a time (plain loops, for numba).
+
+    Every ordered pair (a, b) of a landmark's observations adds -M_a X_b^T (M = H_xl H_ll^-1, X = H_xl,
+    9 x 3 each: pose 6, camera rotation 3): its pose-pose block when kf_a >= kf_b within the band (lower
+    banded storage ab[i - j, j]), its pose-rotation block to the border and its rotation-rotation block to
+    the corner. Every observation then adds its own H_xx blocks and its reduced gradient -g_x + M g_l.
+    """
+    for l in range(lm_start.shape[0] - 1):
+        s0, s1 = lm_start[l], lm_start[l + 1]
+        for a in range(s0, s1):
+            ra, sa = kf[a] * DOF, slot[a]
+            for b in range(s0, s1):
+                cb, sb = kf[b] * DOF, slot[b]
+                if kf[a] >= kf[b] and kf[a] - kf[b] <= band:
+                    for i in range(6):
+                        for j in range(6):
+                            if ra + i >= cb + j:
+                                ab[ra + i - cb - j, cb + j] -= _row_dot(m_o, a, i, h_xl, b, j)
+                if sb >= 0:
+                    for i in range(6):
+                        for j in range(3):
+                            border[ra + i, sb * 3 + j] -= _row_dot(m_o, a, i, h_xl, b, 6 + j)
+                    if sa >= 0:
+                        for i in range(3):
+                            for j in range(3):
+                                corner[sa * 3 + i, sb * 3 + j] -= _row_dot(m_o, a, 6 + i, h_xl, b, 6 + j)
+    for o in range(kf.shape[0]):
+        r0, so = kf[o] * DOF, slot[o]
+        for i in range(6):
+            for j in range(i + 1):
+                ab[i - j, r0 + j] += h_xx[o, i, j]
+        gl = g_l[lm[o]]
+        for i in range(9):
+            red = -g_x[o, i] + m_o[o, i, 0] * gl[0] + m_o[o, i, 1] * gl[1] + m_o[o, i, 2] * gl[2]
+            if i < 6:
+                rhs[r0 + i] += red
+            elif so >= 0:
+                rhs[nb + so * 3 + i - 6] += red
+        if so >= 0:
+            for i in range(6):
+                for j in range(3):
+                    border[r0 + i, so * 3 + j] += h_xx[o, i, 6 + j]
+            for i in range(3):
+                for j in range(3):
+                    corner[so * 3 + i, so * 3 + j] += h_xx[o, 6 + i, 6 + j]
+
+
+_schur_add_jit = njit(cache=True, nogil=True)(_schur_add) if njit is not None else None
+
+
 class Reprojection:
     """All reprojection observations, sorted by landmark, with the fixed Schur pair structure.
 
@@ -526,7 +613,8 @@ class Reprojection:
     columns for a camera that is not estimated) and the landmark (3, world).
     """
 
-    def __init__(self, obs_kf, obs_cam, obs_lm, obs_z, n_lm, cams, est_cams, sigma, huber, band, chunk=400_000):
+    def __init__(self, obs_kf, obs_cam, obs_lm, obs_z, n_lm, cams, est_cams, sigma, huber, band, chunk=400_000,
+                 numpy_pairs=None):
         order = np.lexsort((obs_kf, obs_lm))
         self.kf, self.cam, self.lm, self.z = obs_kf[order], obs_cam[order], obs_lm[order], obs_z[order]
         self.n_lm, self.sigma, self.huber, self.chunk = n_lm, sigma, huber, chunk
@@ -538,8 +626,10 @@ class Reprojection:
         for i, c in enumerate(est_cams):
             self.ext_slot[c] = i
         self.n_ext = len(est_cams)
+        self.band = band
         counts = np.bincount(self.lm, minlength=n_lm)
         start = np.r_[0, np.cumsum(counts)[:-1]]
+        self.lm_start = np.r_[0, np.cumsum(counts)].astype(np.int64)  # observations of landmark l: [l], [l + 1]
         # every ordered pair (a, b) of observations of the same landmark
         m = counts[self.lm]
         pa = np.repeat(np.arange(len(self.lm)), m)
@@ -557,6 +647,10 @@ class Reprojection:
         # lower-band pose-pose pairs (kf_a >= kf_b), sorted by their (kf_a, kf_b) block
         low = np.flatnonzero((ka >= kb) & (ka - kb <= band))
         self.band_kf = int((ka - kb)[low].max()) if len(low) else 1
+        # the pair lists below serve the numpy elimination only (without numba)
+        self.numpy_pairs = _schur_add_jit is None if numpy_pairs is None else numpy_pairs
+        if not self.numpy_pairs:
+            return
         self.blk_keys, inv = np.unique(ka[low].astype(np.int64) * 1_000_000 + kb[low], return_inverse=True)
         s = np.argsort(inv, kind="stable")
         self.low_a, self.low_b, self.low_bid = pa[low][s].astype(np.int32), pb[low][s].astype(np.int32), inv[s]
@@ -758,7 +852,7 @@ def cmd_solve(a):
     from scipy.linalg import cho_solve_banded, cholesky_banded
 
     t0 = time.time()
-    kf_ns, offsets, xy, _ = load_features(a.work)
+    kf_ns, offsets, xy, _ = load_features(a.work, desc=False)
     cams, noise = load_calib(a.calib)
     vio = load_tum(a.vio)
     kf_p, kf_r = keyframe_poses(kf_ns, a.vio)
@@ -872,7 +966,10 @@ def cmd_solve(a):
             low = ci >= cj
             np.add.at(ab_imu, ((ci - cj)[low], cj[low]), (A.T @ A)[low])
             np.add.at(rhs_imu, cols, A.T @ b)
-        direct = np.add.reduceat(h_xx[rp.obs_sort][:, 0:6, 0:6], rp.obs_starts, axis=0)
+        slot = rp.ext_slot[rp.cam]
+        has = slot >= 0
+        if rp.numpy_pairs:
+            direct = np.add.reduceat(h_xx[rp.obs_sort][:, 0:6, 0:6], rp.obs_starts, axis=0)
         modes_on = nm > 0 and it >= a.modes_start
         if modes_on:
             # H v for every mode before the landmarks are eliminated (undamped)
@@ -906,50 +1003,16 @@ def cmd_solve(a):
             m_o = np.einsum("nij,njk->nik", h_xl, h_ll_inv[rp.lm])
             ab, rhs = ab_imu.copy(), np.zeros(nb + nz)
             rhs[:nb] = rhs_imu
-            # Schur complement of the landmarks: -M_a X_b^T per (kf_a, kf_b) block, in chunks
-            blocks = np.zeros((len(rp.blk_keys), 6, 6))
-            for s in range(0, len(rp.low_a), rp.chunk):
-                e = min(s + rp.chunk, len(rp.low_a))
-                prod = -np.einsum("nij,nkj->nik", m_o[rp.low_a[s:e], 0:6, :], h_xl[rp.low_b[s:e], 0:6, :])
-                bid = rp.low_bid[s:e]
-                st = np.flatnonzero(np.r_[True, bid[1:] != bid[:-1]])
-                blocks[bid[st]] += np.add.reduceat(prod, st, axis=0)
-            for rows, cols, vals in ((rp.blk_a * DOF, rp.blk_b * DOF, blocks), (rp.obs_kfs * DOF, rp.obs_kfs * DOF, direct)):
-                ii, jj = np.broadcast_arrays(rows[:, None, None] + np.arange(6)[None, :, None],
-                                             cols[:, None, None] + np.arange(6)[None, None, :])
-                low = ii >= jj
-                ab[(ii - jj)[low], jj[low]] += vals[low]
             border, corner = np.zeros((nb, nz)), np.zeros((nz, nz))
-            if ne:
-                slot = rp.ext_slot[rp.cam]
-                has = slot >= 0
-                bsum = np.zeros((n * rp.n_ext, 6, 3))
-                for s in range(0, len(rp.bd_a), rp.chunk):
-                    e = min(s + rp.chunk, len(rp.bd_a))
-                    prod = -np.einsum("nij,nkj->nik", m_o[rp.bd_a[s:e], 0:6, :], h_xl[rp.bd_b[s:e], 6:9, :])
-                    key = rp.bd_key[s:e]
-                    st = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
-                    bsum[key[st]] += np.add.reduceat(prod, st, axis=0)
-                np.add.at(bsum, rp.kf[has].astype(np.int64) * rp.n_ext + slot[has], h_xx[has][:, 0:6, 6:9])
-                for sl in range(rp.n_ext):
-                    border.reshape(n, DOF, nz)[:, 0:6, sl * 3:sl * 3 + 3] += bsum[sl::rp.n_ext]
-                csum = np.zeros((rp.n_ext, rp.n_ext, 3, 3))
-                for s in range(0, len(rp.cn_a), rp.chunk):
-                    e = min(s + rp.chunk, len(rp.cn_a))
-                    prod = -np.einsum("nij,nkj->nik", m_o[rp.cn_a[s:e], 6:9, :], h_xl[rp.cn_b[s:e], 6:9, :])
-                    np.add.at(csum, (slot[rp.cn_a[s:e]], slot[rp.cn_b[s:e]]), prod)
-                np.add.at(csum, (slot[has], slot[has]), h_xx[has][:, 6:9, 6:9])
-                for sa in range(rp.n_ext):
-                    for sb in range(rp.n_ext):
-                        corner[sa * 3:sa * 3 + 3, sb * 3:sb * 3 + 3] = csum[sa, sb]
-            red = -g_x + np.einsum("nij,nj->ni", m_o, g_l[rp.lm])
-            np.add.at(rhs, (rp.kf * DOF)[:, None] + np.arange(6)[None, :], red[:, 0:6])
-            if ne:
-                np.add.at(rhs, nb + (slot[has] * 3)[:, None] + np.arange(3)[None, :], red[has, 6:9])
-                if seg_pairs:
-                    _, h_s, b_s = segment_prior(r_ic, seg_pairs, rp.ext_slot, rp.n_ext, seg_w)
-                    corner[:ne, :ne] += h_s
-                    rhs[nb:nb + ne] += b_s
+            if rp.numpy_pairs:
+                _schur_add_numpy(rp, m_o, h_xl, h_xx, g_x, g_l, direct, slot, has, n, nb, ne, ab, border, corner, rhs)
+            else:  # numba: one pass over the landmarks
+                _schur_add_jit(m_o, h_xl, h_xx, g_x, g_l, rp.kf, slot, rp.lm, rp.lm_start, rp.band, nb, ab, border,
+                               corner, rhs)
+            if ne and seg_pairs:
+                _, h_s, b_s = segment_prior(r_ic, seg_pairs, rp.ext_slot, rp.n_ext, seg_w)
+                corner[:ne, :ne] += h_s
+                rhs[nb:nb + ne] += b_s
             ab[0] += lam * ab[0] + 1e-9
             if ne:
                 corner[np.arange(ne), np.arange(ne)] += lam * np.diag(corner)[:ne] + 1e-9
@@ -975,13 +1038,13 @@ def cmd_solve(a):
             except np.linalg.LinAlgError:
                 lam *= 10
                 continue
-            if nz:  # block elimination of the border
-                yb = cho_solve_banded((cfac, True), border)
-                schur = corner - border.T @ yb
+            if nz:  # block elimination of the border, with zb = L^-1 border (A = L L^T)
+                zb = _forward_border(cfac, border)
+                schur = corner - zb.T @ zb
                 s_inv = np.linalg.inv(schur)
                 if modes_on and len(rp.off_keys) == 0:
                     # trust region: damp the modes further until each step is within its cap
-                    rz = rhs[nb:] - border.T @ cho_solve_banded((cfac, True), rhs[:nb])
+                    rz = rhs[nb:] - zb.T @ _tri_banded(cfac, rhs[:nb])
                     cap = np.array([a.mode_cap_yaw if m_ == "yaw" else a.mode_cap_scale for m_ in modes])
                     extra = 0.0
                     for _ in range(30):
@@ -993,11 +1056,11 @@ def cmd_solve(a):
                         s_inv = np.linalg.inv(damped)
 
             def precond(r_):
-                y0 = cho_solve_banded((cfac, True), r_[:nb])
                 if not nz:
-                    return y0
-                de0 = s_inv @ (r_[nb:] - border.T @ y0)
-                return np.r_[y0 - yb @ de0, de0]
+                    return cho_solve_banded((cfac, True), r_[:nb])
+                w0 = _tri_banded(cfac, r_[:nb])  # L^-1 r
+                de0 = s_inv @ (r_[nb:] - zb.T @ w0)
+                return np.r_[_tri_banded(cfac, w0 - zb @ de0, "T"), de0]
 
             sol = precond(rhs) if len(rp.off_keys) == 0 else _pcg(rp, m_o, h_xl, ab, u, nb, nz, border, corner,
                                                                     precond, rhs)
@@ -1087,6 +1150,26 @@ def cmd_solve(a):
                  active=rp.active)
 
 
+def _tri_banded(cfac, b, trans="N"):
+    """L^-1 b (trans "N") or L^-T b ("T") for the lower banded Cholesky factor cfac (LAPACK storage)."""
+    from scipy.linalg.lapack import dtbtrs
+    x, info = dtbtrs(cfac, b, uplo="L", trans=trans)
+    if info != 0:
+        raise np.linalg.LinAlgError(f"dtbtrs info {info}")
+    return x
+
+
+def _forward_border(cfac, border):
+    """L^-1 border, each column solved from the keyframe of its first nonzero row on (the rows above stay 0)."""
+    z = np.zeros_like(border)
+    nonzero = border != 0
+    first = np.where(nonzero.any(0), nonzero.argmax(0) // DOF * DOF, border.shape[0])
+    for r0 in np.unique(first[first < border.shape[0]]):
+        cols = np.flatnonzero(first == r0)
+        z[r0:, cols] = _tri_banded(cfac[:, r0:], border[r0:, cols])
+    return z
+
+
 def _pcg(rp, m_o, h_xl, ab, u, nb, ne, border, corner, precond, rhs):
     """Conjugate gradients on the full reduced system; the bordered banded factor preconditions it."""
     blocks = np.zeros((len(rp.off_keys), 6, 6))
@@ -1096,17 +1179,16 @@ def _pcg(rp, m_o, h_xl, ab, u, nb, ne, border, corner, precond, rhs):
         bid = rp.off_bid[s:e]
         st = np.flatnonzero(np.r_[True, bid[1:] != bid[:-1]])
         blocks[bid[st]] += np.add.reduceat(prod, st, axis=0)
-    rows_a = (rp.off_ka * DOF)[:, None] + np.arange(6)
-    rows_b = (rp.off_kb * DOF)[:, None] + np.arange(6)
+    from scipy.linalg.blas import dsbmv
+    rows_a = ((rp.off_ka * DOF)[:, None] + np.arange(6)).ravel()
+    rows_b = ((rp.off_kb * DOF)[:, None] + np.arange(6)).ravel()
+    ab_f = np.asfortranarray(ab)
 
     def operator(x):
         xb = x[:nb]
-        y = ab[0] * xb
-        for d in range(1, u + 1):
-            y[d:] += ab[d, :nb - d] * xb[:nb - d]
-            y[:nb - d] += ab[d, :nb - d] * xb[d:]
-        np.add.at(y, rows_a, np.einsum("nij,nj->ni", blocks, xb[rows_b]))
-        np.add.at(y, rows_b, np.einsum("nji,nj->ni", blocks, xb[rows_a]))
+        y = dsbmv(u, 1.0, ab_f, xb, lower=1)  # the banded part (symmetric, lower storage)
+        y += np.bincount(rows_a, np.einsum("nij,nj->ni", blocks, xb[rows_b].reshape(-1, 6)).ravel(), nb)
+        y += np.bincount(rows_b, np.einsum("nji,nj->ni", blocks, xb[rows_a].reshape(-1, 6)).ravel(), nb)
         if not ne:
             return y
         return np.r_[y + border @ x[nb:], border.T @ xb + corner @ x[nb:]]
@@ -1129,6 +1211,48 @@ def _pcg(rp, m_o, h_xl, ab, u, nb, ne, border, corner, precond, rhs):
         p = z + (rz / rz_old) * p
     print(f"    pcg: {it + 1} iterations", flush=True)
     return x
+
+
+def _schur_add_numpy(rp, m_o, h_xl, h_xx, g_x, g_l, direct, slot, has, n, nb, ne, ab, border, corner, rhs):
+    """The numpy version of _schur_add (without numba): the same sums over the precomputed pair lists."""
+    nz = border.shape[1]
+    # Schur complement of the landmarks: -M_a X_b^T per (kf_a, kf_b) block, in chunks
+    blocks = np.zeros((len(rp.blk_keys), 6, 6))
+    for s in range(0, len(rp.low_a), rp.chunk):
+        e = min(s + rp.chunk, len(rp.low_a))
+        prod = -np.einsum("nij,nkj->nik", m_o[rp.low_a[s:e], 0:6, :], h_xl[rp.low_b[s:e], 0:6, :])
+        bid = rp.low_bid[s:e]
+        st = np.flatnonzero(np.r_[True, bid[1:] != bid[:-1]])
+        blocks[bid[st]] += np.add.reduceat(prod, st, axis=0)
+    for rows, cols, vals in ((rp.blk_a * DOF, rp.blk_b * DOF, blocks), (rp.obs_kfs * DOF, rp.obs_kfs * DOF, direct)):
+        ii, jj = np.broadcast_arrays(rows[:, None, None] + np.arange(6)[None, :, None],
+                                     cols[:, None, None] + np.arange(6)[None, None, :])
+        low = ii >= jj
+        ab[(ii - jj)[low], jj[low]] += vals[low]
+    if ne:
+        bsum = np.zeros((n * rp.n_ext, 6, 3))
+        for s in range(0, len(rp.bd_a), rp.chunk):
+            e = min(s + rp.chunk, len(rp.bd_a))
+            prod = -np.einsum("nij,nkj->nik", m_o[rp.bd_a[s:e], 0:6, :], h_xl[rp.bd_b[s:e], 6:9, :])
+            key = rp.bd_key[s:e]
+            st = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
+            bsum[key[st]] += np.add.reduceat(prod, st, axis=0)
+        np.add.at(bsum, rp.kf[has].astype(np.int64) * rp.n_ext + slot[has], h_xx[has][:, 0:6, 6:9])
+        for sl in range(rp.n_ext):
+            border.reshape(n, DOF, nz)[:, 0:6, sl * 3:sl * 3 + 3] += bsum[sl::rp.n_ext]
+        csum = np.zeros((rp.n_ext, rp.n_ext, 3, 3))
+        for s in range(0, len(rp.cn_a), rp.chunk):
+            e = min(s + rp.chunk, len(rp.cn_a))
+            prod = -np.einsum("nij,nkj->nik", m_o[rp.cn_a[s:e], 6:9, :], h_xl[rp.cn_b[s:e], 6:9, :])
+            np.add.at(csum, (slot[rp.cn_a[s:e]], slot[rp.cn_b[s:e]]), prod)
+        np.add.at(csum, (slot[has], slot[has]), h_xx[has][:, 6:9, 6:9])
+        for sa in range(rp.n_ext):
+            for sb in range(rp.n_ext):
+                corner[sa * 3:sa * 3 + 3, sb * 3:sb * 3 + 3] = csum[sa, sb]
+    red = -g_x + np.einsum("nij,nj->ni", m_o, g_l[rp.lm])
+    np.add.at(rhs, (rp.kf * DOF)[:, None] + np.arange(6)[None, :], red[:, 0:6])
+    if ne:
+        np.add.at(rhs, nb + (slot[has] * 3)[:, None] + np.arange(3)[None, :], red[has, 6:9])
 
 
 def write_corrected(path, vio, kf_ns, kf_p, kf_r, opt_p, opt_r):
@@ -1197,7 +1321,7 @@ def cmd_loop_correct(a):
     seg_of_kf = np.minimum(np.arange(n) * n_seg // n, n_seg - 1)  # as in solve
     act = st["active"]
     okf, ocam, olm, oz = st["obs_kf"][act], st["obs_cam"][act], st["obs_lm"][act], st["obs_z"][act]
-    _, offsets, xy, _ = load_features(a.work)
+    _, offsets, xy, _ = load_features(a.work, desc=False)
     lp = np.load(os.path.join(a.work, a.loops_file))
     sel = (lp["pairs"][:, 0] >= k0) & (lp["pairs"][:, 2] < k0 + n)
     pairs, matches = lp["pairs"][sel].astype(np.int64), lp["matches"][sel]

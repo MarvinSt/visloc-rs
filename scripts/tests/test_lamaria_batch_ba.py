@@ -117,6 +117,75 @@ class SegmentPriorTest(unittest.TestCase):
         np.testing.assert_allclose(h, h_num, atol=0.01 * w)  # Gauss-Newton: exact up to O(|e0|)
 
 
+class TriangulateTest(unittest.TestCase):
+    def test_drops_bad_observations_and_narrow_tracks(self):
+        rng = np.random.default_rng(8)
+        cams = two_cameras()
+        n_kf = 6
+        kf_p = np.c_[np.arange(n_kf) * 0.5, np.zeros(n_kf), np.zeros(n_kf)]  # 0.5 m steps along x
+        kf_r = np.array([rot(rng, 0.05) for _ in range(n_kf)])
+        pts = [kf_r[0] @ cams[0]["R_ic"] @ np.array([0.3, -0.2, 4.0]) + kf_p[0],
+               kf_r[0] @ cams[0]["R_ic"] @ np.array([-0.4, 0.1, 400.0]) + kf_p[0]]  # far away: too narrow
+        xy, image_of, tracks = [], [], []
+        for j, pw in enumerate(pts):
+            feats = []
+            for k in range(n_kf):
+                r_wc = kf_r[k] @ cams[0]["R_ic"]
+                pc = r_wc.T @ (pw - (kf_r[k] @ cams[0]["t_ic"] + kf_p[k]))
+                uv = (cams[0]["K"] @ pc)[:2] / pc[2]
+                if j == 0 and k == 3:
+                    uv = uv + 8.0  # one wrong match
+                feats.append(len(xy))
+                xy.append(uv)
+                image_of.append(2 * k)
+            tracks.append(np.array(feats))
+        x, kept = lb.triangulate(tracks, np.array(image_of), np.array(xy), kf_p, kf_r, cams, 4.0, 1.0)
+        # the wrong match pulls the first round's point, which drops it and the first observation; the
+        # second round keeps the other four; the far point's rays stay within 1 degree
+        self.assertEqual(len(kept), 1)
+        np.testing.assert_array_equal(kept[0], np.array([1, 2, 4, 5]))
+        np.testing.assert_allclose(x[0], pts[0], atol=1e-6)
+
+
+class SchurAssemblyTest(unittest.TestCase):
+    def test_landmark_loop_matches_the_pair_lists(self):
+        rng = np.random.default_rng(6)
+        cams = two_cameras()
+        # 7 keyframes, landmarks seen 2-4 times; band 3, so the longest landmarks also have off-band pairs
+        obs_kf, obs_cam, obs_lm = [], [], []
+        for j in range(9):
+            for k in sorted(rng.choice(7, size=rng.integers(2, 5), replace=False)):
+                obs_kf.append(k)
+                obs_cam.append(int(rng.integers(2)))
+                obs_lm.append(j)
+        obs_kf, obs_cam, obs_lm = np.array(obs_kf), np.array(obs_cam), np.array(obs_lm)
+        for est in ([0, 1], [1]):
+            rp = lb.Reprojection(obs_kf, obs_cam, obs_lm, np.zeros((len(obs_kf), 2)), 9, cams, est, 1.0, 2.0, 3,
+                                 numpy_pairs=True)
+            n_o, n, nb, ne = len(rp.kf), 7, 7 * lb.DOF, 3 * rp.n_ext
+            m_o, h_xl = rng.normal(size=(n_o, 9, 3)), rng.normal(size=(n_o, 9, 3))
+            h_xx = rng.normal(size=(n_o, 9, 9))
+            h_xx = h_xx + h_xx.transpose(0, 2, 1)
+            g_x, g_l = rng.normal(size=(n_o, 9)), rng.normal(size=(9, 3))
+            slot = rp.ext_slot[rp.cam]
+            u = (rp.band_kf + 1) * lb.DOF - 1
+            out = []
+            for numpy_path in (True, False):
+                ab, border = np.zeros((u + 1, nb)), np.zeros((nb, ne))
+                corner, rhs = np.zeros((ne, ne)), np.zeros(nb + ne)
+                if numpy_path:
+                    direct = np.add.reduceat(h_xx[rp.obs_sort][:, 0:6, 0:6], rp.obs_starts, axis=0)
+                    lb._schur_add_numpy(rp, m_o, h_xl, h_xx, g_x, g_l, direct, slot, slot >= 0, n, nb, ne, ab, border,
+                                        corner, rhs)
+                else:  # the numba kernel's plain-Python body
+                    lb._schur_add(m_o, h_xl, h_xx, g_x, g_l, rp.kf, slot, rp.lm, rp.lm_start, rp.band, nb, ab, border,
+                                  corner, rhs)
+                out.append((ab, border, corner, rhs))
+            for x_np, x_loop in zip(*out):
+                np.testing.assert_allclose(x_loop, x_np, atol=1e-12)
+            self.assertGreater(len(rp.off_keys), 0)
+
+
 class ModeVectorTest(unittest.TestCase):
     def test_modes_match_small_drifts(self):
         rng = np.random.default_rng(2)

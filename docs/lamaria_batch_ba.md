@@ -32,12 +32,13 @@ sequence. It uses no ground truth.
      preintegrated IMU factor between consecutive keyframes (the
      calibration's noise densities);
    - every landmark, with Huber reprojection terms (σ 1 px, threshold 2 px);
-   - each camera's IMU-camera rotation.
+   - each camera's IMU-camera rotation, one per eighth of the sequence (see
+     [During a recording](#during-a-recording)).
 
    The landmarks are eliminated by the Schur complement. Every landmark is
    observed within 64 keyframes, so the reduced system is banded and is
-   factored by LAPACK's banded Cholesky. The two camera rotations form a
-   dense border. A prior on the first pose fixes the gauge.
+   factored by LAPACK's banded Cholesky. The camera rotations form a dense
+   border. A prior on the first pose fixes the gauge.
 
    Each iteration first drops the observations more than 10 px off, then
    the landmarks left with a single observation. A landmark's damping is its
@@ -92,6 +93,29 @@ On sequence_2_11, three 75 s windows each estimate about
 [0.14, 0.13, −0.03]° (0.19°) in the IMU frame, for both cameras. The two
 cameras agree to within 0.05–0.08°. The device table applies 0.36°.
 
+### During a recording
+
+The rotations also change while the glasses are worn. `--ext-segments 8`
+(the default) estimates each camera's rotation separately in eight equal
+time segments of the keyframes (2–4 min each), with a prior of 0.05°
+(`--ext-seg-sigma`) on the change between consecutive segments. On
+1WM093701G1276 both cameras then turn together relative to the IMU, by
+about 0.1° over a recording. On 1WM09370081264 the segments stay within
+0.02–0.05° of each other:
+
+| Sequence | Device | Range of the common rotation | Correlation of the two cameras |
+|---|---|---:|---:|
+| sequence_1_19 | 1WM09370081264 | 0.05° (y) | 0.65 |
+| sequence_1_20 | 1WM09370081264 | 0.02° (z) | 0.34 |
+| sequence_2_11 | 1WM093701G1276 | 0.11° (y) | 0.94 |
+| sequence_3_17 | 1WM093701G1276 | 0.09° (y) | 0.97 |
+| sequence_4_10 | 1WM093701G1276 | 0.09° (x) | 0.97 |
+| sequence_5_11 | 1WM093701G1276 | 0.10° (y) | 0.90 |
+
+The common rotation is the mean of the two cameras' segment estimates, in
+the IMU frame. The range is that of its component that varies most, and the
+correlation is that of the two cameras' estimates in that component.
+
 ## Results
 
 Official evaluator, one training sequence per track, plus sequence_1_20, a
@@ -104,18 +128,20 @@ factory camera rig. On sequence_4_10 the VIO is the low-light configuration
 (0.5 px KLT threshold) and the BA's SIFT runs on CLAHE-equalized images. The
 first version of the solver had neither the outlier rejection nor the
 landmark damping floor; the 10 px column has both but keeps 10 px to the end;
-the last column also tightens it to 3 px from the 8th iteration on, the
-default (see [Method](#method)).
+the 3 px column also tightens it to 3 px from the 8th iteration on (see
+[Method](#method)). The last column, the default, also estimates the camera
+rotations in eight time segments (see [During a
+recording](#during-a-recording)).
 
-| Sequence | Track | Device | VIO | VIO + mapper | Batch BA, first version | Batch BA, 10 px | Batch BA |
-|---|---|---|---:|---:|---:|---:|---:|
-| sequence_1_19 | Short | 1WM09370081264 | 71.96 | 68.54 | **83.96** | 83.02 | 80.63 |
-| sequence_2_11 | Medium | 1WM093701G1276 | 49.68 | 55.51 | 52.29 | 61.03 | **68.88** |
-| sequence_3_17 | Long | 1WM093701G1276 | 50.06 | 46.68 | 49.59 | 50.14 | **50.32** |
-| sequence_4_10 | Low light | 1WM093701G1276 | 39.00 | 36.65 | 44.28 | 45.79 | **47.43** |
-| sequence_5_11 | Moving platform | 1WM093701G1276 | 43.14 | 49.84 | 55.70 | 59.06 | **59.81** |
-| **Mean of the five tracks** | | | 50.77 | 51.44 | 57.16 | 59.81 | **61.41** |
-| sequence_1_20 | Short | 1WM09370081264 | 38.10 | | 43.48 | 43.39 | 44.43 (**76.13** with `--modes yaw`, see [below](#slow-heading-drift)) |
+| Sequence | Track | Device | VIO | VIO + mapper | Batch BA, first version | Batch BA, 10 px | Batch BA, 3 px | Batch BA |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| sequence_1_19 | Short | 1WM09370081264 | 71.96 | 68.54 | 83.96 | 83.02 | 80.63 | **86.53** |
+| sequence_2_11 | Medium | 1WM093701G1276 | 49.68 | 55.51 | 52.29 | 61.03 | 68.88 | **71.18** |
+| sequence_3_17 | Long | 1WM093701G1276 | 50.06 | 46.68 | 49.59 | 50.14 | 50.32 | **60.25** |
+| sequence_4_10 | Low light | 1WM093701G1276 | 39.00 | 36.65 | 44.28 | 45.79 | 47.43 | **47.65** |
+| sequence_5_11 | Moving platform | 1WM093701G1276 | 43.14 | 49.84 | 55.70 | 59.06 | **59.81** | 56.22 |
+| **Mean of the five tracks** | | | 50.77 | 51.44 | 57.16 | 59.81 | 61.41 | **64.36** |
+| sequence_1_20 | Short | 1WM09370081264 | 38.10 | | 43.48 | 43.39 | 44.43 (**76.13** with `--modes yaw`, see [below](#slow-heading-drift)) | 44.41 |
 
 The 3 px stage drops 1–2 % of the observations (11,400 of 874,000 on
 sequence_2_11). The IMU then fits better: on sequence_2_11 the whitened
@@ -125,21 +151,30 @@ The trajectory improves on every sequence with pseudo-GT (table below); the
 CP Score of sequence_1_19 falls by 2.4 even so, its CP errors growing from
 0.33 to 0.37 m at the median, where the score falls steeply.
 
+The eight rotation segments act on the slow drift, not on the local
+accuracy. The RMSE of 60 s segments stays the same (table below), while the
+Sim(3) RMSE falls on four of the five sequences with pseudo-GT: on
+sequence_3_17 from 1.97 to 1.31 m, and its pose recall at 1 m rises from
+17.0 % to 56.0 %. The fitted scale drift falls from +2.3 % to +1.4 % on
+sequence_3_17 and from +1.9 % to +1.4 % on sequence_2_11 (drift table
+below). sequence_5_11 loses 3.6 points: most of its CP errors grow by
+0.1–0.6 m (1.09 → 1.23 m at the median, in a 2D similarity fit).
+
 The same runs against the pseudo-GT:
 
-| Sequence | Metric | VIO | VIO + mapper | Batch BA, 10 px | Batch BA |
-|---|---|---:|---:|---:|---:|
-| sequence_1_19 | Pose recall at 1 m | 76.3 % | 60.6 % | 91.5 % | **91.7 %** |
-| sequence_1_19 | Sim(3) RMSE | 0.88 m | 0.96 m | **0.55 m** | **0.55 m** |
-| sequence_2_11 | Pose recall at 1 m | 30.9 % | 39.4 % | 51.3 % | **70.2 %** |
-| sequence_2_11 | Sim(3) RMSE | 2.31 m | 1.92 m | 1.51 m | **1.01 m** |
-| sequence_3_17 | Pose recall at 1 m | **24.7 %** | 21.7 % | 16.3 % | 17.0 % |
-| sequence_3_17 | Sim(3) RMSE | 2.07 m | 2.48 m | 2.02 m | **1.97 m** |
-| sequence_4_10 | Pose recall at 1 m | 14.1 % | | 19.3 % | **21.5 %** |
-| sequence_4_10 | Sim(3) RMSE | 3.11 m | | 2.36 m | **2.11 m** |
-| the four above | RMSE of 60 s segments, each Sim(3)-aligned | 0.151 / 0.264 / 0.182 / 0.381 m | | 0.127 / 0.206 / 0.147 / 0.336 m | **0.125 / 0.169 / 0.141 / 0.315 m** |
-| sequence_1_20 | Pose recall at 1 m | 3.8 % | | 11.8 % | 14.4 % (**100 %** with `--modes yaw`) |
-| sequence_1_20 | Sim(3) RMSE | 3.03 m | | 2.41 m | 2.31 m |
+| Sequence | Metric | VIO | VIO + mapper | Batch BA, 10 px | Batch BA, 3 px | Batch BA |
+|---|---|---:|---:|---:|---:|---:|
+| sequence_1_19 | Pose recall at 1 m | 76.3 % | 60.6 % | 91.5 % | 91.7 % | **94.0 %** |
+| sequence_1_19 | Sim(3) RMSE | 0.88 m | 0.96 m | 0.55 m | 0.55 m | **0.44 m** |
+| sequence_2_11 | Pose recall at 1 m | 30.9 % | 39.4 % | 51.3 % | 70.2 % | **76.8 %** |
+| sequence_2_11 | Sim(3) RMSE | 2.31 m | 1.92 m | 1.51 m | 1.01 m | **0.87 m** |
+| sequence_3_17 | Pose recall at 1 m | 24.7 % | 21.7 % | 16.3 % | 17.0 % | **56.0 %** |
+| sequence_3_17 | Sim(3) RMSE | 2.07 m | 2.48 m | 2.02 m | 1.97 m | **1.31 m** |
+| sequence_4_10 | Pose recall at 1 m | 14.1 % | | 19.3 % | **21.5 %** | 20.9 % |
+| sequence_4_10 | Sim(3) RMSE | 3.11 m | | 2.36 m | 2.11 m | **2.05 m** |
+| the four above | RMSE of 60 s segments, each Sim(3)-aligned | 0.151 / 0.264 / 0.182 / 0.381 m | | 0.127 / 0.206 / 0.147 / 0.336 m | 0.125 / 0.169 / 0.141 / 0.315 m | 0.125 / 0.169 / 0.141 / 0.317 m |
+| sequence_1_20 | Pose recall at 1 m | 3.8 % | | 11.8 % | 14.4 % (**100 %** with `--modes yaw`) | 16.4 % |
+| sequence_1_20 | Sim(3) RMSE | 3.03 m | | 2.41 m | **2.31 m** | 2.35 m |
 
 On sequence_5_11 (no pseudo-GT) the BA brings AA2976 from 0.94 m (VIO) to
 0.07 m and the fitted scale drift (without PB2) from −5.4 % to −2.5 %. PB2,
@@ -149,19 +184,20 @@ The batch BA is the most accurate locally on every sequence with pseudo-GT.
 The slow drift that remains, fitted to the CP residuals as a heading and a
 scale drift linear in time:
 
-| Sequence | Heading drift, 10 px | Scale drift, 10 px | Heading drift | Scale drift |
-|---|---:|---:|---:|---:|
-| sequence_1_19 | −0.14° | −0.6 % | −0.30° | −0.6 % |
-| sequence_2_11 | −0.34° | +2.8 % | −0.47° | +1.9 % |
-| sequence_3_17 | +0.82° | +2.3 % | +0.81° | +2.3 % |
-| sequence_4_10 | −0.58° | +4.0 % | −0.92° | +3.6 % |
-| sequence_5_11 (without PB2) | −0.35° | −2.5 % | −0.22° | −2.3 % |
+| Sequence | Heading drift, 10 px | Scale drift, 10 px | Heading drift, 3 px | Scale drift, 3 px | Heading drift | Scale drift |
+|---|---:|---:|---:|---:|---:|---:|
+| sequence_1_19 | −0.14° | −0.6 % | −0.30° | −0.6 % | −0.19° | −0.5 % |
+| sequence_2_11 | −0.34° | +2.8 % | −0.47° | +1.9 % | −0.50° | +1.4 % |
+| sequence_3_17 | +0.82° | +2.3 % | +0.81° | +2.3 % | +0.48° | +1.4 % |
+| sequence_4_10 | −0.58° | +4.0 % | −0.92° | +3.6 % | −0.86° | +3.5 % |
+| sequence_5_11 (without PB2) | −0.35° | −2.5 % | −0.22° | −2.3 % | +0.25° | −2.4 % |
 
-The sequences of 1WM093701G1276 keep 2–4 % of scale drift, and their local
-scale (Sim(3) fits in 60 s windows) varies by ±2–4 %, against ±1 % on
-sequence_1_19. Their IMU factors also fit worse: the whitened position
-residual per factor is 1.6–1.8, against 0.4–0.5 on 1WM09370081264.
-These do not remove it (sequence_2_11, 10 px, CP Score 61.03):
+The sequences of 1WM093701G1276 keep 1.4–3.5 % of scale drift (2–4 % with
+one rotation per camera), and their local scale (Sim(3) fits in 60 s
+windows) varies by ±2–4 %, against ±1 % on sequence_1_19. Their IMU factors
+also fit worse: the whitened position residual per factor is 1.6–1.8,
+against 0.4–0.5 on 1WM09370081264 (10 px solve). These do not remove it
+(sequence_2_11, 10 px, one rotation per camera, CP Score 61.03):
 
 | Change | CP Score | Note |
 |---|---:|---|
@@ -220,7 +256,8 @@ accepts 1,566 keyframe pairs:
 
 Landmarks seen on both visits couple keyframes outside the band. The solver
 then runs conjugate gradients on the full reduced system, preconditioned by
-the banded factor; this converges in about 20 iterations.
+the banded factor: 25–200 iterations per step (to a relative residual of
+1e-9, at most 200).
 
 Added straight to the solve, the revisits do not close the loops. The
 solved sequence_2_11 is about 1.3 m off between its two visits, and a revisit
@@ -253,9 +290,10 @@ On sequence_2_11 PnP places 1,160 edges, 1,050 within the gate. They disagree
 with the solve by 1.29 m at the median, and the 941 edges of the revisit
 120–240 s later agree with each other (1.67 m at the 90th percentile). The
 graph moves the keyframes by 0.48 m at the median and 3.0 m at most, and the
-revisited CP AA1812 goes from 1.8 to 1.1 m:
+revisited CP AA1812 goes from 1.8 to 1.1 m. With one rotation per camera
+(the 3 px solve):
 
-| Sequence | Revisit image pairs | Loop edges in the gate | Batch BA | + `loop-correct` | + second solve |
+| Sequence | Revisit image pairs | Loop edges in the gate | Batch BA, 3 px | + `loop-correct` | + second solve |
 |---|---:|---:|---:|---:|---:|
 | sequence_1_19 | 966 | 220 | 80.63 | **81.79** | 81.76 |
 | sequence_2_11 | 1,922 | 1,050 | 68.88 | 71.53 | **73.34** |
@@ -264,6 +302,22 @@ revisited CP AA1812 goes from 1.8 to 1.1 m:
 | sequence_5_11 | 529 | 84 | 59.81 | **61.31** | 61.20 |
 | **Mean of the five tracks** | | | 61.41 | 62.41 | **63.12** |
 | sequence_1_20 | 1,052 | 266 | **44.43** | 43.33 | 43.35 |
+
+With the default eight rotation segments, in both solves:
+
+| Sequence | Loop edges in the gate | Batch BA | + `loop-correct` | + second solve |
+|---|---:|---:|---:|---:|
+| sequence_1_19 | 219 | 86.53 | **87.35** | 87.22 |
+| sequence_2_11 | 1,065 | 71.18 | 75.59 | **77.31** |
+| sequence_3_17 | 46 | **60.25** | 60.03 | 60.00 |
+| sequence_4_10 | 31 | 47.65 | 47.54 | **49.52** |
+| sequence_5_11 | 84 | 56.22 | **57.45** | 57.15 |
+| **Mean of the five tracks** | | 64.36 | 65.59 | **66.24** |
+| sequence_1_20 | 270 | **44.41** | 43.44 | 43.41 |
+
+The segmented solve of sequence_2_11 disagrees less with its revisits
+(0.94 m at the median instead of 1.29 m), and the loops add 6.1 points
+instead of 4.5.
 
 On sequence_1_20 the revisits lie mostly under a minute apart and the solve
 agrees with them already (0.10–0.18 m at the median). They cannot correct its
@@ -367,10 +421,10 @@ which costs more than it brings when the start is already that good. The
 mode stays off by default; it is the remedy for a start that drifts by
 degrees, such as a VIO without the per-device refinement.
 
-The tighter outlier threshold does not change that (default solve, with and
-without the mode): sequence_1_20 goes from 44.43 to **76.13**, but
-sequence_1_19 from 80.63 to 74.87, sequence_2_11 from 68.88 to 59.17 and
-sequence_4_10 from 47.43 to 40.42. The cost cannot pick the cases either: the
+The tighter outlier threshold does not change that (3 px solve with one
+rotation per camera, with and without the mode): sequence_1_20 goes from
+44.43 to **76.13**, but sequence_1_19 from 80.63 to 74.87, sequence_2_11 from
+68.88 to 59.17 and sequence_4_10 from 47.43 to 40.42. The cost cannot pick the cases either: the
 mode lowers it by 126 on sequence_1_20 and by 107 on sequence_4_10, where it
 turns the heading the wrong way, out of about 150,000–200,000. Neither does
 Earth's rotation: with its full vector in the IMU factors (`--omega-coriolis`,
@@ -460,6 +514,10 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   outlier rejection and the landmark damping floor; 0 turns them off.
   `--outlier-px2` (3) is the tighter threshold from iteration
   `--outlier-start2` (8) on.
+- **Camera rotations.** `--ext-segments` (8) is the number of time segments
+  with their own IMU-camera rotations, `--ext-seg-sigma` (0.05°) the prior
+  between consecutive ones; `--ext-segments 1` keeps one rotation per camera.
+  `--est-extrinsic` (01) picks the cameras whose rotations are estimated.
 - **Revisits.** `solve --save-states` keeps what `loop-correct` needs.
   `loop-correct --gate BASE,RATE,MAX_ROT` (0.3 m, 0.01 m/s, 2°) sets the
   drift a loop edge may disagree by.
@@ -473,7 +531,7 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   per image.
 - **Cost.** On this 4-core container, a 15-minute sequence takes about
   15 min for the features (2 processes) and 3 min for the matching (with
-  numba). The solve takes 9–20 min on one thread; the longest, on the
-  30-minute sequence_3_17. `loops` takes 8–40 min on one process (the
-  unguided matching of every candidate pair), `loop-correct` a minute, and
-  the second solve 15–30 min.
+  numba). The solve takes 10–21 min on one thread (7–12 min with one
+  rotation per camera); the longest, on the 30-minute sequence_3_17. `loops`
+  takes 8–40 min on one process (the unguided matching of every candidate
+  pair), `loop-correct` a minute, and the second solve 22–40 min.

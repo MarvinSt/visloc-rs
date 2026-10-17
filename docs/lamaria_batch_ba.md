@@ -852,6 +852,56 @@ loses 7 points:
 
 It stays off by default as well.
 
+### A heading drift that is not linear: sequence_2_12
+
+sequence_2_12 (Medium, 28 minutes) starts from a VIO whose heading error,
+against the pseudo-GT per 120 s window, runs −4.1° … +1.6° … −0.4°: it is
+neither linear in time nor a single step. The batch BA keeps it (−5.4° …
++1.2°): CP Score 21.0, pose recall 0 % (the VIO: 18.0). Locally it is
+fine, with its 60 s segments 0.25 m off.
+
+Started from the same VIO with only the heading error removed (from the
+pseudo-GT, per 60 s window; diagnosis only), the first solve keeps the
+heading within ±0.4° and scores 55.23 (pose recall 34.7 %, Sim(3) RMSE
+1.67 m against 5.56 m). It also ends lower, at 172,310 against 173,335 with
+0.3 % fewer observations, and its IMU cost is lower too. The better
+solution is there in the objective; the solve from the VIO does not reach
+it. Nothing tried so far gets there without the pseudo-GT (first solve, CP
+Score):
+
+| Run | CP Score | Heading error per 300 s (°) |
+|---|---:|---|
+| Default | 20.98 | |
+| Gyro bias random walk ×100 | 21.77 | −3.32 −1.58 −0.15 +0.58 +0.73 +0.18 |
+| Warm-up random walk (`--gyro-rw-warmup 300`) | 20.90 | −2.80 −1.58 −0.14 +0.66 +0.70 +0.10 |
+| `--modes yaw` | 24.14 | −3.41 −1.49 −0.31 +0.42 +0.72 +0.49 |
+| `--modes yaw8` (eight time pieces) | 17.65 | −3.03 −1.92 −0.57 +0.79 +2.18 +2.47 |
+| IMU noise halved (`--imu-noise-scale 0.5`) | 19.22 | −4.24 −2.09 −0.40 +0.43 +0.73 +0.72 |
+| No focal lengths, no keypoint sizes | 18.09 | −4.21 −2.12 −0.44 +0.40 +0.65 +0.47 |
+| The same, one rotation per camera | 18.43 | −4.32 −2.21 −0.52 +0.40 +0.78 +0.64 |
+| Started with the heading removed (pseudo-GT, diagnosis) | **55.23** | −0.09 −0.09 −0.24 −0.12 +0.40 +0.41 |
+| Started at the pseudo-GT (diagnosis; 30 % of the observations) | **71.82** | +0.28 −0.01 −0.07 −0.18 +0.10 −0.12 |
+
+`--modes yawN` splits the heading mode into N time pieces. Each piece turns
+the heading over its own piece only, and the gyro bias takes the piece's turn
+spread over the whole recording: a constant bias absorbs the pieces' mean
+rate, and the gyroscope sees how they differ. Its steps on sequence_2_12
+change sign from one iteration to the next, and it stops higher than the
+default. Shapes chosen without ground truth do not help either. Starts with
+an exponential heading change A (1 − e^(−t/300 s)) cost more than the VIO
+after eight iterations for A = −7.5° (where the pseudo-GT puts it) and only
+slightly less for −2.5° (230,149 against 230,437). Turning the solve to
+the heading the gyroscope integrates with the solve's bias doubles the
+error: that heading drifts +5° the other way.
+
+The VIO does not cause it at its start either. With the solve's gyro bias
+subtracted from the start (`calib_gyro_bias`), or with a 100 times looser
+gyro bias random walk, its first five minutes keep the same heading error
+(−3.6° and −4.6° in the first 30 s, against −4.0°). Within 30–90 s the
+heading changes the solve, the gyroscope and the pseudo-GT measure between
+pseudo-GT timestamps agree to 0.2–0.4° per interval. The solve still turns
+1.5° more than the other two over the minute.
+
 ### The first keyframe's rotation prior
 
 The gauge prior pins the first keyframe's pose, rotation included, at the
@@ -931,7 +981,8 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   rotation prior (1e-4 rad). `--omega-coriolis x,y,z` puts Earth's rotation
   (rad/s, in the VIO's world frame) into the IMU factors.
 - **Heading drift.** `--modes yaw` lets the solve correct a slow heading
-  drift of its starting trajectory (see [Slow heading drift](#slow-heading-drift)).
+  drift of its starting trajectory (see [Slow heading drift](#slow-heading-drift));
+  `--modes yawN` splits it into N time pieces.
 - **Low light.** `features --clahe` equalizes the contrast before SIFT. On
   sequence_4_10 frames it raises the detections from 130–300 to 1,100–1,500
   per image. `--denoise 7` runs non-local means first (see [Low

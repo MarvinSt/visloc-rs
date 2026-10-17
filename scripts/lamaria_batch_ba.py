@@ -317,9 +317,30 @@ def cmd_match(a):
 
 # ----------------------------------------------------------------------------- revisits
 
-def _unguided_matches(da, db, ratio, max_desc):
-    """Mutual nearest neighbours with the ratio test, over all features."""
-    if njit is not None:
+def _unguided_matches(da, db, ratio, max_desc, method=None):
+    """Mutual nearest neighbours with the ratio test, over all features.
+
+    method: "cv2" (OpenCV's brute-force matcher, the default when OpenCV is there), "numba" or "numpy".
+    """
+    if method is None:
+        try:
+            import cv2  # noqa: F401
+            method = "cv2"
+        except ImportError:
+            method = "numba" if njit is not None else "numpy"
+    if method == "cv2":
+        import cv2
+        fa, fb = np.ascontiguousarray(da, np.float32), np.ascontiguousarray(db, np.float32)
+        if len(fa) < 2 or len(fb) < 2:
+            return np.zeros((0, 2), np.int32)
+        bf = cv2.BFMatcher(cv2.NORM_L2)
+        best_a = np.full(len(fb), -1)
+        for m in bf.match(fb, fa):
+            best_a[m.queryIdx] = m.trainIdx
+        out = [(i, m0.trainIdx) for i, (m0, m1) in enumerate(bf.knnMatch(fa, fb, k=2))
+               if m0.distance < ratio * m1.distance and m0.distance < max_desc and best_a[m0.trainIdx] == i]
+        return np.array(out, np.int32).reshape(-1, 2)
+    if method == "numba":
         ones = np.zeros((len(da), 3), np.float32)
         return _match_kernel(ones, np.zeros((len(db), 3), np.float32), np.ascontiguousarray(da),
                              np.ascontiguousarray(db), np.eye(3, dtype=np.float32), True, np.float32(1e9),
@@ -339,6 +360,7 @@ def _unguided_matches(da, db, ratio, max_desc):
 def _loop_worker(task):
     """A revisit candidate: unguided matching, essential-matrix RANSAC, and a rotation check."""
     import cv2
+    cv2.setNumThreads(1)  # one thread per pool process
     ka, ca, kb, cb = task
     xya, da = _image(ka, ca)
     xyb, db = _image(kb, cb)
@@ -388,7 +410,7 @@ def cmd_loops(a):
                 out_matches.append(m)
     pairs = np.concatenate(out_pairs) if out_pairs else np.zeros((0, 4), np.int32)
     matches = np.concatenate(out_matches) if out_matches else np.zeros((0, 2), np.int32)
-    np.savez(os.path.join(a.work, "loops.npz"), pairs=pairs, matches=matches)
+    np.savez(os.path.join(a.work, a.out_file), pairs=pairs, matches=matches)
     print(f"loops: {len(matches)} matches over {len(out_pairs)} verified image pairs "
           f"({len(np.unique(pairs[:, [0, 2]], axis=0))} keyframe pairs, {by_rotation} rejected by rotation), "
           f"{time.time() - t0:.0f} s", flush=True)
@@ -602,7 +624,81 @@ def _schur_add(m_o, h_xl, h_xx, g_x, g_l, kf, slot, lm, lm_start, band, nb, ab, 
                     corner[so * 3 + i, so * 3 + j] += h_xx[o, 6 + i, 6 + j]
 
 
-_schur_add_jit = njit(cache=True, nogil=True)(_schur_add) if njit is not None else None
+# compiled per run (about 3 s for the three kernels): a cache written by another import context can fail to load
+_schur_add_jit = njit(nogil=True)(_schur_add) if njit is not None else None
+
+
+def _normal_eqs(r_wi, t_wi, r_ic, t_ic, pts, kf, cam, lm, z, kcam, est, active, sigma, huber,
+                h_xx, h_xl, g_x, h_ll_o, h_ll, g_l):
+    """Reprojection.linearize and its normal equations in one pass (plain loops, for numba).
+
+    Each active observation in front of its camera adds its Huber-weighted blocks H_xx (9 x 9), H_xl (9 x 3),
+    g_x (9) and H_ll (3 x 3) at its own index, and H_ll and g_l to its landmark; the arrays start at zero.
+    """
+    jpi, jr, jx, jl = np.zeros((2, 3)), np.zeros((2, 3)), np.zeros((2, 9)), np.zeros((2, 3))
+    p_i, p_c, d = np.zeros(3), np.zeros(3), np.zeros(3)
+    for o in range(kf.shape[0]):
+        k, c, l = kf[o], cam[o], lm[o]
+        for a in range(3):
+            d[a] = pts[l, a] - t_wi[k, a]
+        for a in range(3):  # p_i = R_wi^T (X - t_wi)
+            p_i[a] = r_wi[k, 0, a] * d[0] + r_wi[k, 1, a] * d[1] + r_wi[k, 2, a] * d[2]
+        for a in range(3):
+            d[a] = p_i[a] - t_ic[c, a]
+        for a in range(3):  # p_c = R_ic^T (p_i - t_ic)
+            p_c[a] = r_ic[c, 0, a] * d[0] + r_ic[c, 1, a] * d[1] + r_ic[c, 2, a] * d[2]
+        if not active[o] or p_c[2] <= 0.05:
+            continue
+        zs = p_c[2]
+        res0 = (kcam[c, 0] * p_c[0] / zs + kcam[c, 2] - z[o, 0]) / sigma
+        res1 = (kcam[c, 1] * p_c[1] / zs + kcam[c, 3] - z[o, 1]) / sigma
+        e = np.sqrt(res0 * res0 + res1 * res1)
+        w = 1.0 if e <= huber else huber / max(e, 1e-12)
+        jpi[0, 0], jpi[0, 1], jpi[0, 2] = kcam[c, 0] / zs / sigma, 0.0, -kcam[c, 0] * p_c[0] / zs ** 2 / sigma
+        jpi[1, 0], jpi[1, 1], jpi[1, 2] = 0.0, kcam[c, 1] / zs / sigma, -kcam[c, 1] * p_c[1] / zs ** 2 / sigma
+        for r in range(2):
+            for b in range(3):  # jr = jpi R_ic^T
+                jr[r, b] = jpi[r, 0] * r_ic[c, b, 0] + jpi[r, 1] * r_ic[c, b, 1] + jpi[r, 2] * r_ic[c, b, 2]
+            # pose rotation jr [p_i]x, pose translation -jr, camera rotation jpi [p_c]x, landmark jr R_wi^T
+            jx[r, 0] = jr[r, 1] * p_i[2] - jr[r, 2] * p_i[1]
+            jx[r, 1] = jr[r, 2] * p_i[0] - jr[r, 0] * p_i[2]
+            jx[r, 2] = jr[r, 0] * p_i[1] - jr[r, 1] * p_i[0]
+            for b in range(3):
+                jx[r, 3 + b] = -jr[r, b]
+            if est[c]:
+                jx[r, 6] = jpi[r, 1] * p_c[2] - jpi[r, 2] * p_c[1]
+                jx[r, 7] = jpi[r, 2] * p_c[0] - jpi[r, 0] * p_c[2]
+                jx[r, 8] = jpi[r, 0] * p_c[1] - jpi[r, 1] * p_c[0]
+            else:
+                jx[r, 6] = jx[r, 7] = jx[r, 8] = 0.0
+            for b in range(3):
+                jl[r, b] = jr[r, 0] * r_wi[k, b, 0] + jr[r, 1] * r_wi[k, b, 1] + jr[r, 2] * r_wi[k, b, 2]
+        for i in range(9):
+            for j in range(9):
+                h_xx[o, i, j] = w * (jx[0, i] * jx[0, j] + jx[1, i] * jx[1, j])
+            for j in range(3):
+                h_xl[o, i, j] = w * (jx[0, i] * jl[0, j] + jx[1, i] * jl[1, j])
+            g_x[o, i] = w * (jx[0, i] * res0 + jx[1, i] * res1)
+        for i in range(3):
+            for j in range(3):
+                v = w * (jl[0, i] * jl[0, j] + jl[1, i] * jl[1, j])
+                h_ll_o[o, i, j] = v
+                h_ll[l, i, j] += v
+            g_l[l, i] += w * (jl[0, i] * res0 + jl[1, i] * res1)
+
+
+def _landmark_m(h_xl, h_ll_inv, lm, m_o):
+    """m_o = H_xl H_ll^-1 of each observation's landmark (plain loops, for numba)."""
+    for o in range(h_xl.shape[0]):
+        l = lm[o]
+        for i in range(9):
+            for j in range(3):
+                m_o[o, i, j] = (h_xl[o, i, 0] * h_ll_inv[l, 0, j] + h_xl[o, i, 1] * h_ll_inv[l, 1, j]
+                                + h_xl[o, i, 2] * h_ll_inv[l, 2, j])
+
+
+_normal_eqs_jit = njit(nogil=True)(_normal_eqs) if njit is not None else None
+_landmark_m_jit = njit(nogil=True)(_landmark_m) if njit is not None else None
 
 
 class Reprojection:
@@ -621,6 +717,7 @@ class Reprojection:
         self.active = np.ones(len(self.kf), bool)  # observations not rejected as outliers
         for name, i, j in (("fx", 0, 0), ("fy", 1, 1), ("cx", 0, 2), ("cy", 1, 2)):
             setattr(self, name, np.array([c["K"][i, j] for c in cams])[self.cam])
+        self.kcam = np.array([[c["K"][0, 0], c["K"][1, 1], c["K"][0, 2], c["K"][1, 2]] for c in cams])
         self.est = np.array([c in est_cams for c in range(len(cams))])
         self.ext_slot = np.full(len(cams), -1)
         for i, c in enumerate(est_cams):
@@ -710,6 +807,25 @@ class Reprojection:
         jl = jr @ np.transpose(rw, (0, 2, 1))   # landmark
         _, w, _ = self._robust(res, valid)
         return res, jx, jl, w
+
+    def normal_equations(self, r_wi, t_wi, r_ic, t_ic, pts):
+        """Per observation H_xx, H_xl, g_x and H_ll (weighted), and per landmark H_ll and g_l."""
+        n_o = len(self.kf)
+        h_xx, h_xl, g_x = np.zeros((n_o, 9, 9)), np.zeros((n_o, 9, 3)), np.zeros((n_o, 9))
+        h_ll_o, h_ll, g_l = np.zeros((n_o, 3, 3)), np.zeros((self.n_lm, 3, 3)), np.zeros((self.n_lm, 3))
+        if _normal_eqs_jit is not None:
+            _normal_eqs_jit(r_wi, t_wi, r_ic, t_ic, pts, self.kf, self.cam, self.lm, self.z, self.kcam, self.est,
+                            self.active, self.sigma, self.huber, h_xx, h_xl, g_x, h_ll_o, h_ll, g_l)
+            return h_xx, h_xl, g_x, h_ll_o, h_ll, g_l
+        res, jx, jl, w = self.linearize(r_wi, t_wi, r_ic, t_ic, pts)
+        wjx, wjl = jx * w[:, None, None], jl * w[:, None, None]
+        h_xx = np.einsum("nki,nkj->nij", wjx, jx)
+        h_xl = np.einsum("nki,nkj->nij", wjx, jl)
+        g_x = np.einsum("nki,nk->ni", wjx, res)
+        h_ll_o = np.einsum("nki,nkj->nij", wjl, jl)
+        np.add.at(h_ll, self.lm, h_ll_o)
+        np.add.at(g_l, self.lm, np.einsum("nki,nk->ni", wjl, res))
+        return h_xx, h_xl, g_x, h_ll_o, h_ll, g_l
 
 
 def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_rw_scale=1.0, gyro_rw_scale=1.0,
@@ -945,16 +1061,7 @@ def cmd_solve(a):
                 cost = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[0] + graph.error(values) + seg_cost(r_ic)
                 print(f"  outliers: {bad.sum()} observations over {thr} px (+{lone.sum()} left alone), "
                       f"{rp.active.sum()} active, cost {cost:.6g}", flush=True)
-        res, jx, jl, w = rp.linearize(r_wi, t_wi, r_ic, t_ic, pts)
-        wjx, wjl = jx * w[:, None, None], jl * w[:, None, None]
-        h_xx = np.einsum("nki,nkj->nij", wjx, jx)
-        h_xl = np.einsum("nki,nkj->nij", wjx, jl)
-        g_x = np.einsum("nki,nk->ni", wjx, res)
-        h_ll_o = np.einsum("nki,nkj->nij", wjl, jl)
-        h_ll = np.zeros((rp.n_lm, 3, 3))
-        np.add.at(h_ll, rp.lm, h_ll_o)
-        g_l = np.zeros((rp.n_lm, 3))
-        np.add.at(g_l, rp.lm, np.einsum("nki,nk->ni", wjl, res))
+        h_xx, h_xl, g_x, h_ll_o, h_ll, g_l = rp.normal_equations(r_wi, t_wi, r_ic, t_ic, pts)
         # IMU and prior factors, linearized by GTSAM: ||A dx - b||^2
         ab_imu, rhs_imu = np.zeros((u + 1, nb)), np.zeros(nb)
         lin = graph.linearize(values)
@@ -1000,7 +1107,11 @@ def cmd_solve(a):
         d_l = np.maximum(d_l, a.lm_damp_floor * d_l.max(axis=1, keepdims=True))[:, :, None] * np.eye(3)[None]
         for _ in range(8):
             h_ll_inv = np.linalg.inv(h_ll + lam * d_l + 1e-9 * np.eye(3)[None])
-            m_o = np.einsum("nij,njk->nik", h_xl, h_ll_inv[rp.lm])
+            if _landmark_m_jit is not None:
+                m_o = np.empty_like(h_xl)
+                _landmark_m_jit(h_xl, h_ll_inv, rp.lm, m_o)
+            else:
+                m_o = np.einsum("nij,njk->nik", h_xl, h_ll_inv[rp.lm])
             ab, rhs = ab_imu.copy(), np.zeros(nb + nz)
             rhs[:nb] = rhs_imu
             border, corner = np.zeros((nb, nz)), np.zeros((nz, nz))
@@ -1430,6 +1541,7 @@ def main():
     lp.add_argument("--min-inliers", type=int, default=25, help="essential-matrix inliers to accept a pair")
     lp.add_argument("--max-rot", type=float, default=10.0, help="largest disagreement with the VIO rotation (deg)")
     lp.add_argument("--jobs", type=int, default=2)
+    lp.add_argument("--out-file", default="loops.npz", help="written in --work")
     s = sub.add_parser("solve", help="batch VI bundle adjustment")
     s.add_argument("--work", required=True)
     s.add_argument("--imu", required=True, help="IMU csv (ns, gyro, accel) as the VIO used it")

@@ -5,6 +5,12 @@ import unittest
 
 import numpy as np
 
+try:
+    import cv2  # noqa: F401
+    HAVE_CV2 = True
+except ImportError:
+    HAVE_CV2 = False
+
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "lamaria_batch_ba.py"
 spec = importlib.util.spec_from_file_location("lamaria_batch_ba", SCRIPT)
 lb = importlib.util.module_from_spec(spec)
@@ -70,6 +76,49 @@ class ReprojectionJacobianTest(unittest.TestCase):
                 p2[j, d] += eps
                 num = (residuals(r_wi, t_wi, r_ic, p2)[o] - res[o]) / eps
                 np.testing.assert_allclose(jl[o, :, d], num, rtol=1e-4, atol=1e-3)
+
+
+class NormalEquationsTest(unittest.TestCase):
+    def test_one_pass_loop_matches_linearize(self):
+        rng = np.random.default_rng(9)
+        cams = two_cameras()
+        n_kf, n_lm = 4, 6
+        r_wi = np.array([rot(rng, 0.3) for _ in range(n_kf)])
+        t_wi = rng.normal(size=(n_kf, 3))
+        r_ic = np.array([c["R_ic"] for c in cams])
+        t_ic = np.array([c["t_ic"] for c in cams])
+        obs_kf, obs_cam, obs_lm, pts = [], [], [], np.zeros((n_lm, 3))
+        for j in range(n_lm):
+            k, c = j % n_kf, j % 2
+            pts[j] = (r_wi[k] @ t_ic[c] + t_wi[k]) + r_wi[k] @ r_ic[c] @ np.array([rng.normal() * 0.3, 0.2, 5.0 + j])
+            for kk in range(n_kf):  # every keyframe sees every landmark with the same camera
+                obs_kf.append(kk)
+                obs_cam.append(c)
+                obs_lm.append(j)
+        obs_z = rng.uniform(100, 600, size=(len(obs_kf), 2))  # far off: some Huber-weighted, some behind
+        rp = lb.Reprojection(np.array(obs_kf), np.array(obs_cam), np.array(obs_lm), obs_z, n_lm, cams, [1], 1.0,
+                             2.0, 64, numpy_pairs=True)
+        rp.active[3] = False
+        res, jx, jl, w = rp.linearize(r_wi, t_wi, r_ic, t_ic, pts)
+        wjx, wjl = jx * w[:, None, None], jl * w[:, None, None]
+        want = [np.einsum("nki,nkj->nij", wjx, jx), np.einsum("nki,nkj->nij", wjx, jl),
+                np.einsum("nki,nk->ni", wjx, res), np.einsum("nki,nkj->nij", wjl, jl)]
+        h_ll, g_l = np.zeros((n_lm, 3, 3)), np.zeros((n_lm, 3))
+        np.add.at(h_ll, rp.lm, want[3])
+        np.add.at(g_l, rp.lm, np.einsum("nki,nk->ni", wjl, res))
+        want += [h_ll, g_l]
+        n_o = len(rp.kf)
+        got = [np.zeros((n_o, 9, 9)), np.zeros((n_o, 9, 3)), np.zeros((n_o, 9)), np.zeros((n_o, 3, 3)),
+               np.zeros((n_lm, 3, 3)), np.zeros((n_lm, 3))]
+        lb._normal_eqs(r_wi, t_wi, r_ic, t_ic, pts, rp.kf, rp.cam, rp.lm, rp.z, rp.kcam, rp.est, rp.active,
+                       rp.sigma, rp.huber, *got)
+        self.assertTrue(0 < (w > 0).sum() < n_o)
+        for g, wv in zip(got, want):
+            np.testing.assert_allclose(g, wv, rtol=1e-12, atol=1e-9)
+        h_ll_inv = np.linalg.inv(h_ll + np.eye(3)[None])
+        m_o = np.zeros_like(got[1])
+        lb._landmark_m(got[1], h_ll_inv, rp.lm, m_o)
+        np.testing.assert_allclose(m_o, np.einsum("nij,njk->nik", want[1], h_ll_inv[rp.lm]), rtol=1e-12, atol=1e-12)
 
 
 class OutlierMaskTest(unittest.TestCase):
@@ -291,21 +340,11 @@ class MatchingTest(unittest.TestCase):
         desc_a = rng.integers(0, 256, size=(80, 128), dtype=np.uint8)
         perm = rng.permutation(80)
         desc_b = desc_a[perm]
-        saved = lb.njit
-        try:
-            lb.njit = None
-            m = lb._unguided_matches(desc_a, desc_b, 0.8, 300.0)
-        finally:
-            lb.njit = saved
-        self.assertEqual(len(m), 80)
-        np.testing.assert_array_equal(perm[m[:, 1]], m[:, 0])
-
-
-try:
-    import cv2  # noqa: F401
-    HAVE_CV2 = True
-except ImportError:
-    HAVE_CV2 = False
+        methods = ["numpy"] + (["cv2"] if HAVE_CV2 else [])
+        for method in methods:
+            m = lb._unguided_matches(desc_a, desc_b, 0.8, 300.0, method=method)
+            self.assertEqual(len(m), 80)
+            np.testing.assert_array_equal(perm[m[:, 1]], m[:, 0])
 
 
 @unittest.skipUnless(HAVE_CV2, "needs opencv-python")

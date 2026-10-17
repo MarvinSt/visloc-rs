@@ -396,7 +396,7 @@ class ModeVectorTest(unittest.TestCase):
         # and deform follows the piece's tangent to first order
         k_ = 1e-6
         bias = rng.normal(size=(n, 6)) * 1e-3
-        r2, t2, v2, b2, p2 = lb.deform("yaw:1:4", k_, kf_s, r_wi, t_wi, vel, bias, pts, lm_first)
+        r2, t2, _, b2, p2 = lb.deform("yaw:1:4", k_, kf_s, r_wi, t_wi, vel, bias, pts, lm_first)
         for k in range(n):
             w = np.radians(lb.so3_log_deg(r_wi[k].T @ r2[k])) / k_
             np.testing.assert_allclose(w, vx[1, k, 0:3], atol=1e-4)

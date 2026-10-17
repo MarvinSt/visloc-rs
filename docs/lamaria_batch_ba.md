@@ -468,6 +468,14 @@ median of one frame, 1.8 frames on average on sequence_4_11 at night and
 keyframes, 20–28 tracks per keyframe are seen twice or more, against 45–162
 SIFT landmarks.
 
+Learned features do not help on this window either. XFeat (1,500 keypoints
+per image) and ALIKED-n16 (score threshold 0.2, 494 keypoints per image), on
+the raw images and matched by the same VIO-guided ratio test, end at 0.833 m
+and 0.836 m on the 1000–1400 window, against 0.399 m for denoised SIFT. They
+locate their keypoints less precisely (median reprojection error 0.60 and
+0.52 px, against 0.47 px), and the solve bends against the IMU (position
+residual 4.4 and 1.6 per factor, against 0.69).
+
 ### The first minutes of a recording
 
 The gyroscope disagrees with the solved rotations at the start of every

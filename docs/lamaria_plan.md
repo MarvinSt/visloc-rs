@@ -12,7 +12,10 @@ named inline; nothing is tuned against ground truth unless stated.
 - **Sensors**: Project Aria, 2 SLAM cameras (ASL release: pinhole-undistorted
   ~758×572, fx≈241 → ~115° HFOV) + IMU 1 kHz. Sequences run 0.5–2.9 km / 5–48
   min; the test set is 63 sequences (Short 18, Medium 10, Long 16, Low light 9,
-  Moving platform 10).
+  Moving platform 10). The raw VRS recordings also carry 1 Hz GPS fixes
+  (2.5 m median error against the pseudo-GT on sequence_4_10); by decision we
+  do not use them, nor any other sensor beyond the two SLAM cameras and the
+  IMU, so that the method stays visual-inertial like the leaderboard's.
 - **Metric** (`cvg/lamaria` evaluator, unmodified): a robust Sim(3) alignment to
   surveyed control points, then a per-control-point piecewise score (20 points
   below 5 cm, decaying to 0 at 10 m). Report: **Score** 0–100, **CP@1m** recall,
@@ -261,6 +264,8 @@ before/after on training sequences.
 ## 5. Test-set operational pipeline
 
 1. Download one sequence with `aria2c -x16` from the official test file list.
+   `scripts/run_lamaria_test_submission.py --split training --sequences ...`
+   runs the same steps on training sequences, so the result can be scored.
 2. Run VIO (`--pipeline --threads 12`, variant-A default IMU noise), then the
    mapper (`--temporal-seed 7`; reduced-points config if it exceeds ~1 h or
    ~12 GB RSS).

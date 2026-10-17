@@ -1474,7 +1474,8 @@ def cmd_solve(a):
                          for k in range(n)])
         np.savez(os.path.splitext(a.out)[0] + "_states.npz", k0=k0, kf_ns=kf_ns, r_wi=r_wi, t_wi=t_wi, r_ic=r_ic,
                  ext_segments=n_seg, pts=pts, obs_kf=rp.kf, obs_cam=rp.cam // n_seg, obs_lm=rp.lm, obs_z=rp.z,
-                 active=rp.active, vel=np.array([values.atVector(V(k)) for k in range(n)]), bias=bias, foc=rp.foc)
+                 active=rp.active, vel=np.array([values.atVector(V(k)) for k in range(n)]), bias=bias, foc=rp.foc,
+                 sigma=rp.sigma, huber=a.huber)
 
 
 def _tri_banded(cfac, b, trans="N"):

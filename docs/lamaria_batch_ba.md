@@ -354,6 +354,10 @@ lengths absorb the conflict (the fitted scale drift grows from −6.5 % to
 −8.6 %). Pinning the mean of each camera's scales to the calibration
 (`--focal-mean-sigma 0.00001`) does not save it (48.14).
 
+Elsewhere the mean is what helps: with it pinned, sequence_3_17's first solve
+scores 56.49, against 65.96 with the focal lengths estimated and 60.25 with
+the calibration's.
+
 ### Keypoint size
 
 A SIFT keypoint detected at a coarser scale is located less precisely. The
@@ -422,6 +426,44 @@ matches against 4.1 million) take the fitted scale drift from +3.5 % to
 | CLAHE | 47.65 | 47.54 | 49.52 | 24.1 % |
 | Non-local means (h = 7), then CLAHE | 63.31 | 62.52 | 63.73 | **68.0 %** |
 | The same, with `--est-focal` | **63.64** | **63.26** | **64.30** | 66.9 % |
+
+What is left comes from the observations, not from the optimizer: the same
+first solve started at the pseudo-GT moves away from it and ends at 60.10
+(pose recall 45.9 %), below the solve started at the VIO. The local error
+of 60 s segments is still about twice that of the day sequences (0.15–0.43 m),
+the heading wanders by ±1° over the recording, and 2D errors of 1.5–2 m
+remain at 60–180 s, 840 s and 1,020–1,080 s.
+
+Other preprocessing and detector settings on top of the denoising, on four
+200 s windows (Sim(3) RMSE against the pseudo-GT; one IMU-camera rotation
+per camera):
+
+| Variant | Keyframes 200–600 | 1000–1400 | 1600–2000 | 2200–2600 |
+|---|---:|---:|---:|---:|
+| Non-local means (h = 7), then CLAHE | 0.462 m | 0.399 m | 0.619 m | **0.471 m** |
+| The same, SIFT contrast threshold 0.02 instead of 0.01 | **0.429 m** | **0.340 m** | **0.457 m** | 0.523 m |
+| The same, contrast threshold 0.03 | 0.449 m | | | |
+| Non-local means h = 10, contrast threshold 0.02 | 0.518 m | | | |
+| CLAHE clip limit 2 instead of 3 | 0.484 m | 0.382 m | 0.578 m | 0.562 m |
+| Gamma 0.5 instead of CLAHE | 0.516 m | 0.344 m | | 0.478 m |
+| Keyframes at 4 Hz (offsets and band doubled) | | 0.344 m | | |
+| Keyframes at 4 Hz, contrast threshold 0.02 | | 0.342 m | | |
+
+No equalization, CLAHE tiles of 4 × 4, dropping the keypoints on dark
+ground (mean grey level under 10) or larger than 20 px, and RootSIFT
+descriptors (0.809 m) do not beat the denoised baseline on the 1000–1400
+window either. The contrast threshold of 0.02 wins three windows of four, but
+on the whole sequence (402 keypoints per image, 2.1 million matches) it ends
+where the baseline does: 62.97 after the first solve and **64.35** after the
+second (pose recall 62.1 %). The 200 s windows measure the local shape, while
+the CP Score of this one-way route follows the drift over minutes.
+
+The VIO's KLT tracks cannot fill in either. `basalt_euroc_vio_demo
+--dump-tracks` writes the tracked points of every frame. A track lives a
+median of one frame, 1.6 frames on average on sequence_4_11 at night and
+2.5 by day (the first 2,000 frames of sequence_3_17); sampled at the 2 Hz
+keyframes, 16–28 tracks per keyframe are seen twice or more, against 45–162
+SIFT landmarks.
 
 ### The first minutes of a recording
 
@@ -576,6 +618,25 @@ recall at 1 m):
 The denoised features alone, without the focal lengths, give sequence_4_10
 63.73 (68.0 %).
 
+### What is left on sequence_3_17
+
+The CP errors left on the Long sequence are not a slow drift: fitting a
+heading or scale drift to them leaves the median at 0.80 m (0.77 m without).
+Against the pseudo-GT, the heading stays within ±0.7° for 1,500 s, then turns
+by +0.7° between 1,500 and 1,590 s, and the position is 1.4 m further off
+between 1,410 and 1,500 s (the CPs ETH2 and ETH1 there are 2.8 m and 2.0 m
+off). That stretch crosses an open area against the sun, with dark ground and
+a car passing close: the keyframes keep 160–170 observations (64 at the
+least), against about 500 elsewhere. Over 1,380–1,580 s the VIO itself is
+0.80 m off after a Sim(3) fit, its two halves 2.2 % apart in scale, and the
+pipeline is 0.92 m off. Contrast equalization does not help these day
+images on that window (one rotation per camera): 0.63 m without, 0.66 m with
+CLAHE, 0.60 m with a clip limit of 1.5, 0.75 m with a gamma of 0.7.
+
+In every image region the BA rejects about 1 % of the observations, so the
+wearer's feet and the passers-by in the lower part of the images are already
+left out by the matching.
+
 ### IMU-camera time offset
 
 The BA reports the whitened IMU residual per factor. A sweep of the gyroscope
@@ -696,6 +757,18 @@ turns the heading the wrong way, out of about 150,000–200,000. Neither does
 Earth's rotation: with its full vector in the IMU factors (`--omega-coriolis`,
 the north taken from the control points' LV95 frame for this check only), the
 mode still ends at +0.50° on sequence_1_19 (74.50).
+
+The current solver (eight rotation segments, the 3 px threshold) does the
+same (first solve):
+
+| Sequence | Without | `--modes yaw` | Cost on the observations active in both, without / with |
+|---|---:|---:|---:|
+| sequence_1_19 | **86.53** | 76.25 | |
+| sequence_2_11 | **71.18** | 61.01 | 180,923 / 180,903 |
+| sequence_4_10 (denoised features) | **63.31** | 51.50 | |
+| sequence_1_20 | 44.41 | **77.74** (pose recall 99.7 %) | 147,923 / 147,685 |
+
+On sequence_2_11 the mode also lowers the cost, by 20, and loses 10 points.
 
 The scale mode, where the accelerometer does observe the mode, helps four
 of the five tracks a little, but the low-light one, whose vision is weak,

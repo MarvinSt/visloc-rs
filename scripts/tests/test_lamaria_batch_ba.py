@@ -1,4 +1,4 @@
-"""Unit tests for scripts/lamaria_batch_ba.py (numpy-only parts)."""
+"""Unit tests for scripts/lamaria_batch_ba.py (numpy parts, and the loop edge's PnP if opencv is there)."""
 import importlib.util
 import pathlib
 import unittest
@@ -205,6 +205,36 @@ class MatchingTest(unittest.TestCase):
             lb.njit = saved
         self.assertEqual(len(m), 80)
         np.testing.assert_array_equal(perm[m[:, 1]], m[:, 0])
+
+
+try:
+    import cv2  # noqa: F401
+    HAVE_CV2 = True
+except ImportError:
+    HAVE_CV2 = False
+
+
+@unittest.skipUnless(HAVE_CV2, "needs opencv-python")
+class LoopEdgeTest(unittest.TestCase):
+    def test_pnp_body_pose_recovers_the_body(self):
+        rng = np.random.default_rng(5)
+        cam = two_cameras()[1]
+        r_wb, t_wb = rot(rng, 0.5), np.array([3.0, -2.0, 1.5])
+        r_wc = r_wb @ cam["R_ic"]
+        center = r_wb @ cam["t_ic"] + t_wb
+        n = 60
+        xy = rng.uniform([60, 60], [720, 520], size=(n, 2))
+        depth = rng.uniform(2, 15, size=n)
+        rays = np.c_[xy, np.ones(n)] @ np.linalg.inv(cam["K"]).T
+        world = center + (rays * depth[:, None]) @ r_wc.T
+        seen = xy + rng.normal(scale=0.2, size=xy.shape)
+        seen[:6] += rng.uniform(30, 80, size=(6, 2))  # a few wrong matches for RANSAC to reject
+        # start the PnP from a guess 0.3 m and a few degrees off
+        got = lb.pnp_body_pose(world, seen, cam["K"], cam["R_ic"], cam["t_ic"],
+                               lb.so3_exp(np.array([0.03, -0.02, 0.04])) @ r_wb, t_wb + np.array([0.2, 0.2, -0.1]), 15)
+        self.assertIsNotNone(got)
+        self.assertLess(np.degrees(np.arccos(np.clip((np.trace(got[0].T @ r_wb) - 1) / 2, -1, 1))), 0.1)
+        np.testing.assert_allclose(got[1], t_wb, atol=0.02)
 
 
 if __name__ == "__main__":

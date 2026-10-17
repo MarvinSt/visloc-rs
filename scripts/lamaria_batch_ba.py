@@ -26,11 +26,20 @@ and makes the matching about 30 times faster.
 The cameras must be pinhole (the ASL release's undistorted images; a Basalt
 double-sphere model with xi = alpha = 0).
 
+Revisits (optional): loops matches places seen again; loop-correct turns those
+matches into PnP relative poses and closes them in a pose graph over a solved
+trajectory; a second solve started from the corrected trajectory then adds the
+revisit matches themselves.
+
 usage:
   lamaria_batch_ba.py features --mav0 DIR --vio TUM --work DIR [--kf-step 10]
   lamaria_batch_ba.py match --work DIR --vio TUM --calib JSON
-  lamaria_batch_ba.py loops --work DIR --vio TUM --calib JSON          (optional: revisits)
-  lamaria_batch_ba.py solve --work DIR --imu CSV --calib JSON --vio TUM --out TUM [--loops]
+  lamaria_batch_ba.py solve --work DIR --imu CSV --calib JSON --vio TUM --out TUM
+with the revisits:
+  lamaria_batch_ba.py loops --work DIR --vio TUM --calib JSON
+  lamaria_batch_ba.py solve ... --vio TUM --out BA1.tum --save-states
+  lamaria_batch_ba.py loop-correct --work DIR --calib JSON --states BA1_states.npz --tum BA1.tum --out LC.tum
+  lamaria_batch_ba.py solve ... --vio LC.tum --out TUM --loops
 """
 import argparse
 import json
@@ -582,8 +591,14 @@ class Reprojection:
         return res, jx, jl, w
 
 
-def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_rw_scale=1.0, gyro_rw_scale=1.0):
-    """GTSAM values and factors for poses, velocities, biases, the IMU and the gauge priors."""
+def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_rw_scale=1.0, gyro_rw_scale=1.0,
+               prior_rot_sigma=1e-4, omega_coriolis=None):
+    """GTSAM values and factors for poses, velocities, biases, the IMU and the gauge priors.
+
+    The first keyframe's position is pinned (1e-4 m); its rotation gets prior_rot_sigma (rad). Gravity
+    makes roll and pitch observable, so a loose rotation prior lets the solve fix a tilt the VIO got
+    wrong at its start instead of pinning it there.
+    """
     import gtsam
     from gtsam.symbol_shorthand import B, V, X
     vio_ns, vio_p, _ = vio
@@ -595,6 +610,8 @@ def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_r
     params.setIntegrationCovariance(np.eye(3) * 1e-8)
     params.setBiasAccCovariance(np.eye(3) * (accel_rw_scale * noise["accel_bias_std"]) ** 2)
     params.setBiasOmegaCovariance(np.eye(3) * (gyro_rw_scale * noise["gyro_bias_std"]) ** 2)
+    if omega_coriolis is not None:  # Earth's rotation in the world frame, which the gyroscope also measures
+        params.setOmegaCoriolis(np.asarray(omega_coriolis, float))
     graph, values = gtsam.NonlinearFactorGraph(), gtsam.Values()
     imu_factors = []
     zero_bias = gtsam.imuBias.ConstantBias()
@@ -607,7 +624,8 @@ def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_r
         values.insert(V(k), vel)
         values.insert(B(k), zero_bias)
         if k == 0:
-            graph.add(gtsam.PriorFactorPose3(X(0), values.atPose3(X(0)), gtsam.noiseModel.Isotropic.Sigma(6, 1e-4)))
+            graph.add(gtsam.PriorFactorPose3(X(0), values.atPose3(X(0)), gtsam.noiseModel.Diagonal.Sigmas(
+                np.r_[np.full(3, prior_rot_sigma), np.full(3, 1e-4)])))
             graph.add(gtsam.PriorFactorVector(V(0), vel, gtsam.noiseModel.Isotropic.Sigma(3, 0.1)))
             graph.add(gtsam.PriorFactorConstantBias(B(0), zero_bias, gtsam.noiseModel.Diagonal.Sigmas(
                 np.array([0.1, 0.1, 0.1, 1e-3, 1e-3, 1e-3]))))
@@ -750,8 +768,9 @@ def cmd_solve(a):
     est_cams = [int(ch) for ch in a.est_extrinsic]
     rp = Reprojection(np.concatenate(obs_kf), np.concatenate(obs_cam), remap[obs_lm], np.concatenate(obs_z),
                       len(pts), cams, est_cams, a.pixel_sigma, a.huber, a.band)
+    omega = [float(v) for v in a.omega_coriolis.split(",")] if a.omega_coriolis else None
     graph, values, index, imu_factors = _imu_graph(kf_ns, kf_p, kf_r, vio, a.imu, noise, a.imu_noise_scale,
-                                                   a.accel_rw_scale, a.gyro_rw_scale)
+                                                   a.accel_rw_scale, a.gyro_rw_scale, a.prior_rot_sigma, omega)
     n = len(kf_ns)
     nb, ne = n * DOF, 3 * rp.n_ext
     modes = [m for m in a.modes.split(",") if m]
@@ -779,14 +798,16 @@ def cmd_solve(a):
     for it in range(a.iterations):
         ti = time.time()
         if a.outlier_px > 0 and it >= a.outlier_start:
-            # drop observations that moved far off, then landmarks left with a single observation
-            bad = rp.active & (rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[1] * a.pixel_sigma > a.outlier_px)
+            # drop observations that moved far off, then landmarks left with a single observation;
+            # from --outlier-start2 on with the tighter --outlier-px2
+            thr = a.outlier_px2 if 0 < a.outlier_px2 and it >= a.outlier_start2 else a.outlier_px
+            bad = rp.active & (rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[1] * a.pixel_sigma > thr)
             if bad.any():
                 rp.active &= ~bad
                 lone = rp.active & (np.bincount(rp.lm[rp.active], minlength=rp.n_lm)[rp.lm] < 2)
                 rp.active &= ~lone
                 cost = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[0] + graph.error(values)
-                print(f"  outliers: {bad.sum()} observations over {a.outlier_px} px (+{lone.sum()} left alone), "
+                print(f"  outliers: {bad.sum()} observations over {thr} px (+{lone.sum()} left alone), "
                       f"{rp.active.sum()} active, cost {cost:.6g}", flush=True)
         res, jx, jl, w = rp.linearize(r_wi, t_wi, r_ic, t_ic, pts)
         wjx, wjl = jx * w[:, None, None], jl * w[:, None, None]
@@ -1010,6 +1031,9 @@ def cmd_solve(a):
     print(json.dumps(summary, indent=1), flush=True)
     json.dump(summary, open(os.path.splitext(a.out)[0] + "_summary.json", "w"), indent=1)
     write_corrected(a.out, vio, kf_ns, kf_p, kf_r, t_wi, r_wi)
+    if a.save_states:  # what loop-correct needs: keyframe poses, landmarks and their observations
+        np.savez(os.path.splitext(a.out)[0] + "_states.npz", k0=k0, kf_ns=kf_ns, r_wi=r_wi, t_wi=t_wi, r_ic=r_ic,
+                 pts=pts, obs_kf=rp.kf, obs_cam=rp.cam, obs_lm=rp.lm, obs_z=rp.z, active=rp.active)
 
 
 def _pcg(rp, m_o, h_xl, ab, u, nb, ne, border, corner, precond, rhs):
@@ -1077,6 +1101,122 @@ def write_corrected(path, vio, kf_ns, kf_p, kf_r, opt_p, opt_r):
     print(f"wrote {path}", flush=True)
 
 
+# ----------------------------------------------------------------------------- loop correction
+
+def pnp_body_pose(p3, p2, kmat, r_ic, t_ic, r_wb0, t_wb0, min_inliers):
+    """World pose (R_wb, t_wb) of the body whose camera (R_ic, t_ic in the body) sees the world points p3 at
+    the pixels p2, by PnP with RANSAC (3 px) from the guess (R_wb0, t_wb0); None below min_inliers."""
+    import cv2
+    r_wc = r_wb0 @ r_ic
+    c_w = r_wb0 @ t_ic + t_wb0
+    rvec, tvec = cv2.Rodrigues(r_wc.T)[0], (-r_wc.T @ c_w).reshape(3, 1)
+    found, rvec, tvec, inl = cv2.solvePnPRansac(p3, p2, kmat, None, rvec, tvec, useExtrinsicGuess=True,
+                                                iterationsCount=200, reprojectionError=3.0, confidence=0.999)
+    if not found or inl is None or len(inl) < min_inliers:
+        return None
+    rvec, tvec = cv2.solvePnPRefineLM(p3[inl[:, 0]], p2[inl[:, 0]], kmat, None, rvec, tvec)
+    r_wc = cv2.Rodrigues(rvec)[0].T
+    r_wb = r_wc @ r_ic.T
+    return r_wb, -r_wc @ tvec.ravel() - r_wb @ t_ic
+
+
+def cmd_loop_correct(a):
+    """Close the revisits of a finished solve with a pose graph.
+
+    A solve with the revisit matches cannot close a loop the VIO drifted on: the triangulation and the
+    outlier rejection drop exactly the revisit observations that disagree by a metre or more. Here
+    the revisits become relative poses instead. For each revisit image pair (a, b), a's features that
+    are observations of a solved landmark give 3D points of a's visit; PnP with RANSAC places b's
+    camera against them (and a's against b's visit). Each such edge between keyframes a and b joins
+    a pose graph whose odometry edges are the solve's own consecutive relative poses; an edge whose
+    disagreement with the solve is implausible for the time between the visits (--gate) is dropped,
+    and the rest are robust (Cauchy). The solved graph's keyframe corrections are spread over every
+    frame of the solve's output trajectory.
+    """
+    import gtsam
+    from gtsam.symbol_shorthand import X
+    from scipy.spatial.transform import Rotation
+
+    st = np.load(a.states)
+    cams, _ = load_calib(a.calib)
+    k0, kf_ns, r_wi, t_wi, r_ic, pts = (st[k] for k in ("k0", "kf_ns", "r_wi", "t_wi", "r_ic", "pts"))
+    k0 = int(k0)
+    t_ic = np.array([c["t_ic"] for c in cams])
+    act = st["active"]
+    okf, ocam, olm, oz = st["obs_kf"][act], st["obs_cam"][act], st["obs_lm"][act], st["obs_z"][act]
+    _, offsets, xy, _ = load_features(a.work)
+    lp = np.load(os.path.join(a.work, a.loops_file))
+    n = len(kf_ns)
+    sel = (lp["pairs"][:, 0] >= k0) & (lp["pairs"][:, 2] < k0 + n)
+    pairs, matches = lp["pairs"][sel].astype(np.int64), lp["matches"][sel]
+    pairs[:, [0, 2]] -= k0
+    # landmark of a feature, found by its pixel among the solve's active observations
+    lookup = {(int(2 * k + c), round(float(z[0]), 3), round(float(z[1]), 3)): int(j)
+              for k, c, z, j in zip(okf, ocam, oz, olm)}
+
+    def edge(k3, c3, f3, k2, c2, f2):
+        """Body pose of keyframe k2 placed by PnP against the landmarks seen by features f3 of (k3, c3)."""
+        lms = np.array([lookup.get((2 * k3 + c3, round(float(xy[i, 0]), 3), round(float(xy[i, 1]), 3)), -1)
+                        for i in f3])
+        ok = lms >= 0
+        if ok.sum() < a.min_inliers:
+            return None
+        placed = pnp_body_pose(pts[lms[ok]], xy[f2[ok]].astype(np.float64), cams[c2]["K"], r_ic[c2], t_ic[c2],
+                               r_wi[k2], t_wi[k2], a.min_inliers)
+        if placed is None:
+            return None
+        r_wb, t_wb = placed
+        rel_r, rel_t = r_wi[k3].T @ r_wb, r_wi[k3].T @ (t_wb - t_wi[k3])
+        dev_t = np.linalg.norm(rel_t - r_wi[k3].T @ (t_wi[k2] - t_wi[k3]))
+        dev_r = np.degrees(np.linalg.norm(Rotation.from_matrix((r_wi[k3].T @ r_wi[k2]).T @ rel_r).as_rotvec()))
+        return k3, k2, rel_r, rel_t, dev_r, dev_t
+
+    key = pairs[:, 0] * 10_000_000 + pairs[:, 1] * 1_000_000 + pairs[:, 2] * 10 + pairs[:, 3]
+    _, inv = np.unique(key, return_inverse=True)
+    t_kf = (kf_ns - kf_ns[0]) * 1e-9
+    base, rate, max_rot = (float(v) for v in a.gate.split(","))
+    edges, gated = [], 0
+    for j in range(inv.max() + 1 if len(inv) else 0):
+        rows = np.flatnonzero(inv == j)
+        ka, ca, kb, cb = pairs[rows[0]]
+        fa = offsets[2 * (ka + k0) + ca] + matches[rows, 0]
+        fb = offsets[2 * (kb + k0) + cb] + matches[rows, 1]
+        for e in (edge(ka, ca, fa, kb, cb, fb), edge(kb, cb, fb, ka, ca, fa)):
+            if e is None:
+                continue
+            if e[5] > base + rate * abs(t_kf[e[1]] - t_kf[e[0]]) or e[4] > max_rot:
+                gated += 1
+                continue
+            edges.append(e)
+    print(f"{inv.max() + 1 if len(inv) else 0} revisit image pairs: {len(edges)} loop edges, {gated} more over the "
+          f"drift gate", flush=True)
+    if not edges:
+        sys.exit("no loop edges")
+    dev = np.array([e[5] for e in edges])
+    print(f"  disagreement with the solve: median {np.median(dev):.2f} m, p90 {np.percentile(dev, 90):.2f} m",
+          flush=True)
+    graph, vals = gtsam.NonlinearFactorGraph(), gtsam.Values()
+    for k in range(n):
+        vals.insert(X(k), gtsam.Pose3(gtsam.Rot3(r_wi[k]), t_wi[k]))
+    graph.add(gtsam.PriorFactorPose3(X(0), vals.atPose3(X(0)), gtsam.noiseModel.Isotropic.Sigma(6, 1e-6)))
+    odo = gtsam.noiseModel.Diagonal.Sigmas(np.r_[np.full(3, a.odo_rot_sigma), np.full(3, a.odo_pos_sigma)])
+    for k in range(n - 1):
+        graph.add(gtsam.BetweenFactorPose3(X(k), X(k + 1), vals.atPose3(X(k)).between(vals.atPose3(X(k + 1))), odo))
+    loop_noise = gtsam.noiseModel.Robust.Create(
+        gtsam.noiseModel.mEstimator.Cauchy.Create(1.0),
+        gtsam.noiseModel.Diagonal.Sigmas(np.r_[np.full(3, a.loop_rot_sigma), np.full(3, a.loop_pos_sigma)]))
+    for k3, k2, rel_r, rel_t, _, _ in edges:
+        graph.add(gtsam.BetweenFactorPose3(X(k3), X(k2), gtsam.Pose3(gtsam.Rot3(rel_r), rel_t), loop_noise))
+    res = gtsam.LevenbergMarquardtOptimizer(graph, vals, gtsam.LevenbergMarquardtParams()).optimize()
+    new_r = np.array([res.atPose3(X(k)).rotation().matrix() for k in range(n)])
+    new_t = np.array([res.atPose3(X(k)).translation() for k in range(n)])
+    moved = np.linalg.norm(new_t - t_wi, axis=1)
+    print(f"pose graph: error {graph.error(vals):.4g} -> {graph.error(res):.4g}; keyframes moved by "
+          f"{np.median(moved):.2f} m at the median, {moved.max():.2f} m at most", flush=True)
+    # the per-keyframe corrections, interpolated over the solve's per-frame output
+    write_corrected(a.out, load_tum(a.tum), kf_ns, t_wi, r_wi, new_t, new_r)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1133,6 +1273,13 @@ def main():
     s.add_argument("--outlier-px", type=float, default=10.0,
                    help="each iteration drops observations whose error exceeds this (0: keep all)")
     s.add_argument("--outlier-start", type=int, default=0, help="first iteration that drops outliers")
+    s.add_argument("--outlier-px2", type=float, default=3.0,
+                   help="tighter threshold (px) from --outlier-start2 on, once the solution has settled (0: off)")
+    s.add_argument("--outlier-start2", type=int, default=8)
+    s.add_argument("--omega-coriolis", default="", help="x,y,z: Earth's rotation (rad/s) in the VIO's world frame, "
+                   "e.g. w_e (0, cos lat, sin lat) turned into it; needs the world frame's north")
+    s.add_argument("--prior-rot-sigma", type=float, default=1e-4,
+                   help="prior on the first keyframe's rotation (rad); its position stays pinned")
     s.add_argument("--lm-damp-floor", type=float, default=0.01,
                    help="landmark damping floor, relative to the landmark's largest diagonal entry")
     s.add_argument("--kf-range", default="", help="START:END keyframe window (default: all)")
@@ -1146,8 +1293,27 @@ def main():
     s.add_argument("--modes-start", type=int, default=3, help="first iteration that uses the modes")
     s.add_argument("--mode-cap-yaw", type=float, default=0.01, help="largest yaw-mode step per iteration (rad)")
     s.add_argument("--mode-cap-scale", type=float, default=0.01, help="largest scale-mode step per iteration")
+    s.add_argument("--save-states", action="store_true",
+                   help="also write <out>_states.npz (keyframes, landmarks, observations) for loop-correct")
+    c = sub.add_parser("loop-correct", help="close the revisits of a solve with a pose graph (after solve "
+                       "--save-states and loops)")
+    c.add_argument("--work", required=True)
+    c.add_argument("--calib", required=True)
+    c.add_argument("--states", required=True, help="<out>_states.npz of the solve")
+    c.add_argument("--tum", required=True, help="the solve's output trajectory")
+    c.add_argument("--out", required=True, help="corrected trajectory (TUM)")
+    c.add_argument("--loops-file", default="loops.npz", help="revisit matches in --work")
+    c.add_argument("--min-inliers", type=int, default=15, help="PnP inliers for a loop edge")
+    c.add_argument("--gate", default="0.3,0.01,2.0",
+                   help="drop an edge disagreeing with the solve by more than BASE + RATE * (time between the visits)"
+                        " metres, or by more than MAX_ROT degrees: BASE,RATE,MAX_ROT")
+    c.add_argument("--odo-rot-sigma", type=float, default=2e-4, help="rad, per consecutive keyframe pair")
+    c.add_argument("--odo-pos-sigma", type=float, default=0.02, help="m, per consecutive keyframe pair")
+    c.add_argument("--loop-rot-sigma", type=float, default=0.005, help="rad")
+    c.add_argument("--loop-pos-sigma", type=float, default=0.1, help="m")
     a = p.parse_args()
-    {"features": cmd_features, "match": cmd_match, "loops": cmd_loops, "solve": cmd_solve}[a.cmd](a)
+    {"features": cmd_features, "match": cmd_match, "loops": cmd_loops, "solve": cmd_solve,
+     "loop-correct": cmd_loop_correct}[a.cmd](a)
 
 
 if __name__ == "__main__":

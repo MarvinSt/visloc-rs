@@ -44,8 +44,19 @@ sequence. It uses no ground truth.
    Hessian diagonal floored at 1 % of its largest entry. Without both, a
    landmark seen with little parallax could take a step of hundreds of
    metres, and every damped step of an iteration raised the cost.
+
+   From the 8th iteration on the threshold tightens to 3 px. By then the
+   solution has settled and the median error is about 0.3 px, so an
+   observation still 3 px off is almost always a wrong match. Huber alone
+   lets each such observation pull like a 2 px residual; the 1–2 % of them
+   bend the trajectory against the IMU (see [Results](#results)).
 6. **Output.** The VIO's per-frame trajectory, each frame moved by the
    correction of the surrounding keyframes (interpolated).
+7. **Revisits (optional).** `loops` matches places visited again, and
+   `loop-correct` turns those matches into relative poses for a pose graph
+   over the solved keyframes. A second `solve` then starts from the
+   corrected trajectory and adds the revisit matches (see
+   [Revisits](#revisits)).
 
 ## The IMU-camera rotation of each camera
 
@@ -92,33 +103,43 @@ no mapper run. The batch BA starts from that VIO trajectory and uses the
 factory camera rig. On sequence_4_10 the VIO is the low-light configuration
 (0.5 px KLT threshold) and the BA's SIFT runs on CLAHE-equalized images. The
 first version of the solver had neither the outlier rejection nor the
-landmark damping floor (see [Method](#method)).
+landmark damping floor; the 10 px column has both but keeps 10 px to the end;
+the last column also tightens it to 3 px from the 8th iteration on, the
+default (see [Method](#method)).
 
-| Sequence | Track | Device | VIO | VIO + mapper | Batch BA, first version | Batch BA |
-|---|---|---|---:|---:|---:|---:|
-| sequence_1_19 | Short | 1WM09370081264 | 71.96 | 68.54 | **83.96** | 83.02 |
-| sequence_2_11 | Medium | 1WM093701G1276 | 49.68 | 55.51 | 52.29 | **61.03** |
-| sequence_3_17 | Long | 1WM093701G1276 | 50.06 | 46.68 | 49.59 | **50.14** |
-| sequence_4_10 | Low light | 1WM093701G1276 | 39.00 | 36.65 | 44.28 | **45.79** |
-| sequence_5_11 | Moving platform | 1WM093701G1276 | 43.14 | 49.84 | 55.70 | **59.06** |
-| **Mean of the five tracks** | | | 50.77 | 51.44 | 57.16 | **59.81** |
-| sequence_1_20 | Short | 1WM09370081264 | 38.10 | | 43.48 | 43.39 (**74.84** with `--modes yaw`, see [below](#slow-heading-drift)) |
+| Sequence | Track | Device | VIO | VIO + mapper | Batch BA, first version | Batch BA, 10 px | Batch BA |
+|---|---|---|---:|---:|---:|---:|---:|
+| sequence_1_19 | Short | 1WM09370081264 | 71.96 | 68.54 | **83.96** | 83.02 | 80.63 |
+| sequence_2_11 | Medium | 1WM093701G1276 | 49.68 | 55.51 | 52.29 | 61.03 | **68.88** |
+| sequence_3_17 | Long | 1WM093701G1276 | 50.06 | 46.68 | 49.59 | 50.14 | **50.32** |
+| sequence_4_10 | Low light | 1WM093701G1276 | 39.00 | 36.65 | 44.28 | 45.79 | **47.43** |
+| sequence_5_11 | Moving platform | 1WM093701G1276 | 43.14 | 49.84 | 55.70 | 59.06 | **59.81** |
+| **Mean of the five tracks** | | | 50.77 | 51.44 | 57.16 | 59.81 | **61.41** |
+| sequence_1_20 | Short | 1WM09370081264 | 38.10 | | 43.48 | 43.39 | 44.43 (**76.13** with `--modes yaw`, see [below](#slow-heading-drift)) |
+
+The 3 px stage drops 1–2 % of the observations (11,400 of 874,000 on
+sequence_2_11). The IMU then fits better: on sequence_2_11 the whitened
+residual per factor falls from 1.61 to 0.91 for the position and from 6.60
+to 4.94 for the velocity, and the fitted scale drift from +2.8 % to +1.8 %.
+The trajectory improves on every sequence with pseudo-GT (table below); the
+CP Score of sequence_1_19 falls by 2.4 even so, its CP errors growing from
+0.33 to 0.37 m at the median, where the score falls steeply.
 
 The same runs against the pseudo-GT:
 
-| Sequence | Metric | VIO | VIO + mapper | Batch BA |
-|---|---|---:|---:|---:|
-| sequence_1_19 | Pose recall at 1 m | 76.3 % | 60.6 % | **91.5 %** |
-| sequence_1_19 | Sim(3) RMSE | 0.88 m | 0.96 m | **0.55 m** |
-| sequence_2_11 | Pose recall at 1 m | 30.9 % | 39.4 % | **51.3 %** |
-| sequence_2_11 | Sim(3) RMSE | 2.31 m | 1.92 m | **1.51 m** |
-| sequence_3_17 | Pose recall at 1 m | **24.7 %** | 21.7 % | 16.3 % |
-| sequence_3_17 | Sim(3) RMSE | 2.07 m | 2.48 m | **2.02 m** |
-| sequence_4_10 | Pose recall at 1 m | 14.1 % | | **19.3 %** |
-| sequence_4_10 | Sim(3) RMSE | 3.11 m | | **2.36 m** |
-| the four above | RMSE of 60 s segments, each Sim(3)-aligned | 0.151 / 0.264 / 0.182 / 0.381 m | | **0.127 / 0.206 / 0.147 / 0.336 m** |
-| sequence_1_20 | Pose recall at 1 m | 3.8 % | | 11.8 % (**100 %** with `--modes yaw`) |
-| sequence_1_20 | Sim(3) RMSE | 3.03 m | | 2.41 m (**0.59 m** with `--modes yaw`) |
+| Sequence | Metric | VIO | VIO + mapper | Batch BA, 10 px | Batch BA |
+|---|---|---:|---:|---:|---:|
+| sequence_1_19 | Pose recall at 1 m | 76.3 % | 60.6 % | 91.5 % | **91.7 %** |
+| sequence_1_19 | Sim(3) RMSE | 0.88 m | 0.96 m | **0.55 m** | **0.55 m** |
+| sequence_2_11 | Pose recall at 1 m | 30.9 % | 39.4 % | 51.3 % | **70.2 %** |
+| sequence_2_11 | Sim(3) RMSE | 2.31 m | 1.92 m | 1.51 m | **1.01 m** |
+| sequence_3_17 | Pose recall at 1 m | **24.7 %** | 21.7 % | 16.3 % | 17.0 % |
+| sequence_3_17 | Sim(3) RMSE | 2.07 m | 2.48 m | 2.02 m | **1.97 m** |
+| sequence_4_10 | Pose recall at 1 m | 14.1 % | | 19.3 % | **21.5 %** |
+| sequence_4_10 | Sim(3) RMSE | 3.11 m | | 2.36 m | **2.11 m** |
+| the four above | RMSE of 60 s segments, each Sim(3)-aligned | 0.151 / 0.264 / 0.182 / 0.381 m | | 0.127 / 0.206 / 0.147 / 0.336 m | **0.125 / 0.169 / 0.141 / 0.315 m** |
+| sequence_1_20 | Pose recall at 1 m | 3.8 % | | 11.8 % | 14.4 % (**100 %** with `--modes yaw`) |
+| sequence_1_20 | Sim(3) RMSE | 3.03 m | | 2.41 m | 2.31 m |
 
 On sequence_5_11 (no pseudo-GT) the BA brings AA2976 from 0.94 m (VIO) to
 0.07 m and the fitted scale drift (without PB2) from −5.4 % to −2.5 %. PB2,
@@ -128,19 +149,19 @@ The batch BA is the most accurate locally on every sequence with pseudo-GT.
 The slow drift that remains, fitted to the CP residuals as a heading and a
 scale drift linear in time:
 
-| Sequence | Heading drift | Scale drift |
-|---|---:|---:|
-| sequence_1_19 | −0.14° | −0.6 % |
-| sequence_2_11 | −0.34° | +2.8 % |
-| sequence_3_17 | +0.82° | +2.3 % |
-| sequence_4_10 | −0.58° | +4.0 % |
-| sequence_5_11 (without PB2) | −0.35° | −2.5 % |
+| Sequence | Heading drift, 10 px | Scale drift, 10 px | Heading drift | Scale drift |
+|---|---:|---:|---:|---:|
+| sequence_1_19 | −0.14° | −0.6 % | −0.30° | −0.6 % |
+| sequence_2_11 | −0.34° | +2.8 % | −0.47° | +1.9 % |
+| sequence_3_17 | +0.82° | +2.3 % | +0.81° | +2.3 % |
+| sequence_4_10 | −0.58° | +4.0 % | −0.92° | +3.6 % |
+| sequence_5_11 (without PB2) | −0.35° | −2.5 % | −0.22° | −2.3 % |
 
 The sequences of 1WM093701G1276 keep 2–4 % of scale drift, and their local
 scale (Sim(3) fits in 60 s windows) varies by ±2–4 %, against ±1 % on
 sequence_1_19. Their IMU factors also fit worse: the whitened position
 residual per factor is 1.6–1.8, against 0.4–0.5 on 1WM09370081264.
-These do not remove it (sequence_2_11, CP Score 61.03):
+These do not remove it (sequence_2_11, 10 px, CP Score 61.03):
 
 | Change | CP Score | Note |
 |---|---:|---|
@@ -148,12 +169,27 @@ These do not remove it (sequence_2_11, CP Score 61.03):
 | Accelerometer delayed by −2 / +2 ms | 61.14 / 61.14 | Final cost +1,100 / −90 |
 | Accelerometer bias random walk ×10 | 60.49 | |
 | IMU noise densities ×2 | 58.02 | |
+| Keyframes at 4 Hz (every 5th frame), matches and band up to 128 keyframes | 60.05 | Scale drift +2.8 → +1.8 %, heading drift −0.35 → −0.02°, IMU position residual 1.61 → 0.75; the CPs of the first half gain what those of the second half lose |
+| Camera translations estimated too (prior 1 cm) | 60.21 | They move by 2–4 mm; the scale stays (1.026 against the pseudo-GT) |
+| Vertical Earth rotation in the IMU factors (`--omega-coriolis`) | 60.99 | The gyro bias absorbed it already |
+| Cross-camera matches left out | 64.89 | With the first rotation prior loose as well, −2.2 on sequence_1_19, −2.0 on sequence_4_10 and −7.9 on sequence_5_11 against the 10 px solve; the stereo constraints carry sequence_5_11's funicular ride |
 
 A fit of the accelerometer against the pseudo-GT's second differences had
 suggested a y scale of 0.97 on this device; the BA rules that out. The
 camera exposure does not explain the local scale either: it correlates
 weakly with it on sequence_2_11 (−0.33), and on sequence_4_10 the exposure
 stays at 14 ms while the local scale varies by ±7 %.
+
+The IMU is not what shrinks the trajectory. With the BA's rotations fixed and
+its positions replaced by the pseudo-GT's (aligned rigidly per 60 s window),
+the scale the preintegrated IMU prefers is 1.006 ± 0.004 on sequence_2_11
+(window to window ±1.7 %). The BA instead keeps the global scale of its
+starting point, like its heading drift: the VIO is 2.4 % short against the
+pseudo-GT, the BA 2.7 %, and a start stretched by 2.5 % ends 0.9 % short at a
+slightly lower cost (229,625 against 229,821, with the first rotation prior
+loose, see [below](#the-first-keyframes-rotation-prior)). The scale is a weak
+direction of the objective; within a 60 s window the IMU constrains it to
+only about ±1.7 %.
 
 ### What the gain on sequence_1_19 comes from
 
@@ -186,13 +222,53 @@ Landmarks seen on both visits couple keyframes outside the band. The solver
 then runs conjugate gradients on the full reduced system, preconditioned by
 the banded factor; this converges in about 20 iterations.
 
-With the first version of the solver the revisits raised sequence_2_11 from
-52.29 to 54.41. On sequence_1_20 the stage accepts 836 keyframe pairs (all
-within 15 m in the pseudo-GT, 40 s apart at the median and 127 s at most),
-but the BA with them falls from 43.39 to 38.97: the IMU cost grows from
-17,000 to 30,000 and the heading drift from −4.6° to −5.8°. Some revisit
-matches are probably wrong (repeated structures pass the essential matrix
-and the 10° rotation check), so the stage stays optional.
+Added straight to the solve, the revisits do not close the loops. The
+solved sequence_2_11 is about 1.3 m off between its two visits, and a revisit
+observation that far off fails the 4 px triangulation check or the 10 px
+rejection of the first iterations. What survives already agrees with the
+trajectory: the solve keeps fewer observations than without the revisits
+(845,000 against 874,000, as merged tracks conflict more often), stops at its
+iteration limit and scores 53.15, against 68.88 without them. On
+sequence_1_20 the 10 px solve fell from 43.39 to 38.97 the same way.
+
+`loop-correct` closes the loops before a solve sees them:
+
+1. It reads a finished solve (`solve --save-states`). For each revisit image
+   pair (a, b), the features of a that are observations of a solved landmark
+   give 3D points of a's visit. PnP with RANSAC (OpenCV, 3 px, at least 15
+   inliers) places b's camera against them, and a's against b's visit. Each
+   placement is a relative pose between keyframes a and b.
+2. An edge that disagrees with the solve by more than 0.3 m plus 1 cm per
+   second between the visits, or by more than 2°, is dropped: so much drift
+   is not plausible.
+3. The rest join a pose graph (GTSAM) whose odometry edges are the solve's
+   consecutive relative poses (2e-4 rad and 2 cm per keyframe step); the loop
+   edges are Cauchy-robust (0.005 rad, 0.1 m). The graph's keyframe
+   corrections are spread over every frame, as `solve` spreads its own.
+4. A second solve starts from that trajectory (as `--vio`) with `--loops`.
+   The triangulation check and the outlier rejection now measure the revisit
+   observations against the corrected trajectory.
+
+On sequence_2_11 PnP places 1,160 edges, 1,050 within the gate. They disagree
+with the solve by 1.29 m at the median, and the 941 edges of the revisit
+120–240 s later agree with each other (1.67 m at the 90th percentile). The
+graph moves the keyframes by 0.48 m at the median and 3.0 m at most, and the
+revisited CP AA1812 goes from 1.8 to 1.1 m:
+
+| Sequence | Revisit image pairs | Loop edges in the gate | Batch BA | + `loop-correct` | + second solve |
+|---|---:|---:|---:|---:|---:|
+| sequence_1_19 | 966 | 220 | 80.63 | **81.79** | 81.76 |
+| sequence_2_11 | 1,922 | 1,050 | 68.88 | 71.53 | **73.34** |
+| sequence_3_17 | 415 | 45 | **50.32** | 50.15 | 50.06 |
+| sequence_4_10 | 540 | 31 | 47.43 | 47.29 | **49.24** |
+| sequence_5_11 | 529 | 84 | 59.81 | **61.31** | 61.20 |
+| **Mean of the five tracks** | | | 61.41 | 62.41 | **63.12** |
+| sequence_1_20 | 1,052 | 266 | **44.43** | 43.33 | 43.35 |
+
+On sequence_1_20 the revisits lie mostly under a minute apart and the solve
+agrees with them already (0.10–0.18 m at the median). They cannot correct its
+slow heading drift, and the 10 % of edges that disagree by more than a metre
+cost a point.
 
 ### IMU-camera time offset
 
@@ -291,6 +367,16 @@ which costs more than it brings when the start is already that good. The
 mode stays off by default; it is the remedy for a start that drifts by
 degrees, such as a VIO without the per-device refinement.
 
+The tighter outlier threshold does not change that (default solve, with and
+without the mode): sequence_1_20 goes from 44.43 to **76.13**, but
+sequence_1_19 from 80.63 to 74.87, sequence_2_11 from 68.88 to 59.17 and
+sequence_4_10 from 47.43 to 40.42. The cost cannot pick the cases either: the
+mode lowers it by 126 on sequence_1_20 and by 107 on sequence_4_10, where it
+turns the heading the wrong way, out of about 150,000–200,000. Neither does
+Earth's rotation: with its full vector in the IMU factors (`--omega-coriolis`,
+the north taken from the control points' LV95 frame for this check only), the
+mode still ends at +0.50° on sequence_1_19 (74.50).
+
 The scale mode, where the accelerometer does observe the mode, helps four
 of the five tracks a little, but the low-light one, whose vision is weak,
 loses 7 points:
@@ -305,6 +391,22 @@ loses 7 points:
 | **Mean** | **59.81** | 59.17 | |
 
 It stays off by default as well.
+
+### The first keyframe's rotation prior
+
+The gauge prior pins the first keyframe's pose, rotation included, at the
+VIO's. On sequence_2_11 the first 30 IMU factors (15 s) then carry half of
+the whole sequence's gyroscope residual and 44 % of its velocity residual:
+the first keyframe has no visual observation, the VIO initialized while the
+wearer walked, and its tilt is off. `--prior-rot-sigma 0.05` (rad) lets the
+solve fix the tilt; gravity observes roll and pitch, and the 0.05 rad prior
+still fixes the heading's gauge. The IMU cost halves on every sequence
+(sequence_2_11: 20,600 → 11,700), but the CP Scores split (with the 3 px
+threshold, prior loose minus pinned): +0.6, +0.1, −1.0, −4.6 and +4.2 on
+sequence_1_19, sequence_1_20, sequence_2_11, sequence_4_10 and
+sequence_5_11. A different start shifts the gyro bias and with it the
+heading drift, along the same flat direction as above. It stays at 1e-4 by
+default.
 
 ### Starting from the online mapper
 
@@ -330,9 +432,20 @@ pip install numpy scipy opencv-python gtsam numba
 S=sequence_1_19
 python scripts/lamaria_batch_ba.py features --mav0 data/$S/mav0 --vio vio/$S.tum --work work/$S
 python scripts/lamaria_batch_ba.py match --work work/$S --vio vio/$S.tum --calib calib/$S.json
-python scripts/lamaria_batch_ba.py loops --work work/$S --vio vio/$S.tum --calib calib/$S.json  # optional
 python scripts/lamaria_batch_ba.py solve --work work/$S --vio vio/$S.tum --calib calib/$S.json \
-  --imu data/$S/mav0/imu0/data.csv --out out/$S.tum [--loops]
+  --imu data/$S/mav0/imu0/data.csv --out out/$S.tum
+```
+
+With the revisits:
+
+```bash
+python scripts/lamaria_batch_ba.py loops --work work/$S --vio vio/$S.tum --calib calib/$S.json
+python scripts/lamaria_batch_ba.py solve --work work/$S --vio vio/$S.tum --calib calib/$S.json \
+  --imu data/$S/mav0/imu0/data.csv --out out/$S.ba1.tum --save-states
+python scripts/lamaria_batch_ba.py loop-correct --work work/$S --calib calib/$S.json \
+  --states out/$S.ba1_states.npz --tum out/$S.ba1.tum --out out/$S.lc.tum
+python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --calib calib/$S.json \
+  --imu data/$S/mav0/imu0/data.csv --out out/$S.tum --loops
 ```
 
 - **IMU.** `--imu` is the IMU as the VIO read it, with the factory
@@ -345,6 +458,14 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio vio/$S.tum --calib
   IMU residual per factor.
 - **Robustness.** `--outlier-px` (10) and `--lm-damp-floor` (0.01) are the
   outlier rejection and the landmark damping floor; 0 turns them off.
+  `--outlier-px2` (3) is the tighter threshold from iteration
+  `--outlier-start2` (8) on.
+- **Revisits.** `solve --save-states` keeps what `loop-correct` needs.
+  `loop-correct --gate BASE,RATE,MAX_ROT` (0.3 m, 0.01 m/s, 2°) sets the
+  drift a loop edge may disagree by.
+- **Other options.** `--prior-rot-sigma` loosens the first keyframe's
+  rotation prior (1e-4 rad). `--omega-coriolis x,y,z` puts Earth's rotation
+  (rad/s, in the VIO's world frame) into the IMU factors.
 - **Heading drift.** `--modes yaw` lets the solve correct a slow heading
   drift of its starting trajectory (see [Slow heading drift](#slow-heading-drift)).
 - **Low light.** `features --clahe` equalizes the contrast before SIFT. On
@@ -353,4 +474,6 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio vio/$S.tum --calib
 - **Cost.** On this 4-core container, a 15-minute sequence takes about
   15 min for the features (2 processes) and 3 min for the matching (with
   numba). The solve takes 9–20 min on one thread; the longest, on the
-  30-minute sequence_3_17.
+  30-minute sequence_3_17. `loops` takes 8–40 min on one process (the
+  unguided matching of every candidate pair), `loop-correct` a minute, and
+  the second solve 15–30 min.

@@ -222,13 +222,19 @@ before/after on training sequences.
    geometry, and one Levenberg-Marquardt solve over every keyframe (pose,
    velocity and IMU biases with GTSAM's preintegrated factors), every
    landmark and each camera's IMU-camera rotation, with no ground truth. It
-   raises the mean over the five tracks to **59.81**, against 50.77 for the
-   refined VIO and 53.27 for the per-track VIO or mapper. It keeps the slow
-   heading drift of its starting trajectory; `--modes yaw` corrects a start
-   that drifts by degrees (sequence_1_20: 43.4 → 74.8) but costs points
-   where the start is already good, so it stays opt-in. The G1276 sequences
-   keep 2–4 % of scale drift
-   ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).
+   raises the mean over the five tracks to **61.41** (2026-10-17; 59.81
+   before the 3 px outlier threshold of its last iterations), against 50.77
+   for the refined VIO and 53.27 for the per-track VIO or mapper. Closing
+   the revisits with a pose graph (`loop-correct`) and solving again from
+   the corrected trajectory brings the mean to **63.12** (sequence_2_11: 68.88
+   → 73.34). It keeps the slow heading drift and the global scale of its
+   starting trajectory: these are flat directions of its objective.
+   `--modes yaw` corrects a start that drifts by degrees (sequence_1_20:
+   44.4 → 76.1) but costs points where the start is already good, so it
+   stays opt-in. The G1276 sequences keep 2–4 % of scale drift. Keyframes
+   at 4 Hz, estimated camera translations, Earth's rotation, a loose first
+   rotation prior and leaving out the cross-camera matches did not raise
+   the mean ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).
 
 ## 5. Test-set operational pipeline
 
@@ -240,7 +246,10 @@ before/after on training sequences.
    convert to the submission format
    (`scripts/basalt_tum_to_lamaria_estimate.py`). For the batch BA (lever
    14), run `scripts/lamaria_batch_ba.py` `features`, `match` and `solve` on
-   the VIO trajectory first (about 15 + 3 + 9–20 min per sequence on 4 cores).
+   the VIO trajectory first (about 15 + 3 + 9–20 min per sequence on 4 cores);
+   with the revisits, `loops`, `solve --save-states`, `loop-correct` and a
+   second `solve --loops` from the corrected trajectory (another 10–40 min
+   and 10–30 min).
 4. Delete the sequence data; add `slam/<seq>.txt` to the submission zip.
 5. Submit via <https://lamaria.ethz.ch/login> (24 h rate limit).
 

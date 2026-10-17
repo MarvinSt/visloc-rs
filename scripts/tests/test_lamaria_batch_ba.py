@@ -50,7 +50,8 @@ class ReprojectionJacobianTest(unittest.TestCase):
             obs_lm.append(j)
         obs_z = np.zeros((n_lm, 2))
         rp = lb.Reprojection(np.array(obs_kf), np.array(obs_cam), np.array(obs_lm), obs_z, n_lm, cams,
-                             [0, 1], 1.0, 1e9, 64)
+                             [0, 1], 1.0, 1e9, 64, est_focal=True)
+        rp.set_focal([0.01, -0.02])
         res, jx, jl, _ = rp.linearize(r_wi, t_wi, r_ic, t_ic, pts)
         eps = 1e-6
 
@@ -71,6 +72,11 @@ class ReprojectionJacobianTest(unittest.TestCase):
                     ric2[c] = r_ic[c] @ lb.so3_exp(step)
                 num = (residuals(r2, t2, ric2, pts)[o] - res[o]) / eps
                 np.testing.assert_allclose(jx[o, :, d], num, rtol=1e-4, atol=1e-3)
+            foc = rp.foc.copy()
+            rp.set_focal(foc + eps * (np.arange(2) == c))  # focal length scale: f <- f exp(s)
+            num = (residuals(r_wi, t_wi, r_ic, pts)[o] - res[o]) / eps
+            rp.set_focal(foc)
+            np.testing.assert_allclose(jx[o, :, 9], num, rtol=1e-4, atol=1e-3)
             for d in range(3):
                 p2 = pts.copy()
                 p2[j, d] += eps
@@ -80,6 +86,11 @@ class ReprojectionJacobianTest(unittest.TestCase):
 
 class NormalEquationsTest(unittest.TestCase):
     def test_one_pass_loop_matches_linearize(self):
+        for focal in (False, True):  # with the focal length scale as a tenth camera parameter
+            with self.subTest(focal=focal):
+                self._check(focal)
+
+    def _check(self, focal):
         rng = np.random.default_rng(9)
         cams = two_cameras()
         n_kf, n_lm = 4, 6
@@ -96,8 +107,11 @@ class NormalEquationsTest(unittest.TestCase):
                 obs_cam.append(c)
                 obs_lm.append(j)
         obs_z = rng.uniform(100, 600, size=(len(obs_kf), 2))  # far off: some Huber-weighted, some behind
-        rp = lb.Reprojection(np.array(obs_kf), np.array(obs_cam), np.array(obs_lm), obs_z, n_lm, cams, [1], 1.0,
-                             2.0, 64, numpy_pairs=True)
+        sigma = rng.uniform(0.5, 2.0, size=len(obs_kf))  # per-observation pixel noise
+        rp = lb.Reprojection(np.array(obs_kf), np.array(obs_cam), np.array(obs_lm), obs_z, n_lm, cams, [1], sigma,
+                             2.0, 64, numpy_pairs=True, est_focal=focal)
+        if focal:
+            rp.set_focal([0.0, 0.01])
         rp.active[3] = False
         res, jx, jl, w = rp.linearize(r_wi, t_wi, r_ic, t_ic, pts)
         wjx, wjl = jx * w[:, None, None], jl * w[:, None, None]
@@ -108,7 +122,8 @@ class NormalEquationsTest(unittest.TestCase):
         np.add.at(g_l, rp.lm, np.einsum("nki,nk->ni", wjl, res))
         want += [h_ll, g_l]
         n_o = len(rp.kf)
-        got = [np.zeros((n_o, 9, 9)), np.zeros((n_o, 9, 3)), np.zeros((n_o, 9)), np.zeros((n_o, 3, 3)),
+        nx = 6 + rp.n_par
+        got = [np.zeros((n_o, nx, nx)), np.zeros((n_o, nx, 3)), np.zeros((n_o, nx)), np.zeros((n_o, 3, 3)),
                np.zeros((n_lm, 3, 3)), np.zeros((n_lm, 3))]
         lb._normal_eqs(r_wi, t_wi, r_ic, t_ic, pts, rp.kf, rp.cam, rp.lm, rp.z, rp.kcam, rp.est, rp.active,
                        rp.sigma, rp.huber, *got)
@@ -119,6 +134,31 @@ class NormalEquationsTest(unittest.TestCase):
         m_o = np.zeros_like(got[1])
         lb._landmark_m(got[1], h_ll_inv, rp.lm, m_o)
         np.testing.assert_allclose(m_o, np.einsum("nij,njk->nik", want[1], h_ll_inv[rp.lm]), rtol=1e-12, atol=1e-12)
+        # the one-pass cost (numba) against the vectorized projection; keyframe 0 turned away from its
+        # landmarks puts some observations behind the camera
+        r_wi[0] = r_wi[0] @ np.diag([-1.0, 1.0, -1.0])
+        *_, valid, res = rp._project(r_wi, t_wi, r_ic, t_ic, pts)
+        e_want, _, cost_want = rp._robust(res, valid)
+        e = np.zeros(n_o)
+        cost = lb._reproj_cost(r_wi, t_wi, r_ic, t_ic, pts, rp.kf, rp.cam, rp.lm, rp.z, rp.kcam, rp.active, rp.sigma,
+                               rp.huber, e)
+        self.assertTrue((~valid).any())
+        np.testing.assert_allclose(e, e_want, rtol=1e-12)
+        self.assertAlmostEqual(cost, cost_want.sum(), delta=1e-9 * cost_want.sum())
+        if lb._normal_eqs_par is not None:  # the parallel kernels (numba), chunk by chunk
+            par = [np.zeros_like(g) for g in got]
+            lb._normal_eqs_par(rp.chunks, r_wi, t_wi, r_ic, t_ic, pts, rp.kf, rp.cam, rp.lm, rp.z, rp.kcam, rp.est,
+                               rp.active, rp.sigma, rp.huber, *par)
+            ser = [np.zeros_like(g) for g in got]
+            lb._normal_eqs(r_wi, t_wi, r_ic, t_ic, pts, rp.kf, rp.cam, rp.lm, rp.z, rp.kcam, rp.est, rp.active,
+                           rp.sigma, rp.huber, *ser)
+            for g, wv in zip(par, ser):
+                np.testing.assert_array_equal(g, wv)
+            e_par = np.zeros(n_o)
+            self.assertAlmostEqual(lb._reproj_cost_par(rp.chunks, r_wi, t_wi, r_ic, t_ic, pts, rp.kf, rp.cam, rp.lm,
+                                                       rp.z, rp.kcam, rp.active, rp.sigma, rp.huber, e_par),
+                                   cost, delta=1e-12 * cost)
+            np.testing.assert_array_equal(e_par, e)
 
 
 class OutlierMaskTest(unittest.TestCase):
@@ -166,6 +206,30 @@ class SegmentPriorTest(unittest.TestCase):
         np.testing.assert_allclose(h, h_num, atol=0.01 * w)  # Gauss-Newton: exact up to O(|e0|)
 
 
+class FocalPriorTest(unittest.TestCase):
+    def test_normal_equations_match_finite_differences(self):
+        rng = np.random.default_rng(5)
+        # both cameras in three segments, 4 parameters per slot (rotation, focal length scale last)
+        slot = np.arange(6)
+        pairs = [(0, 1), (1, 2), (3, 4), (4, 5)]
+        groups = [[0, 1, 2], [3, 4, 5]]
+        foc0 = rng.normal(size=6) * 0.003
+        w = (1 / 0.0005 ** 2, 1 / 0.01 ** 2, 1 / 0.001 ** 2, groups)
+
+        def cost(x):
+            return lb.focal_prior(foc0 + x[3::4], pairs, slot, 4, 6, *w)[0]
+
+        c0, h, b = lb.focal_prior(foc0, pairs, slot, 4, 6, *w)
+        self.assertAlmostEqual(c0, cost(np.zeros(24)))
+        eps = 1e-7
+        grad = np.array([(cost(eps * e) - cost(-eps * e)) / (2 * eps) for e in np.eye(24)])
+        np.testing.assert_allclose(b, -grad, rtol=1e-6, atol=1e-6)
+        h_num = np.array([[(cost(eps * (ei + ej)) - cost(eps * (ei - ej)) - cost(eps * (ej - ei))
+                            + cost(-eps * (ei + ej))) / (4 * eps ** 2) for ej in np.eye(24)] for ei in np.eye(24)])
+        np.testing.assert_allclose(h, h_num, rtol=1e-4, atol=1e-6 * np.abs(h).max())  # quadratic: exact
+        self.assertTrue(np.all(h[np.ix_(np.arange(24) % 4 != 3, np.arange(24))] == 0))  # rotations untouched
+
+
 class TriangulateTest(unittest.TestCase):
     def test_drops_bad_observations_and_narrow_tracks(self):
         rng = np.random.default_rng(8)
@@ -208,14 +272,14 @@ class SchurAssemblyTest(unittest.TestCase):
                 obs_cam.append(int(rng.integers(2)))
                 obs_lm.append(j)
         obs_kf, obs_cam, obs_lm = np.array(obs_kf), np.array(obs_cam), np.array(obs_lm)
-        for est in ([0, 1], [1]):
+        for est, focal in (([0, 1], False), ([1], False), ([0, 1], True)):
             rp = lb.Reprojection(obs_kf, obs_cam, obs_lm, np.zeros((len(obs_kf), 2)), 9, cams, est, 1.0, 2.0, 3,
-                                 numpy_pairs=True)
-            n_o, n, nb, ne = len(rp.kf), 7, 7 * lb.DOF, 3 * rp.n_ext
-            m_o, h_xl = rng.normal(size=(n_o, 9, 3)), rng.normal(size=(n_o, 9, 3))
-            h_xx = rng.normal(size=(n_o, 9, 9))
+                                 numpy_pairs=True, est_focal=focal)
+            n_o, n, nb, ne, nx = len(rp.kf), 7, 7 * lb.DOF, rp.n_par * rp.n_ext, 6 + rp.n_par
+            m_o, h_xl = rng.normal(size=(n_o, nx, 3)), rng.normal(size=(n_o, nx, 3))
+            h_xx = rng.normal(size=(n_o, nx, nx))
             h_xx = h_xx + h_xx.transpose(0, 2, 1)
-            g_x, g_l = rng.normal(size=(n_o, 9)), rng.normal(size=(9, 3))
+            g_x, g_l = rng.normal(size=(n_o, nx)), rng.normal(size=(9, 3))
             slot = rp.ext_slot[rp.cam]
             u = (rp.band_kf + 1) * lb.DOF - 1
             out = []

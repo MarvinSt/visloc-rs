@@ -97,6 +97,17 @@ def load_features(work, desc=True):
     return f["kf_ns"], f["offsets"], f["xy"], f["desc"] if desc else None
 
 
+def load_sizes(work):
+    """SIFT keypoint sizes (px) aligned with features.npz: stored there, or by `sizes` in kp_size.npz."""
+    f = np.load(os.path.join(work, "features.npz"))
+    if "size" in f.files:
+        return f["size"]
+    path = os.path.join(work, "kp_size.npz")
+    if not os.path.exists(path):
+        sys.exit("no keypoint sizes: features.npz predates them, run `sizes` first")
+    return np.load(path)["size"]
+
+
 def keyframe_poses(kf_ns, vio):
     vio_ns, vio_p, vio_r = load_tum(vio)
     idx = np.searchsorted(vio_ns, kf_ns)
@@ -107,17 +118,38 @@ def keyframe_poses(kf_ns, vio):
 
 # ----------------------------------------------------------------------------- features
 
-def _sift_worker(task):
+def _sift_image(path, clahe, denoise=0.0):
     import cv2
-    path, nfeat, clahe = task
     im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if im is None:
+        sys.exit(f"cannot read {path}")
+    if denoise > 0:  # low light: non-local means first, so that the equalization does not amplify the noise
+        im = cv2.fastNlMeansDenoising(im, None, denoise, 7, 21)
     if clahe:  # low light: local contrast equalization before detection
         im = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(im)
+    return im
+
+
+def _sift_worker(task):
+    import cv2
+    path, nfeat, clahe, denoise = task
+    cv2.setNumThreads(1)
     sift = cv2.SIFT_create(nfeatures=nfeat, contrastThreshold=0.01)
-    kp, des = sift.detectAndCompute(im, None)
+    kp, des = sift.detectAndCompute(_sift_image(path, clahe, denoise), None)
     xy = np.array([k.pt for k in kp], dtype=np.float32).reshape(-1, 2)
+    size = np.array([k.size for k in kp], dtype=np.float32)
     des = np.zeros((0, 128), np.uint8) if des is None else np.clip(des, 0, 255).astype(np.uint8)
-    return xy, des
+    return xy, des, size
+
+
+def _size_worker(task):
+    """Sizes of an image's stored keypoints, detected again (same detector) and found by their position."""
+    import cv2
+    path, nfeat, clahe, denoise, xy = task
+    cv2.setNumThreads(1)
+    kp = cv2.SIFT_create(nfeatures=nfeat, contrastThreshold=0.01).detect(_sift_image(path, clahe, denoise), None)
+    lut = {np.array(k.pt, np.float32).tobytes(): k.size for k in kp}
+    return np.array([lut.get(p.tobytes(), np.nan) for p in xy], np.float32)
 
 
 def cmd_features(a):
@@ -131,7 +163,7 @@ def cmd_features(a):
     usable = [t for t in sorted(set(frames[0]) & set(frames[1])) if t in vio_set]
     kf_ns = np.array(usable[::a.kf_step], dtype=np.int64)
     print(f"{len(usable)} stereo frames with a VIO pose, {len(kf_ns)} keyframes", flush=True)
-    tasks = [(os.path.join(a.mav0, f"cam{c}", "data", frames[c][int(t)]), a.num_features, a.clahe)
+    tasks = [(os.path.join(a.mav0, f"cam{c}", "data", frames[c][int(t)]), a.num_features, a.clahe, a.denoise)
              for t in kf_ns for c in range(2)]
     t0 = time.time()
     with mp.Pool(a.jobs) as pool:
@@ -139,8 +171,22 @@ def cmd_features(a):
     counts = np.array([len(r[0]) for r in res], dtype=np.int64)
     offsets = np.concatenate([[0], np.cumsum(counts)])
     np.savez(os.path.join(a.work, "features.npz"), kf_ns=kf_ns, offsets=offsets,
-             xy=np.concatenate([r[0] for r in res]), desc=np.concatenate([r[1] for r in res]))
+             xy=np.concatenate([r[0] for r in res]), desc=np.concatenate([r[1] for r in res]),
+             size=np.concatenate([r[2] for r in res]))
     print(f"features: {offsets[-1]} keypoints, {counts.mean():.0f}/image, {time.time() - t0:.0f} s", flush=True)
+
+
+def cmd_sizes(a):
+    """kp_size.npz: the keypoint sizes of a features.npz written without them."""
+    kf_ns, offsets, xy, _ = load_features(a.work, desc=False)
+    tasks = [(os.path.join(a.mav0, f"cam{c}", "data", f"{t}.png"), a.num_features, a.clahe, a.denoise,
+              xy[offsets[2 * k + c]:offsets[2 * k + c + 1]]) for k, t in enumerate(kf_ns) for c in range(2)]
+    t0 = time.time()
+    with mp.Pool(a.jobs) as pool:
+        size = np.concatenate(pool.map(_size_worker, tasks, chunksize=8))
+    np.savez(os.path.join(a.work, "kp_size.npz"), size=size)
+    print(f"sizes: {len(size)} keypoints, {np.isnan(size).mean() * 100:.2f} % not found again, "
+          f"median {np.nanmedian(size):.2f} px, {time.time() - t0:.0f} s", flush=True)
 
 
 # ----------------------------------------------------------------------------- matching
@@ -177,9 +223,9 @@ def _best_two(keys, vals, n):
 
 
 try:  # optional: the same matching rules ~30x faster
-    from numba import njit
+    from numba import njit, prange
 except ImportError:
-    njit = None
+    njit, prange = None, range
 
 if njit is not None:
     @njit(cache=True, nogil=True)
@@ -567,6 +613,38 @@ def segment_prior(r_ic, pairs, slot, n_ext, w):
     return cost, h, b
 
 
+def focal_prior(foc, pairs, slot, n_par, n_ext, w_pair, w_abs, w_mean=0.0, groups=()):
+    """Cost, Hessian and right-hand side of the priors on the focal length scales s (the last parameter of
+    each estimated camera's slot): s ~ N(0, 1 / w_abs), s_b - s_a ~ N(0, 1 / w_pair) for each pair, and the
+    mean of each group of cameras (a physical camera's segments) ~ N(0, 1 / w_mean)."""
+    ne = n_par * n_ext
+    h, b, cost = np.zeros((ne, ne)), np.zeros(ne), 0.0
+    for g in groups:
+        if w_mean <= 0 or not len(g):
+            continue
+        idx = np.array([slot[c] * n_par + n_par - 1 for c in g])
+        m = np.mean(foc[list(g)])
+        h[np.ix_(idx, idx)] += w_mean / len(g) ** 2
+        b[idx] -= w_mean * m / len(g)
+        cost += 0.5 * w_mean * m ** 2
+    for c in np.flatnonzero(slot >= 0):
+        i = slot[c] * n_par + n_par - 1
+        h[i, i] += w_abs
+        b[i] -= w_abs * foc[c]
+        cost += 0.5 * w_abs * foc[c] ** 2
+    for ca, cb in pairs:
+        i, j = slot[ca] * n_par + n_par - 1, slot[cb] * n_par + n_par - 1
+        r = foc[cb] - foc[ca]
+        h[i, i] += w_pair
+        h[j, j] += w_pair
+        h[i, j] -= w_pair
+        h[j, i] -= w_pair
+        b[i] += w_pair * r
+        b[j] -= w_pair * r
+        cost += 0.5 * w_pair * r ** 2
+    return cost, h, b
+
+
 def _row_dot(x, a, i, y, b, j):
     """sum_k x[a, i, k] y[b, j, k] over the landmark's 3 coordinates."""
     return x[a, i, 0] * y[b, j, 0] + x[a, i, 1] * y[b, j, 1] + x[a, i, 2] * y[b, j, 2]
@@ -580,10 +658,12 @@ def _schur_add(m_o, h_xl, h_xx, g_x, g_l, kf, slot, lm, lm_start, band, nb, ab, 
     """Eliminates the landmarks into the reduced system, one landmark at a time (plain loops, for numba).
 
     Every ordered pair (a, b) of a landmark's observations adds -M_a X_b^T (M = H_xl H_ll^-1, X = H_xl,
-    9 x 3 each: pose 6, camera rotation 3): its pose-pose block when kf_a >= kf_b within the band (lower
-    banded storage ab[i - j, j]), its pose-rotation block to the border and its rotation-rotation block to
-    the corner. Every observation then adds its own H_xx blocks and its reduced gradient -g_x + M g_l.
+    (6 + P) x 3 each: pose 6, then the P camera parameters of the observation's slot): its pose-pose
+    block when kf_a >= kf_b within the band (lower banded storage ab[i - j, j]), its pose-camera block to
+    the border and its camera-camera block to the corner. Every observation then adds its own H_xx
+    blocks and its reduced gradient -g_x + M g_l.
     """
+    npar = h_xl.shape[1] - 6
     for l in range(lm_start.shape[0] - 1):
         s0, s1 = lm_start[l], lm_start[l + 1]
         for a in range(s0, s1):
@@ -597,31 +677,31 @@ def _schur_add(m_o, h_xl, h_xx, g_x, g_l, kf, slot, lm, lm_start, band, nb, ab, 
                                 ab[ra + i - cb - j, cb + j] -= _row_dot(m_o, a, i, h_xl, b, j)
                 if sb >= 0:
                     for i in range(6):
-                        for j in range(3):
-                            border[ra + i, sb * 3 + j] -= _row_dot(m_o, a, i, h_xl, b, 6 + j)
+                        for j in range(npar):
+                            border[ra + i, sb * npar + j] -= _row_dot(m_o, a, i, h_xl, b, 6 + j)
                     if sa >= 0:
-                        for i in range(3):
-                            for j in range(3):
-                                corner[sa * 3 + i, sb * 3 + j] -= _row_dot(m_o, a, 6 + i, h_xl, b, 6 + j)
+                        for i in range(npar):
+                            for j in range(npar):
+                                corner[sa * npar + i, sb * npar + j] -= _row_dot(m_o, a, 6 + i, h_xl, b, 6 + j)
     for o in range(kf.shape[0]):
         r0, so = kf[o] * DOF, slot[o]
         for i in range(6):
             for j in range(i + 1):
                 ab[i - j, r0 + j] += h_xx[o, i, j]
         gl = g_l[lm[o]]
-        for i in range(9):
+        for i in range(6 + npar):
             red = -g_x[o, i] + m_o[o, i, 0] * gl[0] + m_o[o, i, 1] * gl[1] + m_o[o, i, 2] * gl[2]
             if i < 6:
                 rhs[r0 + i] += red
             elif so >= 0:
-                rhs[nb + so * 3 + i - 6] += red
+                rhs[nb + so * npar + i - 6] += red
         if so >= 0:
             for i in range(6):
-                for j in range(3):
-                    border[r0 + i, so * 3 + j] += h_xx[o, i, 6 + j]
-            for i in range(3):
-                for j in range(3):
-                    corner[so * 3 + i, so * 3 + j] += h_xx[o, 6 + i, 6 + j]
+                for j in range(npar):
+                    border[r0 + i, so * npar + j] += h_xx[o, i, 6 + j]
+            for i in range(npar):
+                for j in range(npar):
+                    corner[so * npar + i, so * npar + j] += h_xx[o, 6 + i, 6 + j]
 
 
 # compiled per run (about 3 s for the three kernels): a cache written by another import context can fail to load
@@ -629,15 +709,18 @@ _schur_add_jit = njit(nogil=True)(_schur_add) if njit is not None else None
 
 
 def _normal_eqs(r_wi, t_wi, r_ic, t_ic, pts, kf, cam, lm, z, kcam, est, active, sigma, huber,
-                h_xx, h_xl, g_x, h_ll_o, h_ll, g_l):
+                h_xx, h_xl, g_x, h_ll_o, h_ll, g_l, o0=0, o1=-1):
     """Reprojection.linearize and its normal equations in one pass (plain loops, for numba).
 
-    Each active observation in front of its camera adds its Huber-weighted blocks H_xx (9 x 9), H_xl (9 x 3),
-    g_x (9) and H_ll (3 x 3) at its own index, and H_ll and g_l to its landmark; the arrays start at zero.
+    Each active observation in front of its camera adds its Huber-weighted blocks H_xx (n x n), H_xl (n x 3),
+    g_x (n) and H_ll (3 x 3) at its own index, and H_ll and g_l to its landmark; the arrays start at zero.
+    n = 9 (pose, camera rotation) or 10 (and the camera's focal length scale), from the shape of h_xx.
+    Observations o0 to o1 (default: all).
     """
-    jpi, jr, jx, jl = np.zeros((2, 3)), np.zeros((2, 3)), np.zeros((2, 9)), np.zeros((2, 3))
+    nx = h_xx.shape[1]
+    jpi, jr, jx, jl = np.zeros((2, 3)), np.zeros((2, 3)), np.zeros((2, 10)), np.zeros((2, 3))
     p_i, p_c, d = np.zeros(3), np.zeros(3), np.zeros(3)
-    for o in range(kf.shape[0]):
+    for o in range(o0, kf.shape[0] if o1 < 0 else o1):
         k, c, l = kf[o], cam[o], lm[o]
         for a in range(3):
             d[a] = pts[l, a] - t_wi[k, a]
@@ -649,13 +732,13 @@ def _normal_eqs(r_wi, t_wi, r_ic, t_ic, pts, kf, cam, lm, z, kcam, est, active, 
             p_c[a] = r_ic[c, 0, a] * d[0] + r_ic[c, 1, a] * d[1] + r_ic[c, 2, a] * d[2]
         if not active[o] or p_c[2] <= 0.05:
             continue
-        zs = p_c[2]
-        res0 = (kcam[c, 0] * p_c[0] / zs + kcam[c, 2] - z[o, 0]) / sigma
-        res1 = (kcam[c, 1] * p_c[1] / zs + kcam[c, 3] - z[o, 1]) / sigma
+        zs, sg = p_c[2], sigma[o]
+        res0 = (kcam[c, 0] * p_c[0] / zs + kcam[c, 2] - z[o, 0]) / sg
+        res1 = (kcam[c, 1] * p_c[1] / zs + kcam[c, 3] - z[o, 1]) / sg
         e = np.sqrt(res0 * res0 + res1 * res1)
         w = 1.0 if e <= huber else huber / max(e, 1e-12)
-        jpi[0, 0], jpi[0, 1], jpi[0, 2] = kcam[c, 0] / zs / sigma, 0.0, -kcam[c, 0] * p_c[0] / zs ** 2 / sigma
-        jpi[1, 0], jpi[1, 1], jpi[1, 2] = 0.0, kcam[c, 1] / zs / sigma, -kcam[c, 1] * p_c[1] / zs ** 2 / sigma
+        jpi[0, 0], jpi[0, 1], jpi[0, 2] = kcam[c, 0] / zs / sg, 0.0, -kcam[c, 0] * p_c[0] / zs ** 2 / sg
+        jpi[1, 0], jpi[1, 1], jpi[1, 2] = 0.0, kcam[c, 1] / zs / sg, -kcam[c, 1] * p_c[1] / zs ** 2 / sg
         for r in range(2):
             for b in range(3):  # jr = jpi R_ic^T
                 jr[r, b] = jpi[r, 0] * r_ic[c, b, 0] + jpi[r, 1] * r_ic[c, b, 1] + jpi[r, 2] * r_ic[c, b, 2]
@@ -669,12 +752,13 @@ def _normal_eqs(r_wi, t_wi, r_ic, t_ic, pts, kf, cam, lm, z, kcam, est, active, 
                 jx[r, 6] = jpi[r, 1] * p_c[2] - jpi[r, 2] * p_c[1]
                 jx[r, 7] = jpi[r, 2] * p_c[0] - jpi[r, 0] * p_c[2]
                 jx[r, 8] = jpi[r, 0] * p_c[1] - jpi[r, 1] * p_c[0]
+                jx[r, 9] = kcam[c, r] * p_c[r] / zs / sg  # f <- f exp(s)
             else:
-                jx[r, 6] = jx[r, 7] = jx[r, 8] = 0.0
+                jx[r, 6] = jx[r, 7] = jx[r, 8] = jx[r, 9] = 0.0
             for b in range(3):
                 jl[r, b] = jr[r, 0] * r_wi[k, b, 0] + jr[r, 1] * r_wi[k, b, 1] + jr[r, 2] * r_wi[k, b, 2]
-        for i in range(9):
-            for j in range(9):
+        for i in range(nx):
+            for j in range(nx):
                 h_xx[o, i, j] = w * (jx[0, i] * jx[0, j] + jx[1, i] * jx[1, j])
             for j in range(3):
                 h_xl[o, i, j] = w * (jx[0, i] * jl[0, j] + jx[1, i] * jl[1, j])
@@ -687,11 +771,36 @@ def _normal_eqs(r_wi, t_wi, r_ic, t_ic, pts, kf, cam, lm, z, kcam, est, active, 
             g_l[l, i] += w * (jl[0, i] * res0 + jl[1, i] * res1)
 
 
+def _reproj_cost(r_wi, t_wi, r_ic, t_ic, pts, kf, cam, lm, z, kcam, active, sigma, huber, e, o0=0, o1=-1):
+    """Reprojection.cost in one pass (plain loops, for numba): fills e, returns the summed Huber cost."""
+    total = 0.0
+    d, p_i = np.zeros(3), np.zeros(3)
+    for o in range(o0, kf.shape[0] if o1 < 0 else o1):
+        k, c, l = kf[o], cam[o], lm[o]
+        for a in range(3):
+            d[a] = pts[l, a] - t_wi[k, a]
+        for a in range(3):
+            p_i[a] = r_wi[k, 0, a] * d[0] + r_wi[k, 1, a] * d[1] + r_wi[k, 2, a] * d[2]
+        for a in range(3):
+            d[a] = p_i[a] - t_ic[c, a]
+        x = r_ic[c, 0, 0] * d[0] + r_ic[c, 1, 0] * d[1] + r_ic[c, 2, 0] * d[2]
+        y = r_ic[c, 0, 1] * d[0] + r_ic[c, 1, 1] * d[1] + r_ic[c, 2, 1] * d[2]
+        zc = r_ic[c, 0, 2] * d[0] + r_ic[c, 1, 2] * d[1] + r_ic[c, 2, 2] * d[2]
+        valid = zc > 0.05
+        zs = zc if valid else 1.0
+        r0 = (kcam[c, 0] * x / zs + kcam[c, 2] - z[o, 0]) / sigma[o]
+        r1 = (kcam[c, 1] * y / zs + kcam[c, 3] - z[o, 1]) / sigma[o]
+        e[o] = np.sqrt(r0 * r0 + r1 * r1)
+        if valid and active[o]:
+            total += 0.5 * e[o] * e[o] if e[o] <= huber else huber * (e[o] - 0.5 * huber)
+    return total
+
+
 def _landmark_m(h_xl, h_ll_inv, lm, m_o):
     """m_o = H_xl H_ll^-1 of each observation's landmark (plain loops, for numba)."""
     for o in range(h_xl.shape[0]):
         l = lm[o]
-        for i in range(9):
+        for i in range(h_xl.shape[1]):
             for j in range(3):
                 m_o[o, i, j] = (h_xl[o, i, 0] * h_ll_inv[l, 0, j] + h_xl[o, i, 1] * h_ll_inv[l, 1, j]
                                 + h_xl[o, i, 2] * h_ll_inv[l, 2, j])
@@ -699,6 +808,32 @@ def _landmark_m(h_xl, h_ll_inv, lm, m_o):
 
 _normal_eqs_jit = njit(nogil=True)(_normal_eqs) if njit is not None else None
 _landmark_m_jit = njit(nogil=True)(_landmark_m) if njit is not None else None
+_reproj_cost_jit = njit(nogil=True)(_reproj_cost) if njit is not None else None
+
+
+def _normal_eqs_chunks(bounds, r_wi, t_wi, r_ic, t_ic, pts, kf, cam, lm, z, kcam, est, active, sigma, huber,
+                       h_xx, h_xl, g_x, h_ll_o, h_ll, g_l):
+    """_normal_eqs on chunks of whole landmarks in parallel (bounds: the first observation of each chunk)."""
+    for ch in prange(bounds.shape[0] - 1):
+        _normal_eqs_jit(r_wi, t_wi, r_ic, t_ic, pts, kf, cam, lm, z, kcam, est, active, sigma, huber,
+                        h_xx, h_xl, g_x, h_ll_o, h_ll, g_l, bounds[ch], bounds[ch + 1])
+
+
+def _reproj_cost_chunks(bounds, r_wi, t_wi, r_ic, t_ic, pts, kf, cam, lm, z, kcam, active, sigma, huber, e):
+    """_reproj_cost on chunks in parallel; the chunk sums add up in order, so the total is reproducible."""
+    part = np.zeros(bounds.shape[0] - 1)
+    for ch in prange(bounds.shape[0] - 1):
+        part[ch] = _reproj_cost_jit(r_wi, t_wi, r_ic, t_ic, pts, kf, cam, lm, z, kcam, active, sigma, huber, e,
+                                    bounds[ch], bounds[ch + 1])
+    total = 0.0
+    for ch in range(part.shape[0]):
+        total += part[ch]
+    return total
+
+
+# the threads come from NUMBA_NUM_THREADS (default: all cores)
+_normal_eqs_par = njit(nogil=True, parallel=True)(_normal_eqs_chunks) if njit is not None else None
+_reproj_cost_par = njit(nogil=True, parallel=True)(_reproj_cost_chunks) if njit is not None else None
 
 
 class Reprojection:
@@ -710,23 +845,32 @@ class Reprojection:
     """
 
     def __init__(self, obs_kf, obs_cam, obs_lm, obs_z, n_lm, cams, est_cams, sigma, huber, band, chunk=400_000,
-                 numpy_pairs=None):
+                 numpy_pairs=None, est_focal=False):
         order = np.lexsort((obs_kf, obs_lm))
         self.kf, self.cam, self.lm, self.z = obs_kf[order], obs_cam[order], obs_lm[order], obs_z[order]
-        self.n_lm, self.sigma, self.huber, self.chunk = n_lm, sigma, huber, chunk
+        self.n_lm, self.huber, self.chunk = n_lm, huber, chunk
+        # pixel noise of each observation (sigma may be one value for all)
+        self.sigma = np.broadcast_to(np.asarray(sigma, np.float64), order.shape)[order].copy()
         self.active = np.ones(len(self.kf), bool)  # observations not rejected as outliers
         for name, i, j in (("fx", 0, 0), ("fy", 1, 1), ("cx", 0, 2), ("cy", 1, 2)):
             setattr(self, name, np.array([c["K"][i, j] for c in cams])[self.cam])
         self.kcam = np.array([[c["K"][0, 0], c["K"][1, 1], c["K"][0, 2], c["K"][1, 2]] for c in cams])
+        self.kcam0 = self.kcam.copy()
         self.est = np.array([c in est_cams for c in range(len(cams))])
         self.ext_slot = np.full(len(cams), -1)
         for i, c in enumerate(est_cams):
             self.ext_slot[c] = i
         self.n_ext = len(est_cams)
+        # parameters per estimated camera: its rotation, and with est_focal its focal length scale s
+        # (f = f_calib exp(s))
+        self.n_par = 4 if est_focal else 3
+        self.foc = np.zeros(len(cams))
         self.band = band
         counts = np.bincount(self.lm, minlength=n_lm)
         start = np.r_[0, np.cumsum(counts)[:-1]]
         self.lm_start = np.r_[0, np.cumsum(counts)].astype(np.int64)  # observations of landmark l: [l], [l + 1]
+        # chunks of whole landmarks for the parallel kernels
+        self.chunks = self.lm_start[np.linspace(0, n_lm, min(64, max(n_lm, 1)) + 1).astype(np.int64)]
         # every ordered pair (a, b) of observations of the same landmark
         m = counts[self.lm]
         pa = np.repeat(np.arange(len(self.lm)), m)
@@ -766,6 +910,13 @@ class Reprojection:
         self.obs_starts = np.flatnonzero(np.r_[True, np.diff(self.kf[self.obs_sort]) != 0])
         self.obs_kfs = self.kf[self.obs_sort][self.obs_starts]
 
+    def set_focal(self, foc):
+        """Focal length scales s per camera (f = f_calib exp(s))."""
+        self.foc = np.asarray(foc, np.float64).copy()
+        self.kcam = self.kcam0.copy()
+        self.kcam[:, 0:2] *= np.exp(self.foc)[:, None]
+        self.fx, self.fy = self.kcam[self.cam, 0], self.kcam[self.cam, 1]
+
     def _project(self, r_wi, t_wi, r_ic, t_ic, pts):
         rw = r_wi[self.kf]
         p_i = np.einsum("nji,nj->ni", rw, pts[self.lm] - t_wi[self.kf])
@@ -774,7 +925,7 @@ class Reprojection:
         valid = p_c[:, 2] > 0.05
         zs = np.where(valid, p_c[:, 2], 1.0)
         res = np.stack([self.fx * p_c[:, 0] / zs + self.cx - self.z[:, 0],
-                        self.fy * p_c[:, 1] / zs + self.cy - self.z[:, 1]], 1) / self.sigma
+                        self.fy * p_c[:, 1] / zs + self.cy - self.z[:, 1]], 1) / self.sigma[:, None]
         return rw, p_i, rci, p_c, zs, valid, res
 
     def _robust(self, res, valid):
@@ -786,6 +937,11 @@ class Reprojection:
         return e, w, cost
 
     def cost(self, r_wi, t_wi, r_ic, t_ic, pts):
+        if _reproj_cost_par is not None:
+            e = np.empty(len(self.kf))
+            total = _reproj_cost_par(self.chunks, r_wi, t_wi, r_ic, t_ic, pts, self.kf, self.cam, self.lm, self.z,
+                                     self.kcam, self.active, self.sigma, self.huber, e)
+            return float(total), e
         *_, valid, res = self._project(r_wi, t_wi, r_ic, t_ic, pts)
         e, _, cost = self._robust(res, valid)
         return float(cost.sum()), e
@@ -797,25 +953,28 @@ class Reprojection:
         jpi[:, 0, 2] = -self.fx * p_c[:, 0] / zs ** 2
         jpi[:, 1, 1] = self.fy / zs
         jpi[:, 1, 2] = -self.fy * p_c[:, 1] / zs ** 2
-        jpi /= self.sigma
+        jpi /= self.sigma[:, None, None]
         jr = jpi @ rci
-        jx = np.zeros((len(zs), 2, 9))
+        jx = np.zeros((len(zs), 2, 6 + self.n_par))
         jx[:, :, 0:3] = jr @ skew(p_i)          # pose rotation
         jx[:, :, 3:6] = -jr                     # pose translation
         jx[:, :, 6:9] = jpi @ skew(p_c)         # extrinsic rotation
-        jx[~self.est[self.cam], :, 6:9] = 0.0
+        if self.n_par == 4:                     # focal length scale
+            jx[:, 0, 9] = self.fx * p_c[:, 0] / zs / self.sigma
+            jx[:, 1, 9] = self.fy * p_c[:, 1] / zs / self.sigma
+        jx[~self.est[self.cam], :, 6:] = 0.0
         jl = jr @ np.transpose(rw, (0, 2, 1))   # landmark
         _, w, _ = self._robust(res, valid)
         return res, jx, jl, w
 
     def normal_equations(self, r_wi, t_wi, r_ic, t_ic, pts):
         """Per observation H_xx, H_xl, g_x and H_ll (weighted), and per landmark H_ll and g_l."""
-        n_o = len(self.kf)
-        h_xx, h_xl, g_x = np.zeros((n_o, 9, 9)), np.zeros((n_o, 9, 3)), np.zeros((n_o, 9))
+        n_o, nx = len(self.kf), 6 + self.n_par
+        h_xx, h_xl, g_x = np.zeros((n_o, nx, nx)), np.zeros((n_o, nx, 3)), np.zeros((n_o, nx))
         h_ll_o, h_ll, g_l = np.zeros((n_o, 3, 3)), np.zeros((self.n_lm, 3, 3)), np.zeros((self.n_lm, 3))
-        if _normal_eqs_jit is not None:
-            _normal_eqs_jit(r_wi, t_wi, r_ic, t_ic, pts, self.kf, self.cam, self.lm, self.z, self.kcam, self.est,
-                            self.active, self.sigma, self.huber, h_xx, h_xl, g_x, h_ll_o, h_ll, g_l)
+        if _normal_eqs_par is not None:
+            _normal_eqs_par(self.chunks, r_wi, t_wi, r_ic, t_ic, pts, self.kf, self.cam, self.lm, self.z, self.kcam,
+                            self.est, self.active, self.sigma, self.huber, h_xx, h_xl, g_x, h_ll_o, h_ll, g_l)
             return h_xx, h_xl, g_x, h_ll_o, h_ll, g_l
         res, jx, jl, w = self.linearize(r_wi, t_wi, r_ic, t_ic, pts)
         wjx, wjl = jx * w[:, None, None], jl * w[:, None, None]
@@ -829,26 +988,34 @@ class Reprojection:
 
 
 def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_rw_scale=1.0, gyro_rw_scale=1.0,
-               prior_rot_sigma=1e-4, omega_coriolis=None):
+               prior_rot_sigma=1e-4, omega_coriolis=None, warmup_s=0.0, warmup_scale=1.0, warmup_accel_scale=1.0):
     """GTSAM values and factors for poses, velocities, biases, the IMU and the gauge priors.
 
     The first keyframe's position is pinned (1e-4 m); its rotation gets prior_rot_sigma (rad). Gravity
     makes roll and pitch observable, so a loose rotation prior lets the solve fix a tilt the VIO got
-    wrong at its start instead of pinning it there.
+    wrong at its start instead of pinning it there. With warmup_s > 0 the gyro bias random walk starts
+    warmup_scale times larger (the accelerometer's warmup_accel_scale times) and decays to its normal
+    value with that time constant (s): the biases still settle while the device warms up after the
+    start of a recording.
     """
     import gtsam
     from gtsam.symbol_shorthand import B, V, X
     vio_ns, vio_p, _ = vio
     imu = np.loadtxt(imu_path, delimiter=",", comments="#")
     imu_ns = imu[:, 0].astype(np.int64)
-    params = gtsam.PreintegrationCombinedParams.MakeSharedU(9.81)
-    params.setAccelerometerCovariance(np.eye(3) * (noise_scale * noise["accel_noise_std"]) ** 2)
-    params.setGyroscopeCovariance(np.eye(3) * (noise_scale * noise["gyro_noise_std"]) ** 2)
-    params.setIntegrationCovariance(np.eye(3) * 1e-8)
-    params.setBiasAccCovariance(np.eye(3) * (accel_rw_scale * noise["accel_bias_std"]) ** 2)
-    params.setBiasOmegaCovariance(np.eye(3) * (gyro_rw_scale * noise["gyro_bias_std"]) ** 2)
-    if omega_coriolis is not None:  # Earth's rotation in the world frame, which the gyroscope also measures
-        params.setOmegaCoriolis(np.asarray(omega_coriolis, float))
+
+    def make_params(gyro_rw, accel_rw=accel_rw_scale):
+        params = gtsam.PreintegrationCombinedParams.MakeSharedU(9.81)
+        params.setAccelerometerCovariance(np.eye(3) * (noise_scale * noise["accel_noise_std"]) ** 2)
+        params.setGyroscopeCovariance(np.eye(3) * (noise_scale * noise["gyro_noise_std"]) ** 2)
+        params.setIntegrationCovariance(np.eye(3) * 1e-8)
+        params.setBiasAccCovariance(np.eye(3) * (accel_rw * noise["accel_bias_std"]) ** 2)
+        params.setBiasOmegaCovariance(np.eye(3) * (gyro_rw * noise["gyro_bias_std"]) ** 2)
+        if omega_coriolis is not None:  # Earth's rotation in the world frame, which the gyroscope also measures
+            params.setOmegaCoriolis(np.asarray(omega_coriolis, float))
+        return params
+
+    params = make_params(gyro_rw_scale)
     graph, values = gtsam.NonlinearFactorGraph(), gtsam.Values()
     imu_factors = []
     zero_bias = gtsam.imuBias.ConstantBias()
@@ -867,8 +1034,12 @@ def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_r
             graph.add(gtsam.PriorFactorConstantBias(B(0), zero_bias, gtsam.noiseModel.Diagonal.Sigmas(
                 np.array([0.1, 0.1, 0.1, 1e-3, 1e-3, 1e-3]))))
     for k in range(n - 1):
-        pim = gtsam.PreintegratedCombinedMeasurements(params, zero_bias)
         ta, tb = kf_ns[k], kf_ns[k + 1]
+        decay = np.exp(-(ta - kf_ns[0]) * 1e-9 / warmup_s) if warmup_s > 0 else 0.0
+        boost = ((warmup_scale - 1.0) * decay, (warmup_accel_scale - 1.0) * decay)
+        pim = gtsam.PreintegratedCombinedMeasurements(
+            make_params(gyro_rw_scale * (1.0 + boost[0]), accel_rw_scale * (1.0 + boost[1]))
+            if max(boost) > 0.01 else params, zero_bias)
         s = max(np.searchsorted(imu_ns, ta, side="right") - 1, 0)
         e = np.searchsorted(imu_ns, tb, side="left")
         for i in range(s, min(e, len(imu_ns) - 1)):
@@ -969,6 +1140,8 @@ def cmd_solve(a):
 
     t0 = time.time()
     kf_ns, offsets, xy, _ = load_features(a.work, desc=False)
+    if a.xy_correction:  # per-keypoint position corrections (px), e.g. for a detector bias
+        xy = xy + np.load(a.xy_correction)["dxy"]
     cams, noise = load_calib(a.calib)
     vio = load_tum(a.vio)
     kf_p, kf_r = keyframe_poses(kf_ns, a.vio)
@@ -977,6 +1150,13 @@ def cmd_solve(a):
     k1 = min(k1, len(kf_ns))
     sel = (m["pairs"][:, 0] >= k0) & (m["pairs"][:, 2] < k1) & (m["pairs"][:, 2] - m["pairs"][:, 0] <= a.max_offset)
     pairs, matches = m["pairs"][sel], m["matches"][sel]
+    if a.max_size_ratio > 0:  # keep the matches whose two keypoints have similar sizes
+        size = load_sizes(a.work)
+        ratio = size[offsets[2 * pairs[:, 2] + pairs[:, 3]] + matches[:, 1]] / \
+            size[offsets[2 * pairs[:, 0] + pairs[:, 1]] + matches[:, 0]]
+        keep = np.abs(np.log(ratio)) <= np.log(a.max_size_ratio)
+        print(f"  {keep.mean() * 100:.1f} % of the matches within a size ratio of {a.max_size_ratio}", flush=True)
+        pairs, matches = pairs[keep], matches[keep]
     if a.loops:  # verified revisit matches from the loops stage
         lm = np.load(os.path.join(a.work, "loops.npz"))
         lsel = (lm["pairs"][:, 0] >= k0) & (lm["pairs"][:, 2] < k1)
@@ -986,7 +1166,7 @@ def cmd_solve(a):
     pts, kept = triangulate(tracks, image_of, xy, kf_p, kf_r, cams, a.max_reproj, a.min_angle)
     kf_ns, kf_p, kf_r = kf_ns[k0:k1], kf_p[k0:k1], kf_r[k0:k1]
     # a landmark keeps the observations within --band keyframes of its first one, a revisit landmark all
-    obs_kf, obs_cam, obs_lm, obs_z = [], [], [], []
+    obs_kf, obs_cam, obs_lm, obs_z, obs_f = [], [], [], [], []
     for j, feats in enumerate(kept):
         k = image_of[feats] // 2
         keep = (k - k.min() <= a.band) | bool(a.loops)
@@ -995,7 +1175,15 @@ def cmd_solve(a):
             obs_cam.append(image_of[feats[keep]] % 2)
             obs_lm.append(np.full(keep.sum(), j))
             obs_z.append(xy[feats[keep]].astype(np.float64))
+            obs_f.append(feats[keep])
     obs_lm = np.concatenate(obs_lm)
+    obs_sigma = np.full(len(obs_lm), a.pixel_sigma)
+    if a.sigma_size > 0:  # a keypoint larger than --sigma-size is located less precisely
+        size = load_sizes(a.work)[np.concatenate(obs_f)]
+        size = np.where(np.isfinite(size), size, a.sigma_size)
+        obs_sigma *= np.maximum(size / a.sigma_size, 1.0) ** a.sigma_size_pow
+        print(f"  pixel sigma by keypoint size: median {np.median(obs_sigma):.2f}, "
+              f"90th percentile {np.percentile(obs_sigma, 90):.2f}", flush=True)
     used = np.unique(obs_lm)
     remap = np.full(len(kept), -1)
     remap[used] = np.arange(len(used))
@@ -1010,15 +1198,19 @@ def cmd_solve(a):
         # an IMU-camera rotation per time segment: camera c in segment s becomes camera c * n_seg + s
         obs_cam = obs_cam * n_seg + seg_of_kf[obs_kf]
         cams = [cams[c] for c in range(2) for _ in range(n_seg)]
+        if a.focal_trend:  # diagnosis: focal lengths changing linearly over the recording (mean unchanged)
+            cams = [dict(cm, K=cm["K"] * np.array([[f, 1, 1], [1, f, 1], [1, 1, 1]])) for cm, f in
+                    zip(cams, [1 + a.focal_trend * ((s + 0.5) / n_seg - 0.5) for _ in range(2) for s in range(n_seg)])]
         est_cams = [c * n_seg + s for c in phys_est for s in range(n_seg)]
         print(f"  {n_seg} time segments per camera rotation", flush=True)
     rp = Reprojection(obs_kf, obs_cam, remap[obs_lm], np.concatenate(obs_z), len(pts), cams, est_cams,
-                      a.pixel_sigma, a.huber, a.band)
+                      obs_sigma, a.huber, a.band, est_focal=a.est_focal)
     omega = [float(v) for v in a.omega_coriolis.split(",")] if a.omega_coriolis else None
     graph, values, index, imu_factors = _imu_graph(kf_ns, kf_p, kf_r, vio, a.imu, noise, a.imu_noise_scale,
-                                                   a.accel_rw_scale, a.gyro_rw_scale, a.prior_rot_sigma, omega)
+                                                   a.accel_rw_scale, a.gyro_rw_scale, a.prior_rot_sigma, omega,
+                                                   a.gyro_rw_warmup, a.gyro_rw_warmup_scale, a.accel_rw_warmup_scale)
     n = len(kf_ns)
-    nb, ne = n * DOF, 3 * rp.n_ext
+    nb, ne, npar = n * DOF, rp.n_par * rp.n_ext, rp.n_par
     modes = [m for m in a.modes.split(",") if m]
     nm = len(modes)
     nz = ne + nm  # border: the camera rotations, then the deformation modes (undamped)
@@ -1034,9 +1226,17 @@ def cmd_solve(a):
     # consecutive time segments of a camera rotate alike, within --ext-seg-sigma
     seg_pairs = [(c * n_seg + s, c * n_seg + s + 1) for c in phys_est for s in range(n_seg - 1)]
     seg_w = 1.0 / np.radians(a.ext_seg_sigma) ** 2
+    # the rotation's three parameters within each camera's slot of the border
+    rot_idx = (np.arange(rp.n_ext)[:, None] * npar + np.arange(3)[None, :]).ravel()
+    foc_w = (1.0 / a.focal_seg_sigma ** 2, 1.0 / a.focal_sigma ** 2,
+             1.0 / a.focal_mean_sigma ** 2 if a.focal_mean_sigma > 0 else 0.0,
+             [[c * n_seg + s for s in range(n_seg)] for c in phys_est])
 
-    def seg_cost(ric):
-        return segment_prior(ric, seg_pairs, rp.ext_slot, rp.n_ext, seg_w)[0]
+    def seg_cost(ric, foc=None):  # the priors on the camera parameters
+        c_ = segment_prior(ric, seg_pairs, rp.ext_slot, rp.n_ext, seg_w)[0]
+        if a.est_focal:
+            c_ += focal_prior(rp.foc if foc is None else foc, seg_pairs, rp.ext_slot, npar, rp.n_ext, *foc_w)[0]
+        return c_
 
     def poses(vals):
         return (np.array([vals.atPose3(X(k)).rotation().matrix() for k in range(n)]),
@@ -1053,7 +1253,7 @@ def cmd_solve(a):
             # drop observations that moved far off, then landmarks left with a single observation;
             # from --outlier-start2 on with the tighter --outlier-px2
             thr = a.outlier_px2 if 0 < a.outlier_px2 and it >= a.outlier_start2 else a.outlier_px
-            bad = rp.active & (rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[1] * a.pixel_sigma > thr)
+            bad = rp.active & (rp.cost(r_wi, t_wi, r_ic, t_ic, pts)[1] * rp.sigma > thr)
             if bad.any():
                 rp.active &= ~bad
                 lone = rp.active & (np.bincount(rp.lm[rp.active], minlength=rp.n_lm)[rp.lm] < 2)
@@ -1092,10 +1292,10 @@ def cmd_solve(a):
                           np.einsum("nij,nj->ni", h_xx[:, 0:6, 0:6], v6) + np.einsum("nij,nj->ni", h_xl[:, 0:6], vlo))
                 np.add.at(hv_l[mi], rp.lm, np.einsum("nji,nj->ni", h_xl[:, 0:6], v6) + np.einsum("nij,nj->ni", h_ll_o, vlo))
                 if ne:
-                    pe = (np.einsum("nji,nj->ni", h_xx[has_o][:, 0:6, 6:9], v6[has_o])
-                          + np.einsum("nij,nj->ni", h_xl[has_o, 6:9], vlo[has_o]))
+                    pe = (np.einsum("nji,nj->ni", h_xx[has_o][:, 0:6, 6:], v6[has_o])
+                          + np.einsum("nij,nj->ni", h_xl[has_o, 6:], vlo[has_o]))
                     for sl in range(rp.n_ext):
-                        hv_e[mi, sl * 3:sl * 3 + 3] = pe[rp.ext_slot[rp.cam[has_o]] == sl].sum(0)
+                        hv_e[mi, sl * npar:sl * npar + npar] = pe[rp.ext_slot[rp.cam[has_o]] == sl].sum(0)
             vhv = vxf @ hv_x.T + np.einsum("mlk,nlk->mn", v_l, hv_l)
             b_x = rhs_imu.copy()
             np.add.at(b_x, (rp.kf * DOF)[:, None] + np.arange(6)[None, :], -g_x[:, 0:6])
@@ -1122,8 +1322,12 @@ def cmd_solve(a):
                                corner, rhs)
             if ne and seg_pairs:
                 _, h_s, b_s = segment_prior(r_ic, seg_pairs, rp.ext_slot, rp.n_ext, seg_w)
-                corner[:ne, :ne] += h_s
-                rhs[nb:nb + ne] += b_s
+                corner[np.ix_(rot_idx, rot_idx)] += h_s
+                rhs[nb + rot_idx] += b_s
+            if ne and a.est_focal:
+                _, h_f, b_f = focal_prior(rp.foc, seg_pairs, rp.ext_slot, npar, rp.n_ext, *foc_w)
+                corner[:ne, :ne] += h_f
+                rhs[nb:nb + ne] += b_f
             ab[0] += lam * ab[0] + 1e-9
             if ne:
                 corner[np.arange(ne), np.arange(ne)] += lam * np.diag(corner)[:ne] + 1e-9
@@ -1136,10 +1340,10 @@ def cmd_solve(a):
                     np.add.at(border[:, ne + mi], (rp.kf * DOF)[:, None] + np.arange(6)[None, :],
                               -np.einsum("nij,nj->ni", h_xl[:, 0:6], q[mi][rp.lm]))
                 if ne:
-                    pe = np.einsum("nij,mnj->mni", h_xl[has, 6:9], q[:, rp.lm[has]])
+                    pe = np.einsum("nij,mnj->mni", h_xl[has, 6:], q[:, rp.lm[has]])
                     ce = hv_e.copy()
                     for sl in range(rp.n_ext):
-                        ce[:, sl * 3:sl * 3 + 3] -= pe[:, rp.ext_slot[rp.cam[has]] == sl].sum(1)
+                        ce[:, sl * npar:sl * npar + npar] -= pe[:, rp.ext_slot[rp.cam[has]] == sl].sum(1)
                     corner[:ne, ne:], corner[ne:, :ne] = ce.T, ce
                 cmm = vhv - np.einsum("mlk,nlk->mn", hv_l, q)
                 corner[ne:, ne:] = cmm + np.diag((mu + 1e-12) * np.abs(np.diag(cmm)) + 1e-12)
@@ -1174,12 +1378,12 @@ def cmd_solve(a):
                 return np.r_[_tri_banded(cfac, w0 - zb @ de0, "T"), de0]
 
             sol = precond(rhs) if len(rp.off_keys) == 0 else _pcg(rp, m_o, h_xl, ab, u, nb, nz, border, corner,
-                                                                    precond, rhs)
+                                                                    precond, rhs, a.pcg_tol, a.pcg_iters)
             dx, de, dk = sol[:nb], sol[nb:nb + ne], sol[nb + ne:]
-            dxo = np.zeros((len(rp.kf), 9))
+            dxo = np.zeros((len(rp.kf), 6 + npar))
             dxo[:, 0:6] = dx.reshape(n, DOF)[rp.kf, 0:6]
             if ne:
-                dxo[has, 6:9] = de.reshape(-1, 3)[slot[has]]
+                dxo[has, 6:] = de.reshape(-1, npar)[slot[has]]
             back = np.zeros((rp.n_lm, 3))
             np.add.at(back, rp.lm, np.einsum("nji,nj->ni", h_xl, dxo))
             if modes_on:
@@ -1189,9 +1393,13 @@ def cmd_solve(a):
             for key, (col, dim) in index.items():
                 vv.insert(key, dx[col:col + dim])
             new_values = values.retract(vv)
-            new_ric = r_ic.copy()
+            new_ric, foc = r_ic.copy(), rp.foc.copy()
+            new_foc = foc.copy()
             for c in est_cams:
-                new_ric[c] = r_ic[c] @ so3_exp(de[rp.ext_slot[c] * 3:rp.ext_slot[c] * 3 + 3])
+                new_ric[c] = r_ic[c] @ so3_exp(de[rp.ext_slot[c] * npar:rp.ext_slot[c] * npar + 3])
+                if a.est_focal:
+                    new_foc[c] += de[rp.ext_slot[c] * npar + 3]
+            rp.set_focal(new_foc)
             new_pts = pts + dl
             nr, nt = poses(new_values)
             if modes_on:  # the modes' share of the step, as exact deformations
@@ -1207,6 +1415,8 @@ def cmd_solve(a):
                     new_values.insert(B(k), gtsam.imuBias.ConstantBias(st[3][k, 0:3], st[3][k, 3:6]))
                 nr, nt, new_pts = st[0], st[1], st[4]
             new_cost = rp.cost(nr, nt, new_ric, t_ic, new_pts)[0] + graph.error(new_values) + seg_cost(new_ric)
+            if new_cost >= cost:
+                rp.set_focal(foc)  # rejected: the focal lengths stay
             if new_cost < cost:
                 rel = (cost - new_cost) / cost
                 values, r_ic, pts, r_wi, t_wi, cost = new_values, new_ric, new_pts, nr, nt, new_cost
@@ -1223,11 +1433,13 @@ def cmd_solve(a):
         for c in phys_est:  # change from the calibration; with segments, the first and the last one
             ch = [np.round(so3_log_deg(cams[c * n_seg]["R_ic"].T @ r_ic[c * n_seg + s]), 3) for s in (0, n_seg - 1)]
             msg += f" | cam{c} rotation {ch[0]}" + (f" .. {ch[1]}" if n_seg > 1 else "")
+            if a.est_focal:
+                msg += f" focal {100 * np.expm1(rp.foc[c * n_seg]):+.3f} .. {100 * np.expm1(rp.foc[c * n_seg + n_seg - 1]):+.3f} %"
         print(msg, flush=True)
         if not accepted or rel < a.rel_tol:
             break
     reproj, err = rp.cost(r_wi, t_wi, r_ic, t_ic, pts)
-    err_px = err[rp.active] * a.pixel_sigma
+    err_px = (err * rp.sigma)[rp.active]
     comp = np.zeros(5)
     for fct in imu_factors:  # whitened IMU residual per component: rotation, position, velocity, biases
         ew = fct.whitenedError(values)
@@ -1242,6 +1454,8 @@ def cmd_solve(a):
         "reprojection_over_4px_percent": float(np.mean(err_px > 4) * 100),
         "imu_residual_per_factor": dict(zip(("rotation", "position", "velocity", "accel_bias", "gyro_bias"),
                                             comp.round(3).tolist())),
+        "focal_change_percent": {f"cam{c}": (100 * np.expm1(rp.foc[c * n_seg:c * n_seg + n_seg])).round(4).tolist()
+                                 for c in phys_est},
         "camera_rotation_change_deg": {  # per time segment with --ext-segments
             f"cam{c}": [so3_log_deg(cams[c * n_seg]["R_ic"].T @ r_ic[c * n_seg + s]).tolist() for s in range(n_seg)]
             if n_seg > 1 else so3_log_deg(cams[c]["R_ic"].T @ r_ic[c]).tolist() for c in phys_est},
@@ -1256,9 +1470,11 @@ def cmd_solve(a):
     write_corrected(a.out, vio, kf_ns, kf_p, kf_r, t_wi, r_wi)
     if a.save_states:  # what loop-correct needs: keyframe poses, landmarks and their observations
         # r_ic per physical camera and time segment (camera c, segment s at c * ext_segments + s)
+        bias = np.array([np.r_[values.atConstantBias(B(k)).accelerometer(), values.atConstantBias(B(k)).gyroscope()]
+                         for k in range(n)])
         np.savez(os.path.splitext(a.out)[0] + "_states.npz", k0=k0, kf_ns=kf_ns, r_wi=r_wi, t_wi=t_wi, r_ic=r_ic,
                  ext_segments=n_seg, pts=pts, obs_kf=rp.kf, obs_cam=rp.cam // n_seg, obs_lm=rp.lm, obs_z=rp.z,
-                 active=rp.active)
+                 active=rp.active, vel=np.array([values.atVector(V(k)) for k in range(n)]), bias=bias, foc=rp.foc)
 
 
 def _tri_banded(cfac, b, trans="N"):
@@ -1281,7 +1497,7 @@ def _forward_border(cfac, border):
     return z
 
 
-def _pcg(rp, m_o, h_xl, ab, u, nb, ne, border, corner, precond, rhs):
+def _pcg(rp, m_o, h_xl, ab, u, nb, ne, border, corner, precond, rhs, tol=1e-9, max_iter=200):
     """Conjugate gradients on the full reduced system; the bordered banded factor preconditions it."""
     blocks = np.zeros((len(rp.off_keys), 6, 6))
     for s in range(0, len(rp.off_a), rp.chunk):
@@ -1310,17 +1526,17 @@ def _pcg(rp, m_o, h_xl, ab, u, nb, ne, border, corner, precond, rhs):
     p = z.copy()
     rz = r @ z
     bnorm = np.linalg.norm(rhs)
-    for it in range(200):
+    for it in range(max_iter):
         ap = operator(p)
         alpha = rz / (p @ ap)
         x += alpha * p
         r -= alpha * ap
-        if np.linalg.norm(r) < 1e-9 * bnorm:
+        if np.linalg.norm(r) < tol * bnorm:
             break
         z = precond(r)
         rz, rz_old = r @ z, rz
         p = z + (rz / rz_old) * p
-    print(f"    pcg: {it + 1} iterations", flush=True)
+    print(f"    pcg: {it + 1} iterations, relative residual {np.linalg.norm(r) / bnorm:.1e}", flush=True)
     return x
 
 
@@ -1341,29 +1557,30 @@ def _schur_add_numpy(rp, m_o, h_xl, h_xx, g_x, g_l, direct, slot, has, n, nb, ne
         low = ii >= jj
         ab[(ii - jj)[low], jj[low]] += vals[low]
     if ne:
-        bsum = np.zeros((n * rp.n_ext, 6, 3))
+        P = rp.n_par
+        bsum = np.zeros((n * rp.n_ext, 6, P))
         for s in range(0, len(rp.bd_a), rp.chunk):
             e = min(s + rp.chunk, len(rp.bd_a))
-            prod = -np.einsum("nij,nkj->nik", m_o[rp.bd_a[s:e], 0:6, :], h_xl[rp.bd_b[s:e], 6:9, :])
+            prod = -np.einsum("nij,nkj->nik", m_o[rp.bd_a[s:e], 0:6, :], h_xl[rp.bd_b[s:e], 6:, :])
             key = rp.bd_key[s:e]
             st = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
             bsum[key[st]] += np.add.reduceat(prod, st, axis=0)
-        np.add.at(bsum, rp.kf[has].astype(np.int64) * rp.n_ext + slot[has], h_xx[has][:, 0:6, 6:9])
+        np.add.at(bsum, rp.kf[has].astype(np.int64) * rp.n_ext + slot[has], h_xx[has][:, 0:6, 6:])
         for sl in range(rp.n_ext):
-            border.reshape(n, DOF, nz)[:, 0:6, sl * 3:sl * 3 + 3] += bsum[sl::rp.n_ext]
-        csum = np.zeros((rp.n_ext, rp.n_ext, 3, 3))
+            border.reshape(n, DOF, nz)[:, 0:6, sl * P:sl * P + P] += bsum[sl::rp.n_ext]
+        csum = np.zeros((rp.n_ext, rp.n_ext, P, P))
         for s in range(0, len(rp.cn_a), rp.chunk):
             e = min(s + rp.chunk, len(rp.cn_a))
-            prod = -np.einsum("nij,nkj->nik", m_o[rp.cn_a[s:e], 6:9, :], h_xl[rp.cn_b[s:e], 6:9, :])
+            prod = -np.einsum("nij,nkj->nik", m_o[rp.cn_a[s:e], 6:, :], h_xl[rp.cn_b[s:e], 6:, :])
             np.add.at(csum, (slot[rp.cn_a[s:e]], slot[rp.cn_b[s:e]]), prod)
-        np.add.at(csum, (slot[has], slot[has]), h_xx[has][:, 6:9, 6:9])
+        np.add.at(csum, (slot[has], slot[has]), h_xx[has][:, 6:, 6:])
         for sa in range(rp.n_ext):
             for sb in range(rp.n_ext):
-                corner[sa * 3:sa * 3 + 3, sb * 3:sb * 3 + 3] = csum[sa, sb]
+                corner[sa * P:sa * P + P, sb * P:sb * P + P] = csum[sa, sb]
     red = -g_x + np.einsum("nij,nj->ni", m_o, g_l[rp.lm])
     np.add.at(rhs, (rp.kf * DOF)[:, None] + np.arange(6)[None, :], red[:, 0:6])
     if ne:
-        np.add.at(rhs, nb + (slot[has] * 3)[:, None] + np.arange(3)[None, :], red[has, 6:9])
+        np.add.at(rhs, nb + (slot[has] * rp.n_par)[:, None] + np.arange(rp.n_par)[None, :], red[has, 6:])
 
 
 def write_corrected(path, vio, kf_ns, kf_p, kf_r, opt_p, opt_r):
@@ -1430,6 +1647,7 @@ def cmd_loop_correct(a):
     t_ic = np.array([c["t_ic"] for c in cams])
     n_seg = int(st["ext_segments"]) if "ext_segments" in st else 1
     seg_of_kf = np.minimum(np.arange(n) * n_seg // n, n_seg - 1)  # as in solve
+    foc = st["foc"] if "foc" in st else np.zeros(2 * n_seg)  # focal length scales of solve --est-focal
     act = st["active"]
     okf, ocam, olm, oz = st["obs_kf"][act], st["obs_cam"][act], st["obs_lm"][act], st["obs_z"][act]
     _, offsets, xy, _ = load_features(a.work, desc=False)
@@ -1448,7 +1666,9 @@ def cmd_loop_correct(a):
         ok = lms >= 0
         if ok.sum() < a.min_inliers:
             return None
-        placed = pnp_body_pose(pts[lms[ok]], xy[f2[ok]].astype(np.float64), cams[c2]["K"],
+        kmat = cams[c2]["K"].copy()
+        kmat[[0, 1], [0, 1]] *= np.exp(foc[c2 * n_seg + seg_of_kf[k2]])
+        placed = pnp_body_pose(pts[lms[ok]], xy[f2[ok]].astype(np.float64), kmat,
                                r_ic[c2 * n_seg + seg_of_kf[k2]], t_ic[c2], r_wi[k2], t_wi[k2], a.min_inliers)
         if placed is None:
             return None
@@ -1515,6 +1735,15 @@ def main():
     f.add_argument("--num-features", type=int, default=1500)
     f.add_argument("--jobs", type=int, default=2)
     f.add_argument("--clahe", action="store_true", help="contrast-limited histogram equalization (low light)")
+    f.add_argument("--denoise", type=float, default=0.0,
+                   help="non-local means denoising strength h before detection (low light, e.g. 7; 0: off)")
+    z = sub.add_parser("sizes", help="keypoint sizes for a features.npz written without them (kp_size.npz)")
+    z.add_argument("--mav0", required=True)
+    z.add_argument("--work", required=True)
+    z.add_argument("--num-features", type=int, default=1500, help="as in features")
+    z.add_argument("--jobs", type=int, default=2)
+    z.add_argument("--clahe", action="store_true", help="as in features")
+    z.add_argument("--denoise", type=float, default=0.0, help="as in features")
     m = sub.add_parser("match", help="VIO-guided epipolar matching between keyframes")
     m.add_argument("--work", required=True)
     m.add_argument("--vio", required=True)
@@ -1559,6 +1788,27 @@ def main():
     s.add_argument("--max-reproj", type=float, default=4.0, help="triangulation inlier threshold (px)")
     s.add_argument("--min-angle", type=float, default=1.0, help="minimum triangulation angle (deg)")
     s.add_argument("--pixel-sigma", type=float, default=1.0)
+    s.add_argument("--sigma-size", type=float, default=0.0,
+                   help="keypoint size (px) up to which an observation has --pixel-sigma; a larger keypoint's "
+                   "sigma grows as (size / this) ** --sigma-size-pow (0: off)")
+    s.add_argument("--sigma-size-pow", type=float, default=1.0)
+    s.add_argument("--xy-correction", default="", help="npz with dxy (px) per keypoint of features.npz, "
+                   "added to the keypoint positions")
+    s.add_argument("--est-focal", action="store_true",
+                   help="also estimate each estimated camera's focal length scale, per time segment")
+    s.add_argument("--focal-seg-sigma", type=float, default=0.0005,
+                   help="prior on the focal length change between consecutive segments (relative)")
+    s.add_argument("--focal-sigma", type=float, default=0.01, help="prior on each focal length scale (relative)")
+    s.add_argument("--focal-mean-sigma", type=float, default=0.0,
+                   help="prior on the mean of each camera's focal length scales over the segments (0: none); "
+                   "a tight one keeps the calibration's focal length on average and lets only its course change")
+    s.add_argument("--focal-trend", type=float, default=0.0,
+                   help="diagnosis: relative focal length change from the first to the last segment")
+    s.add_argument("--pcg-tol", type=float, default=1e-9,
+                   help="relative residual at which conjugate gradients stop (with revisit matches)")
+    s.add_argument("--pcg-iters", type=int, default=200, help="most conjugate-gradient iterations per step")
+    s.add_argument("--max-size-ratio", type=float, default=0.0,
+                   help="drop matches whose keypoint sizes differ by more than this factor (0: keep all)")
     s.add_argument("--huber", type=float, default=2.0, help="Huber threshold in sigmas")
     s.add_argument("--iterations", type=int, default=30)
     s.add_argument("--rel-tol", type=float, default=1e-5)
@@ -1580,6 +1830,13 @@ def main():
                    help="multiplies the calibration's accelerometer and gyroscope noise densities")
     s.add_argument("--accel-rw-scale", type=float, default=1.0, help="multiplies the accel bias random walk")
     s.add_argument("--gyro-rw-scale", type=float, default=1.0, help="multiplies the gyro bias random walk")
+    s.add_argument("--gyro-rw-warmup", type=float, default=0.0,
+                   help="time constant (s) over which a larger gyro bias random walk at the start of the "
+                   "recording decays to the normal one (0: off)")
+    s.add_argument("--gyro-rw-warmup-scale", type=float, default=1000.0,
+                   help="how many times larger the gyro bias random walk is at the start, with --gyro-rw-warmup")
+    s.add_argument("--accel-rw-warmup-scale", type=float, default=1.0,
+                   help="the same for the accelerometer bias random walk, with --gyro-rw-warmup")
     s.add_argument("--loops", action="store_true", help="add the revisit matches of the loops stage")
     s.add_argument("--modes", default="", help="undamped deformation modes of the whole solution: yaw, scale "
                    "(comma-separated); they let LM move along slow drifts the damped steps cannot follow")
@@ -1605,7 +1862,7 @@ def main():
     c.add_argument("--loop-rot-sigma", type=float, default=0.005, help="rad")
     c.add_argument("--loop-pos-sigma", type=float, default=0.1, help="m")
     a = p.parse_args()
-    {"features": cmd_features, "match": cmd_match, "loops": cmd_loops, "solve": cmd_solve,
+    {"features": cmd_features, "sizes": cmd_sizes, "match": cmd_match, "loops": cmd_loops, "solve": cmd_solve,
      "loop-correct": cmd_loop_correct}[a.cmd](a)
 
 

@@ -879,6 +879,8 @@ Score):
 | IMU noise halved (`--imu-noise-scale 0.5`) | 19.22 | −4.24 −2.09 −0.40 +0.43 +0.73 +0.72 |
 | No focal lengths, no keypoint sizes | 18.09 | −4.21 −2.12 −0.44 +0.40 +0.65 +0.47 |
 | The same, one rotation per camera | 18.43 | −4.32 −2.21 −0.52 +0.40 +0.78 +0.64 |
+| Triangulation check 15 px, outliers 30 px (the far observations stay in) | 19.99 | −4.09 −1.89 −0.45 +0.48 +0.82 +0.78 |
+| The same, 3 px only from iteration 15, 40 iterations | 21.09 | −4.07 −1.79 −0.44 +0.52 +1.17 +1.28 |
 | Started with the heading removed (pseudo-GT, diagnosis) | **55.23** | −0.09 −0.09 −0.24 −0.12 +0.40 +0.41 |
 | Started at the pseudo-GT (diagnosis; 30 % of the observations) | **71.82** | +0.28 −0.01 −0.07 −0.18 +0.10 −0.12 |
 

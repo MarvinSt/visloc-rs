@@ -1,12 +1,12 @@
 //! Multi-view stereo on a COLMAP sparse model with undistorted (pinhole)
-//! images: PatchMatch depth maps, geometric-consistency passes, optionally
-//! on an image pyramid, then fusion into `fused.ply`.
+//! images: PatchMatch depth maps, planar prior and geometric-consistency
+//! passes on an image pyramid, then fusion into `fused.ply`.
 //!
 //! ```text
 //! cargo run --release -p visloc-mvs --example mvs -- \
 //!     --sparse <dir with cameras.txt/images.txt/points3D.txt> \
 //!     --images <image dir> --out <dir> [--max-image-size 3200] \
-//!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 1] [--gpu] \
+//!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 3] [--gpu] \
 //!     [--view-selection confidence|sampled] [--init-top-k 3] \
 //!     [--restorer infinity|start|off] [--detail-threshold 0.1] [--no-planar-prior] \
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
@@ -14,10 +14,10 @@
 //!     [--min-mean-consistency 0] [--no-average]
 //! ```
 //!
-//! ACMP's planar prior pass runs between the photometric and the geometric
-//! passes (`--no-planar-prior` leaves it out); `--scales 3` runs it at every
-//! scale of ACMM's multi-scale scheme, as ACMMP does; `--gpu` (a
-//! `--features gpu` build) runs PatchMatch on the GPU.
+//! Three scales in ACMMP's order by default: at every scale a photometric
+//! pass, ACMP's planar prior pass (`--no-planar-prior` leaves it out) and
+//! the geometric passes; `--scales 1` runs one. `--gpu` (a `--features gpu`
+//! build) runs PatchMatch on the GPU.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -37,7 +37,7 @@ fn main() {
     let mut pm_options = PatchMatchOptions::default();
     let fusion_options = FusionOptions::default();
     let mut geom_passes = 2usize;
-    let mut scales = 1usize;
+    let mut scales = 3usize;
     let mut restorer = "infinity".to_owned();
     let mut detail_threshold = 0.1f32;
     let mut use_gpu = false;

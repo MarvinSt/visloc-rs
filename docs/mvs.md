@@ -10,7 +10,7 @@ cargo run --release -p visloc-mvs --features gpu --example mvs -- \
     --sparse <dir with cameras.txt, images.txt, points3D.txt> \
     --images <image dir> --out <dir> --gpu \
     [--max-image-size 3200] [--sources 10] [--iterations 3] \
-    [--geom-passes 2] [--scales 1] [--no-planar-prior] \
+    [--geom-passes 2] [--scales 3] [--no-planar-prior] \
     [--view-selection confidence|sampled]
 ```
 
@@ -45,7 +45,7 @@ from the paper:
   window skips its centre, so where every sample's grey level is far from
   the centre's, all the weights vanish and the pixel does not match.
 - **Planar prior** (ACMP: Q. Xu and W. Tao, "Planar Prior Assisted
-  PatchMatch Multi-View Stereo", AAAI 2020; with one scale by default,
+  PatchMatch Multi-View Stereo", AAAI 2020; at every scale by default,
   `--no-planar-prior` leaves it out). After the photometric pass, each
   view's credible pixels (the lowest-cost pixel of each 5×5 block, if its
   cost is below 0.1) are triangulated in the image (Delaunay). The three
@@ -56,17 +56,33 @@ from the paper:
   `exp(-c²/0.18) · (0.5 + exp(-Δd²/(2σd²)) · exp(-Δθ²/(2σθ²)))`: `c` the
   cost, `Δd` and `Δθ` the depth and normal angle to the prior, `σd` 1/64 of
   the depth range, `σθ` 5°. Where weak texture leaves the costs unable to
-  tell planes apart, the hypothesis closest to the prior wins.
+  tell planes apart, the hypothesis closest to the prior wins. Where a
+  pixel has a prior, the refinement draws its random depth within 3σd of
+  the prior's and its random normal around the prior's, as ACMP's code
+  does.
 - **Geometric consistency** (`--geom-passes`, 2 by default). Further
   passes start from the previous depth maps and add 0.2 times each source
   view's forward-backward reprojection error, truncated at 3 pixels.
-- **Multi-scale** (`--scales 3`). ACMM's pyramid: estimates at a coarser
-  scale are upsampled (joint bilateral, the best-weighted neighbour's plane)
-  and kept where a photometric pass at the finer scale does not beat them
-  by more than 0.1 (the detail restorer), then refined by geometric passes.
-  On ETH3D it helps weakly textured scenes and costs accuracy on detailed
-  ones (below); the example runs one scale by default, and multi-scale
-  runs without the planar prior.
+- **Multi-scale** (three scales by default, `--scales 1` runs one), in the
+  order of ACMMP's released code (Q. Xu, W. Kong, W. Tao and M. Pollefeys,
+  "Multi-Scale Geometric Consistency Guided and Planar Prior Assisted
+  Multi-View Stereo", TPAMI 2022): at every scale of the image pyramid a
+  photometric pass, the planar prior pass and the geometric passes. A
+  finer scale's photometric pass starts from the coarser maps, upsampled
+  (joint bilateral: each pixel takes the plane of the best-weighted coarse
+  neighbour). Its detail restorer lets a pixel leave its upsampled plane
+  only for one whose cost is below that of the plane at infinity (the
+  rotation's homography) by 0.1. Where weak texture leaves every plane
+  about as costly, the coarser estimate stays; elsewhere the pass
+  re-estimates at the finer scale. That is what ACMM's and ACMMP's code
+  compute: their baseline plane is the upsampled depth with no normal.
+  ACMM's paper compares with the upsampled plane's own cost instead
+  (`--restorer start`), which holds planes that are slightly off: on a
+  synthetic plane a start 2% too deep stays 2% too deep, where the plane
+  at infinity lets it converge to within 0.05%. Our first multi-scale
+  scheme, an independent photometric pass at each finer scale kept where
+  it beat the upsampled plane by 0.1, lost accuracy on detailed scenes
+  for that reason (below).
 - **Source views and depth ranges.** Up to 10 source views per image by
   MVSNet's score over the shared sparse points (a Gaussian in the
   triangulation angle around 5°). The depth range comes from the image's
@@ -76,7 +92,11 @@ from the paper:
   angle; the agreeing pixels are averaged into one point and not used
   again. ACMM's and ACMP's code ask for two agreeing views: with these
   depth maps one view scores higher (below), and `--min-consistent 2`
-  restores two.
+  restores two. ACMMP's code also asks the agreeing views to agree well on
+  average (`--min-mean-consistency 0.3`) and keeps the reference pixel's
+  point instead of the average (`--no-average`). On pipes and meadow
+  pre-resized to 800 px the first costs about 10 points of F1 and the
+  second changes it by 0.1 point, so both are off by default.
 
 The GPU path runs the same per-pixel update as compute shaders, with the
 same sampling regions, view selection and random numbers. The source images

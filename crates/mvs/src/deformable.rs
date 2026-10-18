@@ -2,7 +2,8 @@
 //! Deformation for Textureless-Resilient Multi-View Stereo", CVPR 2023),
 //! implemented from the paper and its released code.
 //!
-//! A pass that starts from a depth map first sorts its pixels: a pixel is
+//! A pass sorts its pixels at its end, for the next pass (APD's schedule;
+//! a finer scale starts from the coarser scale's classes): a pixel is
 //! *strong* when its cost along its ray (normal fixed, one disparity step
 //! apart) has one clear minimum near its depth, *weak* otherwise. A weak
 //! pixel looks for strong *anchors* in sectors around it, far if need be,
@@ -68,13 +69,16 @@ pub(crate) const MAX_ANCHORS: usize = 8;
 /// Pixels this close to the border are never sorted or used as anchors.
 const BORDER: usize = 6;
 
-/// How a pixel is matched.
+/// How a deformable pass matches a pixel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Class {
+pub enum Class {
+    /// Matched with its anchors if it has enough coplanar ones, else as a
+    /// strong pixel.
     Weak,
+    /// Matched with its own window; a possible anchor.
     Strong,
-    /// No depth, at the border, or a weak pixel without coplanar anchors:
-    /// matched as a strong pixel, never an anchor.
+    /// No depth or at the border: matched as a strong pixel, never an
+    /// anchor.
     Unknown,
 }
 

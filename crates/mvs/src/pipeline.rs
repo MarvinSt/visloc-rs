@@ -13,7 +13,7 @@
 
 use rayon::prelude::*;
 
-use crate::deformable::Deformable;
+use crate::deformable::{Class, Deformable};
 use crate::patch_match::{DepthMap, DetailRestorer, PatchMatchOptions};
 use crate::planar_prior::{planar_prior, PlanarPrior, PlanarPriorOptions};
 use crate::workspace::{View, Workspace};
@@ -84,10 +84,10 @@ pub type StartEstimator<'a> =
 ///
 /// The earlier maps are released as the pass goes, so it holds about one
 /// set of maps rather than two: their costs at the start, a view's normals
-/// once it is re-estimated, and a view's depths once the last view using
-/// them (itself or as a source) is. So `estimate` may read, for its view,
-/// the earlier depths of the view and of its sources and the view's own
-/// earlier normals, nothing else.
+/// and classes once it is re-estimated, and a view's depths once the last
+/// view using them (itself or as a source) is. So `estimate` may read, for
+/// its view, the earlier depths of the view and of its sources and the
+/// view's own earlier normals and classes, nothing else.
 pub fn geometric_pass(
     ws: &Workspace,
     mut earlier: Vec<DepthMap>,
@@ -104,6 +104,7 @@ pub fn geometric_pass(
     for v in 0..n {
         maps.push(estimate(ws, v, options, Some(&earlier)));
         earlier[v].normal = Vec::new();
+        earlier[v].classes = Vec::new();
         for &s in &last_read_by[v] {
             earlier[s].depth = Vec::new();
         }
@@ -171,12 +172,20 @@ pub fn multi_scale_depth_maps(
     let pm = &options.patch_match;
     // A pass's options at scale `level`: `pass` 0 for the photometric
     // pass, 1 for the planar prior pass, 2 and on for the geometric ones.
+    // A pass followed by a deformable one (every pass from the last at the
+    // coarsest scale to the one before the very last) sorts its pixels for
+    // it, with its own settings.
+    let last_pass = if options.geom_passes > 0 {
+        1 + options.geom_passes
+    } else {
+        usize::from(options.planar_prior.is_some())
+    };
     let pass_options = |level: usize, pass: usize| -> PatchMatchOptions {
         let mut o = pm.clone();
         if pass >= 2 {
             o.iterations = options.geom_iterations;
         }
-        o.deformable = options.deformable.as_ref().filter(|_| level > 0).map(|d| {
+        let settings = options.deformable.as_ref().map(|d| {
             let finest = level + 1 == scales;
             Deformable {
                 sectors: if finest { 32 } else { 16 },
@@ -185,6 +194,14 @@ pub fn multi_scale_depth_maps(
                 ..d.clone()
             }
         });
+        let last = pass == last_pass;
+        let next_deformable = if level == 0 {
+            last && scales > 1
+        } else {
+            !(last && level + 1 == scales)
+        };
+        o.deformable = settings.clone().filter(|_| level > 0);
+        o.sort_pixels = settings.filter(|_| next_deformable);
         o
     };
     // The planar prior and geometric passes of one scale.
@@ -219,8 +236,9 @@ pub fn multi_scale_depth_maps(
 
     let coarsest = current.as_ref().unwrap_or(ws);
     let started = std::time::Instant::now();
+    let coarsest_pm = pass_options(0, 0);
     let maps: Vec<DepthMap> = (0..coarsest.views.len())
-        .map(|v| photometric(coarsest, v, pm, None))
+        .map(|v| photometric(coarsest, v, &coarsest_pm, None))
         .collect();
     log(&format!(
         "scale 0 ({}x{}): photometric {:.1} s",
@@ -308,7 +326,7 @@ pub fn downscale(ws: &Workspace) -> Workspace {
 /// largest bilateral weight (distance in coarse pixels, grey-level
 /// difference in the fine image), evaluated on its own ray. Averaging the
 /// planes' depths instead would bridge depth edges with surfaces that exist
-/// in no view.
+/// in no view. Classes carry over from the nearest coarse pixel (APD-MVS).
 pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
     const RADIUS: i32 = 2;
     const SIGMA_SPATIAL: f32 = 1.0;
@@ -326,10 +344,11 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
         ]
     };
     let fine_gray = fine.gray_levels();
-    // Costs carry over where `map` has them.
+    // Costs and classes carry over where `map` has them.
     let with_costs = !map.cost.is_empty();
-    // Per row: depths, normals, costs.
-    type Row = (Vec<f32>, Vec<[f32; 3]>, Vec<f32>);
+    let with_classes = map.classes.len() == map.width * map.height;
+    // Per row: depths, normals, costs, classes.
+    type Row = (Vec<f32>, Vec<[f32; 3]>, Vec<f32>, Vec<Class>);
     let rows: Vec<Row> = (0..fh)
         .into_par_iter()
         .map(|y| {
@@ -340,12 +359,18 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
             } else {
                 Vec::new()
             };
+            let mut classes = Vec::with_capacity(if with_classes { fw } else { 0 });
             for x in 0..fw {
                 let fine_ray = ray(fine, x as f32 + 0.5, y as f32 + 0.5);
                 let gray = fine_gray[y * fw + x];
                 // The fine pixel's centre in coarse pixel coordinates.
                 let (cxf, cyf) = ((x as f32 + 0.5) * sx - 0.5, (y as f32 + 0.5) * sy - 0.5);
                 let (ci, cj) = (cxf.round() as i32, cyf.round() as i32);
+                if with_classes {
+                    let qi = ci.clamp(0, map.width as i32 - 1) as usize;
+                    let qj = cj.clamp(0, map.height as i32 - 1) as usize;
+                    classes.push(map.classes[qj * map.width + qi]);
+                }
                 // (weight, depth here, normal, coarse pixel) of the best
                 // plane.
                 let mut best: Option<(f32, f32, [f32; 3], usize)> = None;
@@ -393,7 +418,7 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
                     }
                 }
             }
-            (depth, normal, cost)
+            (depth, normal, cost, classes)
         })
         .collect();
     let mut out = DepthMap {
@@ -402,11 +427,13 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
         depth: Vec::with_capacity(fw * fh),
         normal: Vec::with_capacity(fw * fh),
         cost: Vec::with_capacity(if with_costs { fw * fh } else { 0 }),
+        classes: Vec::with_capacity(if with_classes { fw * fh } else { 0 }),
     };
-    for (d, n, c) in rows {
+    for (d, n, c, k) in rows {
         out.depth.extend(d);
         out.normal.extend(n);
         out.cost.extend(c);
+        out.classes.extend(k);
     }
     out
 }
@@ -419,6 +446,31 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 mod tests {
     use super::*;
     use crate::patch_match::{estimate, plane_scene, plane_scene_truth};
+
+    /// Upsampling gives each fine pixel the class of its nearest coarse
+    /// pixel.
+    #[test]
+    fn upsampling_carries_the_classes() {
+        let ws = plane_scene();
+        let fine = &ws.views[0];
+        let coarse = &downscale(&ws).views[0];
+        let mut map = plane_scene_truth(&downscale(&ws), 0);
+        let classes = [Class::Weak, Class::Strong, Class::Unknown];
+        map.classes = (0..map.depth.len()).map(|i| classes[i % 3]).collect();
+        let up = upsample(&map, coarse, fine);
+        assert_eq!(up.classes.len(), fine.width * fine.height);
+        for y in 0..fine.height {
+            for x in 0..fine.width {
+                let q =
+                    (y / 2).min(coarse.height - 1) * coarse.width + (x / 2).min(coarse.width - 1);
+                assert_eq!(
+                    up.classes[y * fine.width + x],
+                    map.classes[q],
+                    "pixel ({x}, {y})"
+                );
+            }
+        }
+    }
 
     /// Releasing the earlier maps during a pass changes nothing: the same
     /// maps as a pass that keeps them all, also when a view's depths are

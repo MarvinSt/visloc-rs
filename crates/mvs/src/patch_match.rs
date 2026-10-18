@@ -103,8 +103,15 @@ pub struct PatchMatchOptions {
     pub median_filter: bool,
     pub seed: u32,
     /// APD-MVS's deformable patches for weak-texture pixels, in passes that
-    /// start from a depth map ([`mod@crate::deformable`]).
+    /// start from a depth map ([`mod@crate::deformable`]): the start map's
+    /// weak pixels, as the pass that made it sorted them
+    /// ([`DepthMap::classes`]), else as sorted at the start.
     pub deformable: Option<Deformable>,
+    /// Sorts the result's pixels with these settings ([`DepthMap::classes`])
+    /// for a following deformable pass: APD-MVS sorts at the end of every
+    /// pass, on the depths it refined, and a finer scale starts from the
+    /// coarser scale's classes.
+    pub sort_pixels: Option<Deformable>,
 }
 
 impl Default for PatchMatchOptions {
@@ -130,6 +137,7 @@ impl Default for PatchMatchOptions {
             median_filter: true,
             seed: 0,
             deformable: None,
+            sort_pixels: None,
         }
     }
 }
@@ -137,7 +145,8 @@ impl Default for PatchMatchOptions {
 /// A view's depths (camera `z`, 0 where there is none), unit normals in the
 /// camera frame and final costs, row-major. The costs are for inspection
 /// only (no pass or fusion reads them); `cost` is empty when they were not
-/// kept.
+/// kept. `classes` sorts the pixels for a following deformable pass
+/// (`PatchMatchOptions::sort_pixels`), empty when they were not sorted.
 #[derive(Debug, Clone)]
 pub struct DepthMap {
     pub width: usize,
@@ -145,11 +154,13 @@ pub struct DepthMap {
     pub depth: Vec<f32>,
     pub normal: Vec<[f32; 3]>,
     pub cost: Vec<f32>,
+    pub classes: Vec<Class>,
 }
 
 impl DepthMap {
     /// Writes the map as raw little-endian data: width and height (`u32`),
-    /// then the depths, normals and the costs if it has them (`f32`).
+    /// then the depths, normals and the costs if it has them (`f32`); not
+    /// the classes.
     pub fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
         if !(self.cost.is_empty() || self.cost.len() == self.depth.len()) {
             return Err(std::io::Error::new(
@@ -208,6 +219,7 @@ impl DepthMap {
             } else {
                 Vec::new()
             },
+            classes: Vec::new(),
         })
     }
 }
@@ -234,15 +246,15 @@ pub fn estimate(
         None => ctx.random_state(),
         Some(maps) => ctx.state_from(&maps[view], None),
     };
-    if let (Some(_), Some(d)) = (prior, &options.deformable) {
-        ctx.anchors = Some(ctx.find_anchors(&state, d));
+    if let (Some(maps), Some(d)) = (prior, &options.deformable) {
+        ctx.anchors = Some(ctx.start_anchors(&state, &maps[view], d));
     }
     for iteration in 0..options.iterations {
         for color in [0, 1] {
             ctx.pass(&mut state, iteration, color);
         }
     }
-    ctx.depth_map(&state)
+    ctx.finish(&state)
 }
 
 /// Which pixels of a photometric pass from a start map (a coarser scale's
@@ -283,7 +295,7 @@ pub fn estimate_from(
     let mut ctx = Context::new(reference, sources, options, view as u32, false);
     let mut state = ctx.state_from(start, None);
     if let Some(d) = &options.deformable {
-        ctx.anchors = Some(ctx.find_anchors(&state, d));
+        ctx.anchors = Some(ctx.start_anchors(&state, start, d));
     }
     ctx.restore = match restorer {
         DetailRestorer::Off => None,
@@ -295,7 +307,7 @@ pub fn estimate_from(
             ctx.pass(&mut state, iteration, color);
         }
     }
-    ctx.depth_map(&state)
+    ctx.finish(&state)
 }
 
 /// ACMP's planar prior assisted pass for `ws.views[view]`, from photometric
@@ -333,14 +345,14 @@ pub fn estimate_with_prior(
     ctx.prior = Some(Prior::new(prior, prior_options, reference.depth_range));
     let mut state = ctx.state_from(start, Some((prior, prior_options.credible_cost)));
     if let Some(d) = &options.deformable {
-        ctx.anchors = Some(ctx.find_anchors(&state, d));
+        ctx.anchors = Some(ctx.start_anchors(&state, start, d));
     }
     for iteration in 0..options.iterations {
         for color in [0, 1] {
             ctx.pass(&mut state, iteration, color);
         }
     }
-    ctx.depth_map(&state)
+    ctx.finish(&state)
 }
 
 /// Per pixel of `map` (a depth map of `ws.views[view]`), the mean of the
@@ -498,6 +510,26 @@ struct RefPatch {
     var: f32,
     /// A weak pixel's anchor windows: its cost is then the deformable one.
     anchors: Option<Box<AnchorPatches>>,
+}
+
+impl RefPatch {
+    /// The window uniformly weighted: APD-MVS sorts pixels with plain NCC,
+    /// whose curve along the ray is smoother than the bilateral one (whose
+    /// colour weights shrink a textured window to a few samples).
+    fn uniform(&self) -> RefPatch {
+        let mut patch = self.clone();
+        let n = self.n as f32;
+        let (mut sum, mut sum_sq) = (0.0f32, 0.0f32);
+        for k in 0..self.n {
+            patch.weights[k] = 1.0;
+            sum += self.values[k];
+            sum_sq += self.values[k] * self.values[k];
+        }
+        patch.sum_w = n;
+        patch.mean = sum / n;
+        patch.var = sum_sq / n - patch.mean * patch.mean;
+        patch
+    }
 }
 
 /// A weak pixel's windows at its anchors: a 3×3 grid 5 pixels apart around
@@ -1428,13 +1460,33 @@ impl<'a> Context<'a> {
         (best_plane, best_cost, views)
     }
 
-    /// APD-MVS's sorting and anchors for `state` (the pass's start): each
-    /// pixel's cost (the mean of its best `init_top_k` views, plus the
+    /// The anchors of a pass from `start`: its classes if the pass that
+    /// made it sorted them, else `state`'s (the pass's start) sorted now.
+    fn start_anchors(&self, state: &State, start: &DepthMap, options: &Deformable) -> Anchors {
+        let (w, h) = (self.reference.width, self.reference.height);
+        if start.classes.len() == w * h {
+            self.find_anchors(state, &start.classes, options)
+        } else {
+            let classes = self.sort_pixels(state, options);
+            self.find_anchors(state, &classes, options)
+        }
+    }
+
+    /// `state`'s depth map, its pixels sorted if the options ask for it.
+    fn finish(&self, state: &State) -> DepthMap {
+        let mut map = self.depth_map(state);
+        if let Some(d) = &self.options.sort_pixels {
+            map.classes = self.sort_pixels(state, d);
+        }
+        map
+    }
+
+    /// APD-MVS's sorting of `state`'s pixels: each pixel's plain-NCC cost
+    /// (the mean of the views it matches best at its depth, plus the
     /// geometric terms in a geometric pass) at `2 sweep + 1` depths one
     /// pseudo-disparity step apart along its ray, normal fixed, sorts it
-    /// ([`deformable::classify`]); a weak pixel keeps the strong anchors its
-    /// sectors find if RANSAC finds enough coplanar ones around it.
-    fn find_anchors(&self, state: &State, options: &Deformable) -> Anchors {
+    /// ([`deformable::classify`]).
+    fn sort_pixels(&self, state: &State, options: &Deformable) -> Vec<Class> {
         let (w, h) = (self.reference.width, self.reference.height);
         let n = self.sources.len();
         let center = self.reference.center();
@@ -1477,6 +1529,7 @@ impl<'a> Context<'a> {
                         sorted.extend((0..n).map(|j| (photo[j] + geo[j], j)));
                         sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
                         let views: Vec<usize> = sorted[..k].iter().map(|&(_, j)| j).collect();
+                        let patch = patch.uniform();
                         let disparity = self.fx * baseline / depth;
                         for (m, cost) in costs.iter_mut().enumerate() {
                             let step = disparity + (m as i32 - options.sweep) as f32;
@@ -1507,7 +1560,15 @@ impl<'a> Context<'a> {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let nearest = deformable::nearest_strong(&classes, w, h, options.nearest_radius);
+        classes
+    }
+
+    /// APD-MVS's anchors: a weak pixel of `classes` keeps the strong
+    /// anchors its sectors find if RANSAC finds enough of them coplanar
+    /// around it (on `state`'s depths).
+    fn find_anchors(&self, state: &State, classes: &[Class], options: &Deformable) -> Anchors {
+        let (w, h) = (self.reference.width, self.reference.height);
+        let nearest = deformable::nearest_strong(classes, w, h, options.nearest_radius);
         let threshold = options.ransac_threshold * (self.depth_max - self.depth_min);
         let point = |i: usize| -> Option<([f32; 2], [f32; 3])> {
             let (x, y) = (i % w, i / w);
@@ -1521,7 +1582,7 @@ impl<'a> Context<'a> {
             .filter_map(|i| {
                 let (x, y) = (i % w, i / w);
                 let sectors =
-                    deformable::sector_anchors((x, y), (w, h), &classes, &nearest, options);
+                    deformable::sector_anchors((x, y), (w, h), classes, &nearest, options);
                 if sectors.len() < 4 {
                     return None;
                 }
@@ -1646,6 +1707,7 @@ pub(crate) fn finish_depth_map(
         depth,
         normal,
         cost,
+        classes: Vec::new(),
     }
 }
 
@@ -1884,6 +1946,7 @@ pub(crate) fn plane_scene_truth(ws: &Workspace, view: usize) -> DepthMap {
         height: v.height,
         normal: vec![n; depth.len()],
         cost: vec![0.0; depth.len()],
+        classes: Vec::new(),
         depth,
     }
 }
@@ -2040,6 +2103,40 @@ mod tests {
             before > 10.0 * after,
             "plain {before} vs deformable {after}"
         );
+    }
+
+    /// A pass with `sort_pixels` sorts its result's pixels, and a
+    /// deformable pass takes its start's classes: from the photometric
+    /// pass's it fills the textureless region, from a start sorted all
+    /// strong it is the plain pass.
+    #[test]
+    fn deformable_passes_take_the_start_classes() {
+        use crate::planar_prior::{mean_relative_error, textureless_scene};
+        let (ws, inner) = textureless_scene();
+        let options = PatchMatchOptions::default();
+        let sorting = PatchMatchOptions {
+            sort_pixels: Some(Deformable::default()),
+            ..options.clone()
+        };
+        let photometric = estimate(&ws, 0, &sorting, None);
+        assert_eq!(photometric.classes.len(), photometric.depth.len());
+        assert!(inner.iter().any(|&i| photometric.classes[i] == Class::Weak));
+        let deformable = PatchMatchOptions {
+            deformable: Some(Deformable::default()),
+            ..options.clone()
+        };
+        let truth = plane_scene_truth(&ws, 0);
+        let with = estimate_from(&ws, 0, &deformable, &photometric, DetailRestorer::Off);
+        let after = mean_relative_error(&with, &truth, &inner);
+        assert!(after < 0.015, "deformable: {after}");
+        assert!(with.classes.is_empty());
+        let all_strong = DepthMap {
+            classes: vec![Class::Strong; photometric.depth.len()],
+            ..photometric.clone()
+        };
+        let plain = estimate_from(&ws, 0, &options, &photometric, DetailRestorer::Off);
+        let strong = estimate_from(&ws, 0, &deformable, &all_strong, DetailRestorer::Off);
+        assert_eq!(strong.depth, plain.depth);
     }
 
     #[test]

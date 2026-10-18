@@ -233,6 +233,22 @@ fn load_patch(x: u32, y: u32) {
     patch_var = sum_sq / sum_w - patch_mean * patch_mean;
 }
 
+// The loaded window uniformly weighted (`RefPatch::uniform`): APD-MVS sorts
+// pixels with plain NCC.
+fn uniform_patch() {
+    var sum = 0.0;
+    var sum_sq = 0.0;
+    for (var k = 0u; k < patch_n; k++) {
+        patch_weights[k] = 1.0;
+        sum += patch_values[k];
+        sum_sq += patch_values[k] * patch_values[k];
+    }
+    let n = f32(patch_n);
+    patch_sum_w = n;
+    patch_mean = sum / n;
+    patch_var = sum_sq / n - patch_mean * patch_mean;
+}
+
 fn plane_depth(plane: vec4<f32>, ray: vec3<f32>) -> f32 {
     let denom = dot(plane.xyz, ray);
     if (denom >= -1e-6) {
@@ -564,8 +580,9 @@ fn classify_curve(curve: ptr<function, array<f32, 61>>, len: u32) -> u32 {
     return WEAK;
 }
 
-// Each pixel's class from its cost (`top_k_cost`) at `2 sweep + 1` depths
-// one pseudo-disparity step apart along its ray, normal fixed.
+// Each pixel's class from its plain-NCC cost (plus the geometric term) over
+// fixed views at `2 sweep + 1` depths one pseudo-disparity step apart along
+// its ray, normal fixed.
 @compute @workgroup_size(16, 8, 1)
 fn classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = gid.x;
@@ -611,6 +628,7 @@ fn classify(@builtin(global_invocation_id) gid: vec3<u32>) {
         views[q] = best;
         taken |= 1u << best;
     }
+    uniform_patch();
     let disparity = params.fx * params.baseline / depth;
     let len = min(u32(2 * params.sweep + 1), MAX_CURVE);
     var curve: array<f32, 61>;

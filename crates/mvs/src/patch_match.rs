@@ -34,6 +34,7 @@ use std::borrow::Cow;
 
 use rayon::prelude::*;
 
+use crate::deformable::{self, Class, Deformable, Draws, MAX_ANCHORS};
 use crate::planar_prior::{PlanarPrior, PlanarPriorOptions};
 use crate::workspace::{View, Workspace};
 
@@ -101,6 +102,16 @@ pub struct PatchMatchOptions {
     /// A 5×5 median filter over the final depths (ACMH).
     pub median_filter: bool,
     pub seed: u32,
+    /// APD-MVS's deformable patches for weak-texture pixels, in passes that
+    /// start from a depth map ([`mod@crate::deformable`]): the start map's
+    /// weak pixels, as the pass that made it sorted them
+    /// ([`DepthMap::classes`]), else as sorted at the start.
+    pub deformable: Option<Deformable>,
+    /// Sorts the result's pixels with these settings ([`DepthMap::classes`])
+    /// for a following deformable pass: APD-MVS sorts at the end of every
+    /// pass, on the depths it refined, and a finer scale starts from the
+    /// coarser scale's classes.
+    pub sort_pixels: Option<Deformable>,
 }
 
 impl Default for PatchMatchOptions {
@@ -125,6 +136,8 @@ impl Default for PatchMatchOptions {
             normal_perturbation: 0.02,
             median_filter: true,
             seed: 0,
+            deformable: None,
+            sort_pixels: None,
         }
     }
 }
@@ -132,7 +145,8 @@ impl Default for PatchMatchOptions {
 /// A view's depths (camera `z`, 0 where there is none), unit normals in the
 /// camera frame and final costs, row-major. The costs are for inspection
 /// only (no pass or fusion reads them); `cost` is empty when they were not
-/// kept.
+/// kept. `classes` sorts the pixels for a following deformable pass
+/// (`PatchMatchOptions::sort_pixels`), empty when they were not sorted.
 #[derive(Debug, Clone)]
 pub struct DepthMap {
     pub width: usize,
@@ -140,11 +154,13 @@ pub struct DepthMap {
     pub depth: Vec<f32>,
     pub normal: Vec<[f32; 3]>,
     pub cost: Vec<f32>,
+    pub classes: Vec<Class>,
 }
 
 impl DepthMap {
     /// Writes the map as raw little-endian data: width and height (`u32`),
-    /// then the depths, normals and the costs if it has them (`f32`).
+    /// then the depths, normals and the costs if it has them (`f32`); not
+    /// the classes.
     pub fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
         if !(self.cost.is_empty() || self.cost.len() == self.depth.len()) {
             return Err(std::io::Error::new(
@@ -203,6 +219,7 @@ impl DepthMap {
             } else {
                 Vec::new()
             },
+            classes: Vec::new(),
         })
     }
 }
@@ -224,17 +241,20 @@ pub fn estimate(
         .take(MAX_SOURCES)
         .map(|&s| Source::new(reference, &ws.views[s], prior.map(|maps| &maps[s])))
         .collect();
-    let ctx = Context::new(reference, sources, options, view as u32, prior.is_some());
+    let mut ctx = Context::new(reference, sources, options, view as u32, prior.is_some());
     let mut state = match prior {
         None => ctx.random_state(),
         Some(maps) => ctx.state_from(&maps[view], None),
     };
+    if let (Some(maps), Some(d)) = (prior, &options.deformable) {
+        ctx.anchors = Some(ctx.start_anchors(&state, &maps[view], d));
+    }
     for iteration in 0..options.iterations {
         for color in [0, 1] {
             ctx.pass(&mut state, iteration, color);
         }
     }
-    ctx.depth_map(&state)
+    ctx.finish(&state)
 }
 
 /// Which pixels of a photometric pass from a start map (a coarser scale's
@@ -274,6 +294,9 @@ pub fn estimate_from(
         .collect();
     let mut ctx = Context::new(reference, sources, options, view as u32, false);
     let mut state = ctx.state_from(start, None);
+    if let Some(d) = &options.deformable {
+        ctx.anchors = Some(ctx.start_anchors(&state, start, d));
+    }
     ctx.restore = match restorer {
         DetailRestorer::Off => None,
         DetailRestorer::Start(margin) => Some((state.cost.clone(), margin)),
@@ -284,7 +307,7 @@ pub fn estimate_from(
             ctx.pass(&mut state, iteration, color);
         }
     }
-    ctx.depth_map(&state)
+    ctx.finish(&state)
 }
 
 /// ACMP's planar prior assisted pass for `ws.views[view]`, from photometric
@@ -321,12 +344,15 @@ pub fn estimate_with_prior(
     let mut ctx = Context::new(reference, sources, options, view as u32, false);
     ctx.prior = Some(Prior::new(prior, prior_options, reference.depth_range));
     let mut state = ctx.state_from(start, Some((prior, prior_options.credible_cost)));
+    if let Some(d) = &options.deformable {
+        ctx.anchors = Some(ctx.start_anchors(&state, start, d));
+    }
     for iteration in 0..options.iterations {
         for color in [0, 1] {
             ctx.pass(&mut state, iteration, color);
         }
     }
-    ctx.depth_map(&state)
+    ctx.finish(&state)
 }
 
 /// Per pixel of `map` (a depth map of `ws.views[view]`), the mean of the
@@ -472,6 +498,7 @@ impl<'a> Source<'a> {
 /// The reference window around one pixel: sample offsets, grey levels
 /// (minus the centre's, which NCC ignores and which keeps the f32 sums
 /// accurate), bilateral weights and weighted statistics.
+#[derive(Clone)]
 struct RefPatch {
     n: usize,
     offsets: [(f32, f32); MAX_SAMPLES],
@@ -481,6 +508,52 @@ struct RefPatch {
     sum_w: f32,
     mean: f32,
     var: f32,
+    /// A weak pixel's anchor windows: its cost is then the deformable one.
+    anchors: Option<Box<AnchorPatches>>,
+}
+
+impl RefPatch {
+    /// The window uniformly weighted: APD-MVS sorts pixels with plain NCC,
+    /// whose curve along the ray is smoother than the bilateral one (whose
+    /// colour weights shrink a textured window to a few samples).
+    fn uniform(&self) -> RefPatch {
+        let mut patch = self.clone();
+        let n = self.n as f32;
+        let (mut sum, mut sum_sq) = (0.0f32, 0.0f32);
+        for k in 0..self.n {
+            patch.weights[k] = 1.0;
+            sum += self.values[k];
+            sum_sq += self.values[k] * self.values[k];
+        }
+        patch.sum_w = n;
+        patch.mean = sum / n;
+        patch.var = sum_sq / n - patch.mean * patch.mean;
+        patch
+    }
+}
+
+/// A weak pixel's windows at its anchors: a 3×3 grid 5 pixels apart around
+/// each (offsets from the pixel), uniformly weighted.
+#[derive(Clone)]
+struct AnchorPatches {
+    count: usize,
+    offsets: [[(f32, f32); ANCHOR_SAMPLES]; MAX_ANCHORS],
+    /// Grey levels minus each window's centre.
+    values: [[f32; ANCHOR_SAMPLES]; MAX_ANCHORS],
+    centers: [f32; MAX_ANCHORS],
+    means: [f32; MAX_ANCHORS],
+    vars: [f32; MAX_ANCHORS],
+    center_weight: f32,
+}
+
+/// Samples of an anchor window.
+const ANCHOR_SAMPLES: usize = 9;
+
+/// Per pixel of a pass, the anchors of the weak pixels that have them.
+struct Anchors {
+    /// Index into `sets`, `u32::MAX` for a pixel matched as strong.
+    index: Vec<u32>,
+    sets: Vec<Vec<u32>>,
 }
 
 /// A planar prior pass's prior and the terms of ACMP's posterior.
@@ -557,6 +630,8 @@ struct Context<'a> {
     /// takes a new plane only if its cost is below its baseline by the
     /// margin.
     restore: Option<(Vec<f32>, f32)>,
+    /// The weak pixels' anchors when the pass has deformable patches.
+    anchors: Option<Anchors>,
     fx: f32,
     fy: f32,
     cx: f32,
@@ -604,6 +679,7 @@ impl<'a> Context<'a> {
             geometric,
             prior: None,
             restore: None,
+            anchors: None,
             fx: reference.fx as f32,
             fy: reference.fy as f32,
             cx: reference.cx as f32,
@@ -635,6 +711,7 @@ impl<'a> Context<'a> {
             sum_w: 0.0,
             mean: 0.0,
             var: 0.0,
+            anchors: None,
         };
         let inv_color = 1.0 / (2.0 * self.options.sigma_color * self.options.sigma_color);
         let inv_spatial = 1.0 / (2.0 * self.options.sigma_spatial * self.options.sigma_spatial);
@@ -662,17 +739,17 @@ impl<'a> Context<'a> {
         patch
     }
 
-    /// One minus the bilateral NCC of `plane` at the pixel of `patch` (ray
-    /// `ray`) in `source`.
-    fn photometric_cost(
+    /// The plane's homography in camera rays for `source` as the image of
+    /// the pixel's ray and of unit pixel steps in x and y, `None` when the
+    /// pixel's ray maps behind the source camera or outside its image.
+    fn warp(
         &self,
-        patch: &RefPatch,
         source: &Source<'_>,
         ray: [f32; 3],
         plane: &Plane,
-    ) -> f32 {
-        if patch.var < 1e-5 || plane.rho.abs() < 1e-12 {
-            return MAX_COST;
+    ) -> Option<([f32; 3], [f32; 3], [f32; 3])> {
+        if plane.rho.abs() < 1e-12 {
+            return None;
         }
         // A plane point X maps to R X + t = (R + t nᵀ / rho) X: the
         // homography in camera rays, applied to the ray of each sample
@@ -688,42 +765,130 @@ impl<'a> Context<'a> {
         let bx = [m[0][0] / self.fx, m[1][0] / self.fx, m[2][0] / self.fx];
         let by = [m[0][1] / self.fy, m[1][1] / self.fy, m[2][1] / self.fy];
         let view = source.view;
-        let (w, h) = (view.width as f32, view.height as f32);
         if a[2] <= 0.0 {
-            return MAX_COST;
+            return None;
         }
         let cx_s = source.fx * a[0] / a[2] + source.cx;
         let cy_s = source.fy * a[1] / a[2] + source.cy;
-        if !(0.0..w).contains(&cx_s) || !(0.0..h).contains(&cy_s) {
-            return MAX_COST;
+        if !(0.0..view.width as f32).contains(&cx_s) || !(0.0..view.height as f32).contains(&cy_s) {
+            return None;
         }
-        let (mut s_w, mut s_ww, mut s_rw) = (0.0f32, 0.0f32, 0.0f32);
-        for k in 0..patch.n {
-            let (dx, dy) = patch.offsets[k];
+        Some((a, bx, by))
+    }
+
+    /// One minus the bilateral NCC of `plane` at the pixel of `patch` (ray
+    /// `ray`) in `source`; for a weak pixel with anchors, the deformable
+    /// cost: `center_weight` times that plus the rest times the anchor
+    /// windows' mean (APD-MVS), all warped by `plane`.
+    fn photometric_cost(
+        &self,
+        patch: &RefPatch,
+        source: &Source<'_>,
+        ray: [f32; 3],
+        plane: &Plane,
+    ) -> f32 {
+        let Some((a, bx, by)) = self.warp(source, ray, plane) else {
+            return MAX_COST;
+        };
+        let sample = |dx: f32, dy: f32| -> Option<f32> {
             let p = [
                 a[0] + dx * bx[0] + dy * by[0],
                 a[1] + dx * bx[1] + dy * by[1],
                 a[2] + dx * bx[2] + dy * by[2],
             ];
             if p[2] <= 0.0 {
-                return MAX_COST;
+                return None;
             }
             let u = source.fx * p[0] / p[2] + source.cx;
             let v = source.fy * p[1] / p[2] + source.cy;
-            let value = bilinear(&source.gray, view.width, view.height, u, v) - patch.center;
-            let weight = patch.weights[k];
-            s_w += weight * value;
-            s_ww += weight * value * value;
-            s_rw += weight * patch.values[k] * value;
+            Some(bilinear(
+                &source.gray,
+                source.view.width,
+                source.view.height,
+                u,
+                v,
+            ))
+        };
+        let center = if patch.var < 1e-5 {
+            MAX_COST
+        } else {
+            let (mut s_w, mut s_ww, mut s_rw) = (0.0f32, 0.0f32, 0.0f32);
+            let mut ok = true;
+            for k in 0..patch.n {
+                let (dx, dy) = patch.offsets[k];
+                let Some(gray) = sample(dx, dy) else {
+                    ok = false;
+                    break;
+                };
+                let value = gray - patch.center;
+                let weight = patch.weights[k];
+                s_w += weight * value;
+                s_ww += weight * value * value;
+                s_rw += weight * patch.values[k] * value;
+            }
+            let mean = s_w / patch.sum_w;
+            let var = s_ww / patch.sum_w - mean * mean;
+            if !ok || var < 1e-5 {
+                MAX_COST
+            } else {
+                let cov = s_rw / patch.sum_w - patch.mean * mean;
+                (1.0 - cov / (patch.var * var).sqrt()).clamp(0.0, MAX_COST)
+            }
+        };
+        let Some(anchors) = &patch.anchors else {
+            return center;
+        };
+        let (w, h) = (source.view.width as f32, source.view.height as f32);
+        let mut sum = 0.0f32;
+        for k in 0..anchors.count {
+            let (mut s, mut ss, mut sr) = (0.0f32, 0.0f32, 0.0f32);
+            let mut cost = MAX_COST;
+            let mut ok = anchors.vars[k] >= 1e-5;
+            for (m, &(dx, dy)) in anchors.offsets[k].iter().enumerate() {
+                if !ok {
+                    break;
+                }
+                // An anchor window leaving the source image costs the
+                // maximum.
+                let p = [
+                    a[0] + dx * bx[0] + dy * by[0],
+                    a[1] + dx * bx[1] + dy * by[1],
+                    a[2] + dx * bx[2] + dy * by[2],
+                ];
+                let (u, v) = if p[2] > 0.0 {
+                    (
+                        source.fx * p[0] / p[2] + source.cx,
+                        source.fy * p[1] / p[2] + source.cy,
+                    )
+                } else {
+                    (-1.0, -1.0)
+                };
+                if !(0.0..w).contains(&u) || !(0.0..h).contains(&v) {
+                    ok = false;
+                    break;
+                }
+                let value = bilinear(&source.gray, source.view.width, source.view.height, u, v)
+                    - anchors.centers[k];
+                s += value;
+                ss += value * value;
+                sr += anchors.values[k][m] * value;
+            }
+            if ok {
+                let n = ANCHOR_SAMPLES as f32;
+                let mean = s / n;
+                let var = ss / n - mean * mean;
+                if var >= 1e-5 {
+                    let cov = sr / n - anchors.means[k] * mean;
+                    cost = (1.0 - cov / (anchors.vars[k] * var).sqrt()).clamp(0.0, MAX_COST);
+                }
+            }
+            sum += cost;
         }
-        let mean = s_w / patch.sum_w;
-        let var = s_ww / patch.sum_w - mean * mean;
-        if var < 1e-5 {
-            return MAX_COST;
+        if anchors.count == 0 {
+            return center;
         }
-        let cov = s_rw / patch.sum_w - patch.mean * mean;
-        let ncc = cov / (patch.var * var).sqrt();
-        (1.0 - ncc).clamp(0.0, MAX_COST)
+        anchors.center_weight * center
+            + (1.0 - anchors.center_weight) * (sum / anchors.count as f32).min(MAX_COST)
     }
 
     /// Forward-backward reprojection error of `plane` at pixel `(x, y)`
@@ -1001,12 +1166,35 @@ impl<'a> Context<'a> {
             return (state.plane[i], MAX_COST, state.views[i]);
         }
         let ray = self.ray(x, y);
-        let patch = self.ref_patch(x, y);
+        let mut patch = self.ref_patch(x, y);
+        // A weak pixel with anchors: matched with its deformable patch, its
+        // candidates the anchors' planes (APD-MVS).
+        let anchors = self.anchors.as_ref().and_then(|a| {
+            let k = a.index[i];
+            (k != u32::MAX).then(|| a.sets[k as usize].as_slice())
+        });
+        let plain = anchors.map(|_| patch.clone());
+        if let (Some(set), Some(options)) = (anchors, &self.options.deformable) {
+            patch.anchors = Some(Box::new(self.anchor_patches(
+                x,
+                y,
+                set,
+                options.center_weight,
+            )));
+        }
 
         // Adaptive checkerboard sampling: the lowest-cost plane of each of
         // the eight regions (other colour, inside the image).
         let mut candidates: [Option<Plane>; 8] = [None; 8];
+        if let Some(set) = anchors {
+            for (candidate, &a) in candidates.iter_mut().zip(set) {
+                *candidate = Some(state.plane[a as usize]);
+            }
+        }
         for (region, offsets) in sampling_regions().iter().enumerate() {
+            if anchors.is_some() {
+                break;
+            }
             let mut best: Option<(f32, usize)> = None;
             for &(dx, dy) in offsets.iter() {
                 let (sx, sy) = (x as i32 + dx, y as i32 + dy);
@@ -1199,6 +1387,45 @@ impl<'a> Context<'a> {
             (depth_now, normal_perturbed),
             (depth_perturbed, normal_perturbed),
         ];
+        // A weak pixel first tries the plane fitted to its anchors' depths.
+        if let Some(set) = anchors {
+            let w_ref = self.reference.width;
+            let points: Vec<([f32; 2], [f32; 3])> = set
+                .iter()
+                .filter_map(|&a| {
+                    let (ax, ay) = (a as usize % w_ref, a as usize / w_ref);
+                    let r = self.ray(ax, ay);
+                    let d = state.plane[a as usize].depth(r)?;
+                    Some(([ax as f32, ay as f32], [r[0] * d, r[1] * d, d]))
+                })
+                .collect();
+            let mut draws = Draws::new(rng.0 | 1);
+            if let Some((n, w0)) =
+                deformable::fitted_plane([x as f32, y as f32], &points, &mut draws)
+            {
+                // n · X + w0 = 0 is n · X = rho with rho = -w0, the normal
+                // facing the camera.
+                let mut plane = Plane { n, rho: -w0 };
+                if dot(plane.n, ray) > 0.0 {
+                    plane = Plane {
+                        n: [-n[0], -n[1], -n[2]],
+                        rho: w0,
+                    };
+                }
+                if let Some(depth) = plane.depth(ray) {
+                    if (self.depth_min..=self.depth_max).contains(&depth) {
+                        let cost =
+                            self.weighted_cost(&patch, (x, y), ray, &plane, &weights, weight_sum);
+                        let hypothesis_score = score(cost, &plane);
+                        if hypothesis_score > best_score {
+                            best_cost = cost;
+                            best_score = hypothesis_score;
+                            best_plane = plane;
+                        }
+                    }
+                }
+            }
+        }
         for (depth, normal) in hypotheses {
             if !(self.depth_min..=self.depth_max).contains(&depth) {
                 continue;
@@ -1212,12 +1439,220 @@ impl<'a> Context<'a> {
                 best_plane = plane;
             }
         }
+        if let Some(plain) = &plain {
+            // A weak pixel keeps the plain cost, which its neighbours'
+            // sampling compares. Under the detail restorer, whose baseline
+            // the plain cost cannot beat in weak texture, it takes a new
+            // plane only if its deformable cost beats its start plane's by
+            // the margin (APD's first pass at a finer scale).
+            let plane = match &self.restore {
+                Some((_, margin)) if best_cost >= current_cost - margin => current,
+                _ => best_plane,
+            };
+            let cost = self.weighted_cost(plain, (x, y), ray, &plane, &weights, weight_sum);
+            return (plane, cost, views);
+        }
         if let Some((baseline, margin)) = &self.restore {
             if best_cost >= baseline[i] - margin {
                 return (current, current_cost, views);
             }
         }
         (best_plane, best_cost, views)
+    }
+
+    /// The anchors of a pass from `start`: its classes if the pass that
+    /// made it sorted them, else `state`'s (the pass's start) sorted now.
+    fn start_anchors(&self, state: &State, start: &DepthMap, options: &Deformable) -> Anchors {
+        let (w, h) = (self.reference.width, self.reference.height);
+        if start.classes.len() == w * h {
+            self.find_anchors(state, &start.classes, options)
+        } else {
+            let classes = self.sort_pixels(state, options);
+            self.find_anchors(state, &classes, options)
+        }
+    }
+
+    /// `state`'s depth map, its pixels sorted if the options ask for it.
+    fn finish(&self, state: &State) -> DepthMap {
+        let mut map = self.depth_map(state);
+        if let Some(d) = &self.options.sort_pixels {
+            map.classes = self.sort_pixels(state, d);
+        }
+        map
+    }
+
+    /// APD-MVS's sorting of `state`'s pixels: each pixel's plain-NCC cost
+    /// (the mean of the views it matches best at its depth, plus the
+    /// geometric terms in a geometric pass) at `2 sweep + 1` depths one
+    /// pseudo-disparity step apart along its ray, normal fixed, sorts it
+    /// ([`deformable::classify`]).
+    fn sort_pixels(&self, state: &State, options: &Deformable) -> Vec<Class> {
+        let (w, h) = (self.reference.width, self.reference.height);
+        let n = self.sources.len();
+        let center = self.reference.center();
+        let baseline = if n == 0 {
+            0.0
+        } else {
+            self.sources
+                .iter()
+                .map(|s| (s.view.center() - center).norm() as f32)
+                .sum::<f32>()
+                / n as f32
+        };
+        let k = self.options.init_top_k.clamp(1, n.max(1));
+        let border = 6;
+        let classes: Vec<Class> = (0..h)
+            .into_par_iter()
+            .flat_map_iter(|y| {
+                let (mut photo, mut geo) = ([0.0; MAX_SOURCES], [0.0; MAX_SOURCES]);
+                let mut costs = vec![0.0f32; (2 * options.sweep + 1) as usize];
+                let mut sorted = Vec::with_capacity(n);
+                (0..w)
+                    .map(|x| {
+                        if n == 0 || x < border || y < border || x + border >= w || y + border >= h
+                        {
+                            return Class::Unknown;
+                        }
+                        let i = y * w + x;
+                        let ray = self.ray(x, y);
+                        let plane = state.plane[i];
+                        let Some(depth) = plane.depth(ray) else {
+                            return Class::Unknown;
+                        };
+                        let patch = self.ref_patch(x, y);
+                        // The curve's views: the best `init_top_k` at the
+                        // pixel's depth, the same at every depth (APD keeps
+                        // the pixel's selected views; a best-k at each depth
+                        // is a lower envelope with spurious minima).
+                        self.view_costs(&patch, (x, y), ray, &plane, (&mut photo, &mut geo));
+                        sorted.clear();
+                        sorted.extend((0..n).map(|j| (photo[j] + geo[j], j)));
+                        sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                        let views: Vec<usize> = sorted[..k].iter().map(|&(_, j)| j).collect();
+                        let patch = patch.uniform();
+                        let disparity = self.fx * baseline / depth;
+                        for (m, cost) in costs.iter_mut().enumerate() {
+                            let step = disparity + (m as i32 - options.sweep) as f32;
+                            let d = self.fx * baseline / step;
+                            *cost =
+                                if step <= 0.0 || !(self.depth_min..=self.depth_max).contains(&d) {
+                                    MAX_COST
+                                } else {
+                                    let p = Plane::from_depth(d, plane.n, ray);
+                                    let total: f32 = views
+                                        .iter()
+                                        .map(|&j| {
+                                            let source = &self.sources[j];
+                                            let geo = if self.geometric {
+                                                self.options.geom_lambda
+                                                    * self.reprojection_error(source, x, y, ray, &p)
+                                            } else {
+                                                0.0
+                                            };
+                                            self.photometric_cost(&patch, source, ray, &p) + geo
+                                        })
+                                        .sum();
+                                    (total / k as f32).min(MAX_COST)
+                                };
+                        }
+                        deformable::classify(&costs, options)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        classes
+    }
+
+    /// APD-MVS's anchors: a weak pixel of `classes` keeps the strong
+    /// anchors its sectors find if RANSAC finds enough of them coplanar
+    /// around it (on `state`'s depths).
+    fn find_anchors(&self, state: &State, classes: &[Class], options: &Deformable) -> Anchors {
+        let (w, h) = (self.reference.width, self.reference.height);
+        let nearest = deformable::nearest_strong(classes, w, h, options.nearest_radius);
+        let threshold = options.ransac_threshold * (self.depth_max - self.depth_min);
+        let point = |i: usize| -> Option<([f32; 2], [f32; 3])> {
+            let (x, y) = (i % w, i / w);
+            let ray = self.ray(x, y);
+            let d = state.plane[i].depth(ray)?;
+            Some(([x as f32, y as f32], [ray[0] * d, ray[1] * d, d]))
+        };
+        let found: Vec<(usize, Vec<u32>)> = (0..w * h)
+            .into_par_iter()
+            .filter(|&i| classes[i] == Class::Weak)
+            .filter_map(|i| {
+                let (x, y) = (i % w, i / w);
+                let sectors =
+                    deformable::sector_anchors((x, y), (w, h), classes, &nearest, options);
+                if sectors.len() < 4 {
+                    return None;
+                }
+                let center = point(i)?;
+                let (pixels, points): (Vec<usize>, Vec<_>) = sectors
+                    .iter()
+                    .filter_map(|&a| point(a).map(|p| (a, p)))
+                    .unzip();
+                let mut draws =
+                    Draws::new(self.options.seed ^ (i as u32).wrapping_mul(0x9E37_79B9));
+                let kept = deformable::coplanar_anchors(
+                    center,
+                    &points,
+                    threshold,
+                    options.min_inliers,
+                    &mut draws,
+                )?;
+                Some((i, kept.into_iter().map(|m| pixels[m] as u32).collect()))
+            })
+            .collect();
+        let mut index = vec![u32::MAX; w * h];
+        let mut sets = Vec::with_capacity(found.len());
+        for (i, set) in found {
+            index[i] = sets.len() as u32;
+            sets.push(set);
+        }
+        Anchors { index, sets }
+    }
+
+    /// The anchor windows of pixel `(x, y)` at `anchors` (pixel indices).
+    fn anchor_patches(
+        &self,
+        x: usize,
+        y: usize,
+        anchors: &[u32],
+        center_weight: f32,
+    ) -> AnchorPatches {
+        let (w, h) = (self.reference.width, self.reference.height);
+        let mut patches = AnchorPatches {
+            count: anchors.len().min(MAX_ANCHORS),
+            offsets: [[(0.0, 0.0); ANCHOR_SAMPLES]; MAX_ANCHORS],
+            values: [[0.0; ANCHOR_SAMPLES]; MAX_ANCHORS],
+            centers: [0.0; MAX_ANCHORS],
+            means: [0.0; MAX_ANCHORS],
+            vars: [0.0; MAX_ANCHORS],
+            center_weight,
+        };
+        for (k, &a) in anchors.iter().take(MAX_ANCHORS).enumerate() {
+            let (ax, ay) = ((a as usize % w) as i32, (a as usize / w) as i32);
+            let center = self.gray[a as usize];
+            let (mut s, mut ss) = (0.0f32, 0.0f32);
+            let mut m = 0;
+            for dy in [-5i32, 0, 5] {
+                for dx in [-5i32, 0, 5] {
+                    let sx = (ax + dx).clamp(0, w as i32 - 1);
+                    let sy = (ay + dy).clamp(0, h as i32 - 1);
+                    let value = self.gray[sy as usize * w + sx as usize] - center;
+                    patches.offsets[k][m] = ((sx - x as i32) as f32, (sy - y as i32) as f32);
+                    patches.values[k][m] = value;
+                    s += value;
+                    ss += value * value;
+                    m += 1;
+                }
+            }
+            let n = ANCHOR_SAMPLES as f32;
+            patches.centers[k] = center;
+            patches.means[k] = s / n;
+            patches.vars[k] = ss / n - (s / n) * (s / n);
+        }
+        patches
     }
 
     fn depth_map(&self, state: &State) -> DepthMap {
@@ -1272,6 +1707,7 @@ pub(crate) fn finish_depth_map(
         depth,
         normal,
         cost,
+        classes: Vec::new(),
     }
 }
 
@@ -1510,6 +1946,7 @@ pub(crate) fn plane_scene_truth(ws: &Workspace, view: usize) -> DepthMap {
         height: v.height,
         normal: vec![n; depth.len()],
         cost: vec![0.0; depth.len()],
+        classes: Vec::new(),
         depth,
     }
 }
@@ -1641,6 +2078,65 @@ mod tests {
             let error = error(restorer);
             assert!(error < 0.002, "{restorer:?}: {error}");
         }
+    }
+
+    /// A pass with deformable patches from the photometric map fills a
+    /// textureless region, whose pixels match their textured anchors under
+    /// the plane, where a plain pass leaves it wrong.
+    #[test]
+    fn deformable_patches_fill_a_textureless_region() {
+        use crate::planar_prior::{mean_relative_error, textureless_scene};
+        let (ws, inner) = textureless_scene();
+        let options = PatchMatchOptions::default();
+        let photometric = estimate(&ws, 0, &options, None);
+        let deformable = PatchMatchOptions {
+            deformable: Some(Deformable::default()),
+            ..options.clone()
+        };
+        let truth = plane_scene_truth(&ws, 0);
+        let plain = estimate_from(&ws, 0, &options, &photometric, DetailRestorer::Off);
+        let with = estimate_from(&ws, 0, &deformable, &photometric, DetailRestorer::Off);
+        let before = mean_relative_error(&plain, &truth, &inner);
+        let after = mean_relative_error(&with, &truth, &inner);
+        assert!(after < 0.015, "deformable: {after}");
+        assert!(
+            before > 10.0 * after,
+            "plain {before} vs deformable {after}"
+        );
+    }
+
+    /// A pass with `sort_pixels` sorts its result's pixels, and a
+    /// deformable pass takes its start's classes: from the photometric
+    /// pass's it fills the textureless region, from a start sorted all
+    /// strong it is the plain pass.
+    #[test]
+    fn deformable_passes_take_the_start_classes() {
+        use crate::planar_prior::{mean_relative_error, textureless_scene};
+        let (ws, inner) = textureless_scene();
+        let options = PatchMatchOptions::default();
+        let sorting = PatchMatchOptions {
+            sort_pixels: Some(Deformable::default()),
+            ..options.clone()
+        };
+        let photometric = estimate(&ws, 0, &sorting, None);
+        assert_eq!(photometric.classes.len(), photometric.depth.len());
+        assert!(inner.iter().any(|&i| photometric.classes[i] == Class::Weak));
+        let deformable = PatchMatchOptions {
+            deformable: Some(Deformable::default()),
+            ..options.clone()
+        };
+        let truth = plane_scene_truth(&ws, 0);
+        let with = estimate_from(&ws, 0, &deformable, &photometric, DetailRestorer::Off);
+        let after = mean_relative_error(&with, &truth, &inner);
+        assert!(after < 0.015, "deformable: {after}");
+        assert!(with.classes.is_empty());
+        let all_strong = DepthMap {
+            classes: vec![Class::Strong; photometric.depth.len()],
+            ..photometric.clone()
+        };
+        let plain = estimate_from(&ws, 0, &options, &photometric, DetailRestorer::Off);
+        let strong = estimate_from(&ws, 0, &deformable, &all_strong, DetailRestorer::Off);
+        assert_eq!(strong.depth, plain.depth);
     }
 
     #[test]

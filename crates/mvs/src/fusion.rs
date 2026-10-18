@@ -3,6 +3,7 @@
 //! source views and kept when enough of them agree.
 
 use nalgebra::Vector3;
+use rayon::prelude::*;
 
 use crate::patch_match::DepthMap;
 use crate::workspace::Workspace;
@@ -62,7 +63,36 @@ pub struct FusedPoint {
 /// visited in order and pixels in raster order; a pixel used by a point is
 /// not used again. Each map is dropped once no later view reads it, so the
 /// maps and the points are not all held at once.
-pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) -> Vec<FusedPoint> {
+///
+/// Per view, the depth checks against the source maps run in parallel
+/// first; the raster-order pass that builds the points then re-checks only
+/// the sources that agreed, so the points are those of a sequential fusion.
+pub fn fuse(ws: &Workspace, maps: Vec<DepthMap>, options: &FusionOptions) -> Vec<FusedPoint> {
+    fuse_inner(ws, maps, options, None)
+}
+
+/// Receives a view's index and depths from [`fuse_with`].
+pub type Released<'a> = dyn FnMut(usize, &[f32]) + 'a;
+
+/// [`fuse`], handing each view's depths that enough source views agree
+/// with (or that are in points; 0 elsewhere) to `released` once no later
+/// point can use its pixels, just before its map is dropped (e.g. to
+/// [`crate::mesh::TsdfMesher`]). The points are [`fuse`]'s.
+pub fn fuse_with(
+    ws: &Workspace,
+    maps: Vec<DepthMap>,
+    options: &FusionOptions,
+    released: &mut Released<'_>,
+) -> Vec<FusedPoint> {
+    fuse_inner(ws, maps, options, Some(released))
+}
+
+fn fuse_inner(
+    ws: &Workspace,
+    mut maps: Vec<DepthMap>,
+    options: &FusionOptions,
+    mut released: Option<&mut Released<'_>>,
+) -> Vec<FusedPoint> {
     let cos_max_angle = options.max_normal_angle_deg.to_radians().cos();
     let last_read_by = ws.last_read_by();
     for map in &mut maps {
@@ -73,64 +103,91 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
         .iter()
         .map(|m| vec![0; m.depth.len().div_ceil(64)])
         .collect();
+    // For `released`, per view, a bit per pixel: its depth agrees with
+    // enough source views, whether or not their pixels are in points (the
+    // pixels in points alone leave holes where a lower-resolution source
+    // pixel went to a neighbour).
+    let masks = released.is_some();
+    let mut consistent: Vec<Vec<u64>> = if masks { used.clone() } else { Vec::new() };
     let mut points = Vec::new();
-    let world_normal = |view: usize, n: [f32; 3]| -> Vector3<f64> {
-        ws.views[view].rotation.transpose()
-            * Vector3::new(f64::from(n[0]), f64::from(n[1]), f64::from(n[2]))
-    };
     let mut agreeing: Vec<(usize, usize)> = Vec::new();
+    let mut candidates: Vec<u64> = Vec::new();
     for (i, view) in ws.views.iter().enumerate() {
         let map = &maps[i];
+        let check = Check {
+            ws,
+            maps: &maps,
+            view: i,
+            max_reproj_error: options.max_reproj_error,
+            max_relative_depth_diff: options.max_relative_depth_diff,
+            cos_max_angle,
+        };
+        // Per pixel, bit `k` set when source `k` agrees (sources past the
+        // 64th are always re-checked). Bits are only ever set in `used`, so
+        // a source pixel in a point now is still in one later; for the
+        // consistency masks, source pixels in points count too. On one
+        // thread (and no masks) every source is checked once, in the
+        // raster-order pass.
+        let parallel = rayon::current_num_threads() > 1 || masks;
+        candidates.clear();
+        candidates.resize(map.depth.len(), if parallel { 0 } else { u64::MAX });
+        candidates
+            .par_chunks_mut(map.width.max(1))
+            .enumerate()
+            .filter(|_| parallel)
+            .for_each(|(y, row)| {
+                for (x, bits) in row.iter_mut().enumerate() {
+                    let p = y * map.width + x;
+                    if is_set(&used[i], p) || map.depth[p] <= 0.0 {
+                        continue;
+                    }
+                    let pixel = check.pixel(x, y);
+                    for (k, &j) in view.sources.iter().enumerate().take(64) {
+                        let in_points = (!masks).then_some(used[j].as_slice());
+                        if check.source(&pixel, j, in_points).is_some() {
+                            *bits |= 1 << k;
+                        }
+                    }
+                }
+            });
+        let unchecked = view.sources.len().saturating_sub(64);
         for y in 0..map.height {
             for x in 0..map.width {
                 let p = y * map.width + x;
-                let depth = f64::from(map.depth[p]);
-                if is_set(&used[i], p) || depth <= 0.0 {
+                let bits = candidates[p];
+                if masks
+                    && map.depth[p] > 0.0
+                    && (is_set(&used[i], p)
+                        || (bits.count_ones() as usize + unchecked)
+                            >= options.min_consistent_views.max(1))
+                {
+                    set(&mut consistent[i], p);
+                }
+                if is_set(&used[i], p)
+                    || map.depth[p] <= 0.0
+                    || (bits.count_ones() as usize + unchecked) < options.min_consistent_views
+                {
                     continue;
                 }
-                let (u, v) = (x as f64 + 0.5, y as f64 + 0.5);
-                let point = view.unproject(u, v, depth);
-                let normal = world_normal(i, map.normal[p]);
+                let pixel = check.pixel(x, y);
                 agreeing.clear();
                 let mut consistency = 0.0;
-                let mut sum_point = point;
-                let mut sum_normal = normal;
+                let mut sum_point = pixel.point;
+                let mut sum_normal = pixel.normal;
                 let mut sum_color = view.rgb[p].map(f64::from);
-                for &j in &view.sources {
-                    let source = &ws.views[j];
-                    let source_map = &maps[j];
-                    let (su, sv, sz) = source.project(&point);
-                    if sz <= 0.0 || su < 0.0 || sv < 0.0 {
+                for (k, &j) in view.sources.iter().enumerate() {
+                    if k < 64 && bits >> k & 1 == 0 {
                         continue;
                     }
-                    let (sx, sy) = (su as usize, sv as usize);
-                    if sx >= source_map.width || sy >= source_map.height {
+                    let Some(a) = check.source(&pixel, j, Some(&used[j])) else {
                         continue;
-                    }
-                    let q = sy * source_map.width + sx;
-                    let source_depth = f64::from(source_map.depth[q]);
-                    if is_set(&used[j], q) || source_depth <= 0.0 {
-                        continue;
-                    }
-                    let source_point =
-                        source.unproject(sx as f64 + 0.5, sy as f64 + 0.5, source_depth);
-                    let (ru, rv, rz) = view.project(&source_point);
-                    let reproj = ((ru - u).powi(2) + (rv - v).powi(2)).sqrt();
-                    let depth_diff = (rz - depth).abs() / depth;
-                    let source_normal = world_normal(j, source_map.normal[q]);
-                    let cos_angle = normal.dot(&source_normal);
-                    if reproj <= options.max_reproj_error
-                        && depth_diff <= options.max_relative_depth_diff
-                        && cos_angle >= cos_max_angle
-                    {
-                        agreeing.push((j, q));
-                        let angle = cos_angle.clamp(-1.0, 1.0).acos();
-                        consistency += (-(reproj + 200.0 * depth_diff + 10.0 * angle)).exp();
-                        sum_point += source_point;
-                        sum_normal += source_normal;
-                        for (s, c) in sum_color.iter_mut().zip(source.rgb[q]) {
-                            *s += f64::from(c);
-                        }
+                    };
+                    agreeing.push((j, a.q));
+                    consistency += a.consistency;
+                    sum_point += a.point;
+                    sum_normal += a.normal;
+                    for (s, c) in sum_color.iter_mut().zip(ws.views[j].rgb[a.q]) {
+                        *s += f64::from(c);
                     }
                 }
                 let consistent = agreeing.len() >= options.min_consistent_views
@@ -144,7 +201,7 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
                             sum_color.map(|s| s / count),
                         )
                     } else {
-                        (point, normal, view.rgb[p].map(f64::from))
+                        (pixel.point, pixel.normal, view.rgb[p].map(f64::from))
                     };
                     points.push(FusedPoint {
                         position: [position.x as f32, position.y as f32, position.z as f32],
@@ -159,12 +216,120 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
             }
         }
         for &s in &last_read_by[i] {
+            if let Some(released) = released.as_mut() {
+                let agreed: Vec<f32> = maps[s]
+                    .depth
+                    .iter()
+                    .enumerate()
+                    .map(|(p, &d)| {
+                        if is_set(&used[s], p) || is_set(&consistent[s], p) {
+                            d
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                released(s, &agreed);
+                consistent[s] = Vec::new();
+            }
             maps[s].depth = Vec::new();
             maps[s].normal = Vec::new();
             used[s] = Vec::new();
         }
     }
     points
+}
+
+/// The depth checks of one reference view against its source views' maps.
+struct Check<'a> {
+    ws: &'a Workspace,
+    maps: &'a [DepthMap],
+    view: usize,
+    max_reproj_error: f64,
+    max_relative_depth_diff: f64,
+    cos_max_angle: f64,
+}
+
+/// A reference pixel: its centre, depth, 3D point and world normal.
+struct Pixel {
+    u: f64,
+    v: f64,
+    depth: f64,
+    point: Vector3<f64>,
+    normal: Vector3<f64>,
+}
+
+/// A source pixel that agrees with a reference pixel.
+struct Agreement {
+    q: usize,
+    point: Vector3<f64>,
+    normal: Vector3<f64>,
+    consistency: f64,
+}
+
+impl Check<'_> {
+    fn world_normal(&self, view: usize, n: [f32; 3]) -> Vector3<f64> {
+        self.ws.views[view].rotation.transpose()
+            * Vector3::new(f64::from(n[0]), f64::from(n[1]), f64::from(n[2]))
+    }
+
+    #[inline(always)]
+    fn pixel(&self, x: usize, y: usize) -> Pixel {
+        let map = &self.maps[self.view];
+        let p = y * map.width + x;
+        let depth = f64::from(map.depth[p]);
+        let (u, v) = (x as f64 + 0.5, y as f64 + 0.5);
+        Pixel {
+            u,
+            v,
+            depth,
+            point: self.ws.views[self.view].unproject(u, v, depth),
+            normal: self.world_normal(self.view, map.normal[p]),
+        }
+    }
+
+    /// The pixel of source view `j` that `pixel` projects into, when its
+    /// depth agrees and it is in no point yet (`used`, view `j`'s bits, if
+    /// given).
+    #[inline(always)]
+    fn source(&self, pixel: &Pixel, j: usize, used: Option<&[u64]>) -> Option<Agreement> {
+        let view = &self.ws.views[self.view];
+        let source = &self.ws.views[j];
+        let source_map = &self.maps[j];
+        let (su, sv, sz) = source.project(&pixel.point);
+        if sz <= 0.0 || su < 0.0 || sv < 0.0 {
+            return None;
+        }
+        let (sx, sy) = (su as usize, sv as usize);
+        if sx >= source_map.width || sy >= source_map.height {
+            return None;
+        }
+        let q = sy * source_map.width + sx;
+        let source_depth = f64::from(source_map.depth[q]);
+        if used.is_some_and(|used| is_set(used, q)) || source_depth <= 0.0 {
+            return None;
+        }
+        let source_point = source.unproject(sx as f64 + 0.5, sy as f64 + 0.5, source_depth);
+        let (ru, rv, rz) = view.project(&source_point);
+        let reproj = ((ru - pixel.u).powi(2) + (rv - pixel.v).powi(2)).sqrt();
+        let depth_diff = (rz - pixel.depth).abs() / pixel.depth;
+        let source_normal = self.world_normal(j, source_map.normal[q]);
+        let cos_angle = pixel.normal.dot(&source_normal);
+        if reproj <= self.max_reproj_error
+            && depth_diff <= self.max_relative_depth_diff
+            && cos_angle >= self.cos_max_angle
+        {
+            let angle = cos_angle.clamp(-1.0, 1.0).acos();
+            Some(Agreement {
+                q,
+                point: source_point,
+                normal: source_normal,
+                consistency: (-(reproj + 200.0 * depth_diff + 10.0 * angle)).exp(),
+            })
+        } else {
+            None
+        }
+    }
 }
 
 fn is_set(bits: &[u64], i: usize) -> bool {

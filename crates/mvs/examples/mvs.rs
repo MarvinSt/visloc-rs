@@ -6,27 +6,34 @@
 //! cargo run --release -p visloc-mvs --example mvs -- \
 //!     --sparse <dir with cameras.txt/images.txt/points3D.txt> \
 //!     --images <image dir> --out <dir> [--max-image-size 3200] \
-//!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 3] [--gpu] \
+//!     [--sources 10] [--iterations 3] [--geom-passes 2] [--geom-iterations 3] \
+//!     [--scales 3] [--gpu] \
 //!     [--view-selection confidence|sampled] [--init-top-k 3] \
 //!     [--restorer infinity|start|off] [--detail-threshold 0.1] [--no-planar-prior] \
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 10] \
-//!     [--min-mean-consistency 0] [--no-average]
+//!     [--min-mean-consistency 0] [--no-average] \
+//!     [--deformable] \
+//!     [--mesh] [--mesh-voxel <world units>] [--mesh-voxel-pixels 1] [--mesh-min-weight 1]
 //! ```
 //!
 //! Three scales in ACMMP's order by default: at every scale a photometric
 //! pass, ACMP's planar prior pass (`--no-planar-prior` leaves it out) and
 //! the geometric passes; `--scales 1` runs one. `--gpu` (a `--features gpu`
-//! build) runs PatchMatch on the GPU.
+//! build) runs PatchMatch on the GPU. `--mesh` also writes `mesh.ply`: the
+//! depths that source views agree with in a TSDF (voxels of one pixel's
+//! footprint by default), extracted with surface nets. `--deformable` adds
+//! APD-MVS's deformable patches for weak-texture pixels at the finer
+//! scales (experimental: below the defaults on ETH3D, see docs/mvs.md).
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use visloc_mvs::{
-    estimate, estimate_from, estimate_with_prior, fuse, geometric_pass, multi_scale_depth_maps,
-    planar_prior_pass, read_text_model, write_ply, DepthMap, DetailRestorer, Estimator,
-    FusionOptions, MultiScaleOptions, PatchMatchOptions, PlanarPrior, PlanarPriorOptions,
-    ViewSelection, Workspace, WorkspaceOptions,
+    estimate, estimate_from, estimate_with_prior, fuse, fuse_with, geometric_pass,
+    multi_scale_depth_maps, planar_prior_pass, read_text_model, write_ply, Deformable, DepthMap,
+    DetailRestorer, Estimator, FusionOptions, MeshOptions, MultiScaleOptions, PatchMatchOptions,
+    PlanarPrior, PlanarPriorOptions, TsdfMesher, ViewSelection, Workspace, WorkspaceOptions,
 };
 
 fn main() {
@@ -36,7 +43,10 @@ fn main() {
     let mut ws_options = WorkspaceOptions::default();
     let mut pm_options = PatchMatchOptions::default();
     let fusion_options = FusionOptions::default();
+    let mut mesh_options: Option<MeshOptions> = None;
+    let mut deformable = false;
     let mut geom_passes = 2usize;
+    let mut geom_iterations = None;
     let mut scales = 3usize;
     let mut restorer = "infinity".to_owned();
     let mut detail_threshold = 0.1f32;
@@ -66,6 +76,7 @@ fn main() {
             }
             "--init-top-k" => pm_options.init_top_k = value().parse().unwrap(),
             "--geom-passes" => geom_passes = value().parse().unwrap(),
+            "--geom-iterations" => geom_iterations = Some(value().parse().unwrap()),
             "--scales" => scales = value().parse().unwrap(),
             "--restorer" => restorer = value(),
             "--detail-threshold" => detail_threshold = value().parse().unwrap(),
@@ -83,6 +94,48 @@ fn main() {
                 fusion_options.min_mean_consistency = value().parse().unwrap()
             }
             "--no-average" => fusion_options.average = false,
+            "--deformable" => deformable = true,
+            "--mesh" => {
+                mesh_options.get_or_insert_with(MeshOptions::default);
+            }
+            "--mesh-voxel" => {
+                mesh_options.get_or_insert_with(MeshOptions::default).voxel =
+                    Some(value().parse().unwrap())
+            }
+            "--mesh-voxel-pixels" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .voxel_pixels = value().parse().unwrap()
+            }
+            "--mesh-no-free-space" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .free_space = false;
+            }
+            "--mesh-min-component" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .min_component = value().parse().unwrap()
+            }
+            "--mesh-full-cells" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .partial_cells = false;
+            }
+            "--mesh-levels" => {
+                mesh_options.get_or_insert_with(MeshOptions::default).levels =
+                    value().parse().unwrap()
+            }
+            "--mesh-trunc" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .trunc_voxels = value().parse().unwrap()
+            }
+            "--mesh-min-weight" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .min_weight = value().parse().unwrap()
+            }
             other => panic!("unknown argument {other}"),
         }
     }
@@ -175,6 +228,8 @@ fn main() {
             .collect()
     } else if scales > 1 {
         let options = MultiScaleOptions {
+            deformable: deformable.then(Deformable::default),
+            geom_iterations: geom_iterations.unwrap_or(pm_options.iterations),
             patch_match: pm_options,
             scales,
             geom_passes,
@@ -211,9 +266,13 @@ fn main() {
             );
             eprintln!("planar prior pass: {:.1} s", t.elapsed().as_secs_f64());
         }
+        let geom_options = PatchMatchOptions {
+            iterations: geom_iterations.unwrap_or(pm_options.iterations),
+            ..pm_options.clone()
+        };
         for pass in 0..geom_passes {
             let t = Instant::now();
-            maps = geometric_pass(&ws, maps, &pm_options, &run);
+            maps = geometric_pass(&ws, maps, &geom_options, &run);
             eprintln!(
                 "geometric pass {}: {:.1} s",
                 pass + 1,
@@ -255,7 +314,13 @@ fn main() {
     }
 
     let t = Instant::now();
-    let points = fuse(&ws, maps, &fusion_options);
+    let mut mesher = mesh_options.as_ref().map(|o| TsdfMesher::new(&ws, o));
+    let points = match mesher.as_mut() {
+        Some(mesher) => fuse_with(&ws, maps, &fusion_options, &mut |v, depth| {
+            mesher.integrate(&ws.views[v], depth)
+        }),
+        None => fuse(&ws, maps, &fusion_options),
+    };
     eprintln!(
         "fusion: {} points in {:.1} s",
         points.len(),
@@ -263,6 +328,17 @@ fn main() {
     );
     let ply = out.join("fused.ply");
     write_ply(&ply, &points).expect("writing fused.ply");
+    if let Some(mesher) = mesher {
+        let t = Instant::now();
+        let (mesh, summary) = mesher.finish();
+        let path = out.join("mesh.ply");
+        mesh.write_ply(&path).expect("writing mesh.ply");
+        eprintln!(
+            "{summary} (extracted in {:.1} s) -> {}",
+            t.elapsed().as_secs_f64(),
+            path.display()
+        );
+    }
     eprintln!(
         "wrote {} in {:.1} s total",
         ply.display(),

@@ -292,6 +292,21 @@ All notable changes to `visloc-rs` will be documented here.
     facade (76 images at 3200 px, an L4), peak memory falls from 24.2 to
     12.0 GiB with one scale and from 28.7 to 12.4 GiB with three;
     `fused.ply` is byte-identical on pipes (CPU and GPU).
+  - **End to end against COLMAP:** from the photos (`gsplat_photos`' SfM
+    with the scene's main ground-truth camera held fixed, the model moved
+    onto the ground-truth camera centres, then `visloc-mvs`), F1 76.3%
+    against 57.4% for COLMAP 4.2.1 CUDA (SfM, `patch_match_stereo`,
+    `stereo_fusion`) over the 10 ETH3D scenes both finished on an L4, in
+    58 minutes against 372; 76.0% over all 13 against 83.5% with the
+    ground-truth poses.
+  - **Mesh:** `--mesh` fuses the depths that source views agree with into
+    a TSDF and writes `mesh.ply` (surface nets); on pipes at 1600 px F1
+    68.1% at 2 cm against the cloud's 74.8%. The TSDF moved from
+    `visloc-gsplat-train` to `visloc-gsplat-core` (feature `mesh`).
+  - **Experimental:** `--deformable`, APD-MVS's deformable patches for
+    weak texture (CPU and GPU). On an L4 at 3200 px it scored F1 90.1% on
+    terrace and 76.1% on office at 2 cm, against 91.0% and 79.0% for the
+    defaults, so it is off (docs/mvs.md).
   - **Run it:** `cargo run --release -p visloc-mvs --features gpu
     --example mvs -- --sparse <model> --images <dir> --out <dir> --gpu`.
 

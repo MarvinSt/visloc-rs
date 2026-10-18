@@ -50,6 +50,8 @@ pub struct PhotoSfmConfig {
     pub max_size: u32,
     /// Focal length in working-image pixels (overrides EXIF).
     pub focal_px: Option<f64>,
+    /// Principal point in working-image pixels (the image centre if unset).
+    pub principal_point: Option<(f64, f64)>,
     /// Match every pair up to this many images, else a sliding window.
     pub exhaustive_max: usize,
     /// Sliding-window size (images) past `exhaustive_max`.
@@ -129,6 +131,7 @@ impl Default for PhotoSfmConfig {
         Self {
             max_size: 1600,
             focal_px: None,
+            principal_point: None,
             exhaustive_max: 300,
             window: 20,
             min_matches: 15,
@@ -635,15 +638,10 @@ pub fn build_photo_dataset(
         (None, None) => (1.2 * long, "prior 1.2 x long side"),
     };
     log(&format!("focal {focal_prior:.1} px ({focal_source})"));
-    let camera = Camera::pinhole(
-        1,
-        width,
-        height,
-        focal_prior,
-        focal_prior,
-        width as f64 / 2.0,
-        height as f64 / 2.0,
-    );
+    let (cx, cy) = cfg
+        .principal_point
+        .unwrap_or((width as f64 / 2.0, height as f64 / 2.0));
+    let camera = Camera::pinhole(1, width, height, focal_prior, focal_prior, cx, cy);
 
     let images_out = out_dir.join("images");
     std::fs::create_dir_all(&images_out).map_err(io(&images_out))?;
@@ -1296,6 +1294,31 @@ pub fn build_photo_dataset(
         "# Camera list\n1 PINHOLE {width} {height} {} {} {} {}\n",
         p[0], p[1], p[2], p[3]
     );
+    // Image ids follow the registered images in order; point ids are the
+    // track indices plus one. Each image lists its observations (x, y,
+    // point id) and each point its track (image id, observation index), as
+    // COLMAP writes them, so tools that read the observations (visloc-mvs's
+    // source views and depth ranges) can use the model.
+    let mut image_ids = vec![0usize; n];
+    let mut observations: Vec<Vec<(f64, f64, usize)>> = vec![Vec::new(); n];
+    for (id, (i, _)) in poses
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.as_ref().map(|p| (i, p)))
+        .enumerate()
+    {
+        image_ids[i] = id + 1;
+    }
+    let mut point_tracks: Vec<Vec<(usize, usize)>> = vec![Vec::new(); tracks.len()];
+    for (k, t) in tracks.iter().enumerate() {
+        for &(img, _, px) in &t.observations {
+            if image_ids[img] == 0 {
+                continue;
+            }
+            point_tracks[k].push((image_ids[img], observations[img].len()));
+            observations[img].push((px.x, px.y, k + 1));
+        }
+    }
     let mut images_txt = String::from("# Image list\n");
     for (id, (i, pose)) in poses
         .iter()
@@ -1306,7 +1329,7 @@ pub fn build_photo_dataset(
         let q = pose.world_to_camera.rotation.quaternion();
         let t = pose.world_to_camera.translation;
         images_txt.push_str(&format!(
-            "{} {} {} {} {} {} {} {} 1 {}\n\n",
+            "{} {} {} {} {} {} {} {} 1 {}\n",
             id + 1,
             q.w,
             q.i,
@@ -1317,19 +1340,37 @@ pub fn build_photo_dataset(
             t.z,
             names[i]
         ));
+        let line: Vec<String> = observations[i]
+            .iter()
+            .map(|&(x, y, point)| format!("{x} {y} {point}"))
+            .collect();
+        images_txt.push_str(&line.join(" "));
+        images_txt.push('\n');
     }
     let points_txt: String = std::iter::once("# 3D point list\n".to_string())
-        .chain(points.iter().enumerate().map(|(k, pt)| {
-            format!(
-                "{} {} {} {} {} {} {} 0\n",
+        .chain(tracks.iter().enumerate().filter_map(|(k, t)| {
+            let &(img, _, px) = t.observations.first()?;
+            let (x, y) = (px.x.round(), px.y.round());
+            let rgb = if x >= 0.0 && y >= 0.0 && x < width as f64 && y < height as f64 {
+                decoded[img].0.get_pixel(x as u32, y as u32).0
+            } else {
+                [128; 3]
+            };
+            let track: Vec<String> = point_tracks[k]
+                .iter()
+                .map(|&(image, index)| format!("{image} {index}"))
+                .collect();
+            Some(format!(
+                "{} {} {} {} {} {} {} 0 {}\n",
                 k + 1,
-                pt.position.x,
-                pt.position.y,
-                pt.position.z,
-                pt.rgb[0],
-                pt.rgb[1],
-                pt.rgb[2]
-            )
+                t.position.x,
+                t.position.y,
+                t.position.z,
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                track.join(" ")
+            ))
         }))
         .collect();
     for (file, text) in [

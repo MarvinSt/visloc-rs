@@ -59,6 +59,10 @@ All notable changes to `visloc-rs` will be documented here.
     or a camera mount or selfie stick that moves with the camera. On
     ScanVan that drops the five down faces (the mount) and keeps the up
     faces (trees and buildings).
+  - ScanVan on an RTX 5080 (GPU SIFT and matching, 30k steps, 13 min with
+    the mesh): the held-out panorama renders at 19.12 dB over its five
+    kept faces (19.03 dB over the four side faces, against 19.2 dB with
+    independent faces), the 20 training faces at 34.7 dB.
 - **`--equirect-native`: SfM on the panoramas as equirectangular cameras**
   (#301). `PhotoSfmConfig::equirect_native`: SIFT runs on the whole
   panorama, at most `2 max_size` wide (COLMAP's 3200 px cap at the
@@ -86,8 +90,11 @@ All notable changes to `visloc-rs` will be documented here.
   - ScanVan (CPU): 5/5 panoramas, distances within 0.29% of ScanVan's
     trajectory, in 22 s against the rig's 163 s (SIFT on 3200 x 1600
     panoramas instead of thirty 1504 px faces), with 2,052 SfM points
-    against 4,893. As COLMAP notes for its own model, faster but coarser
-    than perspective views; the rig stays the default.
+    against 4,893. On the RTX 5080 (30k steps, 12 min) the held-out
+    panorama renders at 18.66 dB over five faces (rig: 19.12 dB), the
+    training faces at 33.1 dB (34.7 dB). As COLMAP notes for its own
+    model, faster but coarser than perspective views; the rig stays the
+    default.
 - **A warning for panoramas fed as pinhole photos.** When at least half the
   images look equirectangular, `build_photo_dataset` logs a warning that
   points to `--equirect`. An image counts when it is 2:1 with left and

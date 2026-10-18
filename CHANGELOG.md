@@ -106,6 +106,30 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **Mesh: empty for cameras close together looking out.** The TSDF voxel
+  (scale / 256) and depth cut-off (2 x scale) were sized by the rig scale,
+  the median distance of the camera centres from their centroid. A 360
+  capture or a short walk sees the scene far beyond that: on ScanVan
+  99.8% of the SfM point depths lay past the cut-off, and every mesh of
+  #301 came out with 0 triangles. The scale is now the larger of the rig
+  scale and half the 90th percentile depth of the SfM points the views
+  see (`mesh::scene_scale`).
+  - ScanVan (5 panoramas, `--equirect`, 3k steps at 512 px on lavapipe),
+    the same splat: 25,922 -> 0 triangles before, 2,023,326 -> 212,856
+    now (rig scale 0.33, scene scale 3.77).
+  - south-building's COLMAP model: half the 90th percentile depth is
+    2.93 against a rig scale of 3.57, so object captures keep their
+    defaults.
+
+- **COLMAP-port mapper: structure-less registration triangulated with no
+  error bound.** Its new tracks use the angular residual, in radians, but
+  were bounded by `abs_pose_max_error` (12 px), so every ray passed.
+  COLMAP 4 does the same; the bound is now divided by the camera's pixels
+  per radian, as the GR6P threshold next to it already was. The fallback
+  is on in `gsplat_photos` and `gsplat_euroc`; it registered no image on
+  south-building, ScanVan or EuRoC V1_01 (CPU, the README settings),
+  whose results are unchanged.
+
 - **COLMAP-port mapper: resuming a reconstruction with 3D points
   panicked.** `ObservationManager::new` counted the existing observations
   before the visibility pyramids were sized. The constructor now sizes

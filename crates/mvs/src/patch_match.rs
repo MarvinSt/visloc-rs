@@ -1994,6 +1994,31 @@ mod tests {
         }
     }
 
+    /// A pass with deformable patches from the photometric map fills a
+    /// textureless region, whose pixels match their textured anchors under
+    /// the plane, where a plain pass leaves it wrong.
+    #[test]
+    fn deformable_patches_fill_a_textureless_region() {
+        use crate::planar_prior::{mean_relative_error, textureless_scene};
+        let (ws, inner) = textureless_scene();
+        let options = PatchMatchOptions::default();
+        let photometric = estimate(&ws, 0, &options, None);
+        let deformable = PatchMatchOptions {
+            deformable: Some(Deformable::default()),
+            ..options.clone()
+        };
+        let truth = plane_scene_truth(&ws, 0);
+        let plain = estimate_from(&ws, 0, &options, &photometric, DetailRestorer::Off);
+        let with = estimate_from(&ws, 0, &deformable, &photometric, DetailRestorer::Off);
+        let before = mean_relative_error(&plain, &truth, &inner);
+        let after = mean_relative_error(&with, &truth, &inner);
+        assert!(after < 0.015, "deformable: {after}");
+        assert!(
+            before > 10.0 * after,
+            "plain {before} vs deformable {after}"
+        );
+    }
+
     #[test]
     fn depth_maps_round_trip_with_or_without_costs() {
         let ws = plane_scene();

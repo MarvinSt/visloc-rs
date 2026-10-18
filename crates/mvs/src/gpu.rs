@@ -7,6 +7,7 @@
 use bytemuck::{Pod, Zeroable};
 use visloc_gsplat_render::{GpuContext, GpuError};
 
+use crate::deformable::{self, Class, MAX_ANCHORS};
 use crate::patch_match::{
     finish_depth_map, DepthMap, DetailRestorer, PatchMatchOptions, ViewSelection, MAX_COST,
     MAX_SOURCES,
@@ -64,6 +65,20 @@ struct Params {
     /// margin.
     restore: u32,
     restore_margin: f32,
+    /// 1 when the pass has deformable patches, with their settings (the
+    /// RANSAC threshold in depth units) and the mean baseline to the
+    /// sources.
+    deformable: u32,
+    sweep: i32,
+    peak_radius: i32,
+    max_peak_cost: f32,
+    strong_cost: f32,
+    peak_spread: f32,
+    sectors: u32,
+    ransac_threshold: f32,
+    min_inliers: u32,
+    center_weight: f32,
+    baseline: f32,
 }
 
 /// A source view as the shader reads it (`Source`).
@@ -80,11 +95,13 @@ struct GpuSource {
 /// Uniform slots are this far apart (wgpu's minimum offset alignment).
 const SLOT: u64 = 256;
 
-/// The GPU PatchMatch: a device and the two compute pipelines.
+/// The GPU PatchMatch: a device and the compute pipelines.
 pub struct GpuPatchMatch {
     ctx: GpuContext,
     init: wgpu::ComputePipeline,
     propagate: wgpu::ComputePipeline,
+    classify: wgpu::ComputePipeline,
+    find_anchors: wgpu::ComputePipeline,
 }
 
 impl GpuPatchMatch {
@@ -114,10 +131,14 @@ impl GpuPatchMatch {
         };
         let init = pipeline("init");
         let propagate = pipeline("propagate");
+        let classify = pipeline("classify");
+        let find_anchors = pipeline("find_anchors");
         Self {
             ctx,
             init,
             propagate,
+            classify,
+            find_anchors,
         }
     }
 
@@ -343,6 +364,21 @@ impl GpuPatchMatch {
             }
         }
 
+        // Deformable patches in a pass that starts from a map.
+        let deformable = options
+            .deformable
+            .as_ref()
+            .filter(|_| start.is_some() && options.iterations > 0);
+        let center = reference.center();
+        let baseline = if source_ids.is_empty() {
+            0.0
+        } else {
+            source_ids
+                .iter()
+                .map(|&s| (ws.views[s].center() - center).norm() as f32)
+                .sum::<f32>()
+                / source_ids.len() as f32
+        };
         let base = Params {
             width: w as u32,
             height: h as u32,
@@ -399,16 +435,32 @@ impl GpuPatchMatch {
                 DetailRestorer::Off => 0.0,
                 DetailRestorer::Start(margin) | DetailRestorer::Infinity(margin) => margin,
             },
+            deformable: u32::from(deformable.is_some()),
+            sweep: deformable.map_or(0, |d| d.sweep.min(30)),
+            peak_radius: deformable.map_or(0, |d| d.peak_radius),
+            max_peak_cost: deformable.map_or(0.0, |d| d.max_peak_cost),
+            strong_cost: deformable.map_or(0.0, |d| d.strong_cost),
+            peak_spread: deformable.map_or(0.0, |d| d.peak_spread),
+            sectors: deformable.map_or(0, |d| d.sectors as u32),
+            ransac_threshold: deformable.map_or(0.0, |d| {
+                d.ransac_threshold * (reference.depth_range.1 - reference.depth_range.0)
+            }),
+            min_inliers: deformable.map_or(0, |d| d.min_inliers as u32),
+            center_weight: deformable.map_or(0.0, |d| d.center_weight),
+            baseline,
         };
-        // Slot 0 for `init`, then one per (iteration, colour).
+        // Slot 0 for `init`, then one per (iteration, colour), then
+        // `classify` and `find_anchors`.
         let slots = 1 + 2 * options.iterations;
-        let mut uniform_bytes = vec![0u8; slots * SLOT as usize];
+        let anchor_slot = slots;
+        let mut uniform_bytes = vec![0u8; (slots + 1) * SLOT as usize];
         let mut put = |slot: usize, params: Params| {
             let bytes = bytemuck::bytes_of(&params);
             uniform_bytes[slot * SLOT as usize..slot * SLOT as usize + bytes.len()]
                 .copy_from_slice(bytes);
         };
         put(0, base);
+        put(anchor_slot, base);
         for iteration in 0..options.iterations {
             let t = iteration as f32;
             for color in 0..2 {
@@ -473,6 +525,16 @@ impl GpuPatchMatch {
             DetailRestorer::Off => zeroed("mvs-pre-costs", 16),
             _ => zeroed("mvs-pre-costs", w * h * 4),
         };
+        let per_pixel = |bytes: usize| {
+            if deformable.is_some() {
+                w * h * bytes
+            } else {
+                16
+            }
+        };
+        let classes_buf = zeroed("mvs-classes", per_pixel(4));
+        let nearest_buf = zeroed("mvs-nearest", per_pixel(4));
+        let anchors_buf = zeroed("mvs-anchors", per_pixel(4 * MAX_ANCHORS));
         let texture_size = wgpu::Extent3d {
             width: texture_width as u32,
             height: texture_height as u32,
@@ -578,6 +640,7 @@ impl GpuPatchMatch {
                         },
                         entry(10, &prior_planes_buf),
                         entry(11, &pre_costs_buf),
+                        entry(14, &anchors_buf),
                     ],
                 })
             })
@@ -602,6 +665,55 @@ impl GpuPatchMatch {
             };
         let (gw, gh) = ((w as u32).div_ceil(16), (h as u32).div_ceil(8));
         run(&self.init, &init_group, (gw, gh));
+        if let Some(d) = deformable {
+            // Sort the pixels, find each one's nearest strong pixel on the
+            // CPU (`deformable::nearest_strong`), then the anchors.
+            let classify_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mvs-classify"),
+                layout: &self.classify.get_bind_group_layout(0),
+                entries: &[
+                    params_entry(anchor_slot),
+                    entry(1, &sources_buf),
+                    entry(2, &images_buf),
+                    entry(3, &priors_buf),
+                    entry(4, &planes_buf),
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    entry(12, &classes_buf),
+                ],
+            });
+            run(&self.classify, &classify_group, (gw, gh));
+            let mut codes = vec![0u32; w * h];
+            read_into(device, queue, &classes_buf, &mut codes);
+            let classes: Vec<Class> = codes
+                .iter()
+                .map(|&c| match c {
+                    0 => Class::Weak,
+                    1 => Class::Strong,
+                    _ => Class::Unknown,
+                })
+                .collect();
+            let nearest = deformable::nearest_strong(&classes, w, h, d.nearest_radius);
+            queue.write_buffer(&nearest_buf, 0, bytemuck::cast_slice(&nearest));
+            let anchors_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mvs-find-anchors"),
+                layout: &self.find_anchors.get_bind_group_layout(0),
+                entries: &[
+                    params_entry(anchor_slot),
+                    entry(4, &planes_buf),
+                    entry(12, &classes_buf),
+                    entry(13, &nearest_buf),
+                    entry(14, &anchors_buf),
+                ],
+            });
+            run(&self.find_anchors, &anchors_group, (gw, gh));
+        }
         let half = (w as u32).div_ceil(2).div_ceil(16);
         for group in &propagate_groups {
             run(&self.propagate, group, (half, gh));
@@ -761,6 +873,34 @@ mod tests {
         assert!(kept > 0.015, "against the start: {kept}");
         let error = error(DetailRestorer::Infinity(0.1));
         assert!(error < 0.002, "against infinity: {error}");
+    }
+
+    /// Deformable patches fill a textureless region on the GPU as on the
+    /// CPU (`patch_match`'s test).
+    #[test]
+    fn gpu_deformable_patches_fill_a_textureless_region() {
+        let Some(ctx) = visloc_gsplat_render::try_context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let gpu = GpuPatchMatch::with_context(ctx);
+        let (ws, inner) = textureless_scene();
+        let options = PatchMatchOptions::default();
+        let photometric = gpu.estimate(&ws, 0, &options, None);
+        let deformable = PatchMatchOptions {
+            deformable: Some(crate::deformable::Deformable::default()),
+            ..options.clone()
+        };
+        let truth = plane_scene_truth(&ws, 0);
+        let plain = gpu.estimate_from(&ws, 0, &options, &photometric, DetailRestorer::Off);
+        let with = gpu.estimate_from(&ws, 0, &deformable, &photometric, DetailRestorer::Off);
+        let before = mean_relative_error(&plain, &truth, &inner);
+        let after = mean_relative_error(&with, &truth, &inner);
+        assert!(after < 0.015, "deformable: {after}");
+        assert!(
+            before > 10.0 * after,
+            "plain {before} vs deformable {after}"
+        );
     }
 
     #[test]

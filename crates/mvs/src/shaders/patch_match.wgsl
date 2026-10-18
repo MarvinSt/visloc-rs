@@ -1,8 +1,10 @@
 // ACMH/ACMM PatchMatch on the GPU: the per-pixel update of
 // `patch_match.rs`, one invocation per pixel. `init` gives every pixel its
 // first plane and cost; `propagate` updates the pixels of one checkerboard
-// colour from the other's planes. Planes are `(n.xyz, rho)` in the
-// reference camera frame, `rho = n · X`.
+// colour from the other's planes. With APD-MVS's deformable patches,
+// `classify` sorts the pixels and `find_anchors` gives each weak pixel its
+// anchors between the two. Planes are `(n.xyz, rho)` in the reference
+// camera frame, `rho = n · X`.
 
 const MAX_COST: f32 = 2.0;
 const MAX_SAMPLES: u32 = 64u;
@@ -12,6 +14,17 @@ const NO_VIEW: u32 = 0xffffffffu;
 // Draws of the sampled view weights, and the mark of their random streams.
 const VIEW_SAMPLES: u32 = 15u;
 const SAMPLING_STREAM: u32 = 0x80000000u;
+// Deformable patches: anchors per weak pixel, samples of an anchor window,
+// the longest cost curve, sectors searched at most, the border no pixel
+// within is sorted or anchored, and the pixel classes.
+const MAX_ANCHORS: u32 = 8u;
+const ANCHOR_SAMPLES: u32 = 9u;
+const MAX_CURVE: u32 = 61u;
+const MAX_SECTORS: u32 = 32u;
+const BORDER: u32 = 6u;
+const WEAK: u32 = 0u;
+const STRONG: u32 = 1u;
+const UNKNOWN: u32 = 2u;
 
 struct Params {
     width: u32,
@@ -61,6 +74,22 @@ struct Params {
     // against the plane at infinity's (`pre_costs`), with this margin.
     restore: u32,
     restore_margin: f32,
+    // 1: the pass has deformable patches (`anchors`), with the sorting's
+    // sweep, peak radius (disparity steps), peak cost, single-peak cost and
+    // spread; the anchors' sectors, RANSAC threshold (depth units) and
+    // inliers; the window's weight in a weak pixel's cost; and the mean
+    // baseline to the sources.
+    deformable: u32,
+    sweep: i32,
+    peak_radius: i32,
+    max_peak_cost: f32,
+    strong_cost: f32,
+    peak_spread: f32,
+    sectors: u32,
+    ransac_threshold: f32,
+    min_inliers: u32,
+    center_weight: f32,
+    baseline: f32,
 }
 
 // Reference camera frame to source camera frame: rows of R with t in w.
@@ -97,6 +126,13 @@ struct Source {
 // The detail restorer's baseline costs, from `init`: a pixel takes a new
 // plane only if its cost is below its baseline by `restore_margin`.
 @group(0) @binding(11) var<storage, read_write> pre_costs: array<f32>;
+// Deformable patches: per pixel its class (`classify`), its nearest strong
+// pixel (the CPU's breadth-first search, NO_VIEW for none) and its anchors
+// (`find_anchors`, MAX_ANCHORS per pixel, NO_VIEW past the last; a first
+// NO_VIEW: matched as a strong pixel).
+@group(0) @binding(12) var<storage, read_write> classes: array<u32>;
+@group(0) @binding(13) var<storage, read> nearest: array<u32>;
+@group(0) @binding(14) var<storage, read_write> anchors: array<u32>;
 
 // The reference window of the current pixel, row by row.
 var<private> patch_values: array<f32, 64>;
@@ -108,6 +144,15 @@ var<private> patch_mean: f32;
 var<private> patch_var: f32;
 var<private> rng_state: u32;
 var<private> top_k_views: u32;
+// A weak pixel's anchor windows (offsets from the pixel; grey levels minus
+// each window's centre); `anchor_count` 0 matches the plain window only.
+var<private> anchor_count: u32;
+var<private> anchor_offsets: array<vec2<f32>, 72>;
+var<private> anchor_values: array<f32, 72>;
+var<private> anchor_centers: array<f32, 8>;
+var<private> anchor_means: array<f32, 8>;
+var<private> anchor_vars: array<f32, 8>;
+var<private> draw_state: u32;
 
 fn hash(v: u32) -> u32 {
     var x = v;
@@ -210,8 +255,22 @@ fn source_gray(j: u32, s: Source, u: f32, v: f32) -> f32 {
     return textureSampleLevel(source_images, bilinear, uv, j, 0.0).r;
 }
 
+// The pixel of the image of `ray`, plus `dx`, `dy` pixels, in source `s`
+// under the homography `a` (the ray's image), `bx`, `by` (unit steps):
+// (u, v), or (-1, -1) behind the camera.
+fn warp_sample(s: Source, a: vec3<f32>, bx: vec3<f32>, by: vec3<f32>, dx: f32, dy: f32) -> vec2<f32> {
+    let p = a + dx * bx + dy * by;
+    if (p.z <= 0.0) {
+        return vec2<f32>(-1.0, -1.0);
+    }
+    return vec2<f32>(s.k.x * p.x / p.z + s.k.z, s.k.y * p.y / p.z + s.k.w);
+}
+
+// One minus the bilateral NCC of `plane` at the current pixel in source j;
+// for a weak pixel with anchors (`anchor_count`), the deformable cost:
+// `center_weight` times that plus the rest times the anchor windows' mean.
 fn photometric_cost(j: u32, ray: vec3<f32>, plane: vec4<f32>) -> f32 {
-    if (patch_var < 1e-5 || abs(plane.w) < 1e-12) {
+    if (abs(plane.w) < 1e-12) {
         return MAX_COST;
     }
     let s = sources[j];
@@ -231,40 +290,86 @@ fn photometric_cost(j: u32, ray: vec3<f32>, plane: vec4<f32>) -> f32 {
     if (cu < 0.0 || cv < 0.0 || cu >= f32(s.dims.x) || cv >= f32(s.dims.y)) {
         return MAX_COST;
     }
-    var s_w = 0.0;
-    var s_ww = 0.0;
-    var s_rw = 0.0;
-    // The window in `load_patch`'s order, without integer division.
-    let r = params.window_radius;
-    let step = max(params.window_step, 1);
-    var k = 0u;
-    for (var dy = -r; dy <= r; dy += step) {
-        for (var dx = -r; dx <= r; dx += step) {
-            if (k >= patch_n) {
+    var center = MAX_COST;
+    if (patch_var >= 1e-5) {
+        var s_w = 0.0;
+        var s_ww = 0.0;
+        var s_rw = 0.0;
+        var ok = true;
+        // The window in `load_patch`'s order, without integer division.
+        let r = params.window_radius;
+        let step = max(params.window_step, 1);
+        var k = 0u;
+        for (var dy = -r; dy <= r; dy += step) {
+            for (var dx = -r; dx <= r; dx += step) {
+                if (k >= patch_n) {
+                    break;
+                }
+                let p = a + f32(dx) * bx + f32(dy) * by;
+                if (p.z <= 0.0) {
+                    ok = false;
+                    break;
+                }
+                let u = s.k.x * p.x / p.z + s.k.z;
+                let v = s.k.y * p.y / p.z + s.k.w;
+                let value = source_gray(j, s, u, v) - patch_center;
+                let weight = patch_weights[k];
+                s_w += weight * value;
+                s_ww += weight * value * value;
+                s_rw += weight * patch_values[k] * value;
+                k += 1u;
+            }
+            if (!ok) {
                 break;
             }
-            let p = a + f32(dx) * bx + f32(dy) * by;
-            if (p.z <= 0.0) {
-                return MAX_COST;
-            }
-            let u = s.k.x * p.x / p.z + s.k.z;
-            let v = s.k.y * p.y / p.z + s.k.w;
-            let value = source_gray(j, s, u, v) - patch_center;
-            let weight = patch_weights[k];
-            s_w += weight * value;
-            s_ww += weight * value * value;
-            s_rw += weight * patch_values[k] * value;
-            k += 1u;
+        }
+        let mean = s_w / patch_sum_w;
+        let var_s = s_ww / patch_sum_w - mean * mean;
+        if (ok && var_s >= 1e-5) {
+            let cov = s_rw / patch_sum_w - patch_mean * mean;
+            let ncc = cov / sqrt(patch_var * var_s);
+            center = clamp(1.0 - ncc, 0.0, MAX_COST);
         }
     }
-    let mean = s_w / patch_sum_w;
-    let var_s = s_ww / patch_sum_w - mean * mean;
-    if (var_s < 1e-5) {
-        return MAX_COST;
+    if (anchor_count == 0u) {
+        return center;
     }
-    let cov = s_rw / patch_sum_w - patch_mean * mean;
-    let ncc = cov / sqrt(patch_var * var_s);
-    return clamp(1.0 - ncc, 0.0, MAX_COST);
+    var sum = 0.0;
+    for (var q = 0u; q < anchor_count; q++) {
+        var cost = MAX_COST;
+        var ok = anchor_vars[q] >= 1e-5;
+        var s1 = 0.0;
+        var s2 = 0.0;
+        var sr = 0.0;
+        for (var m = 0u; m < ANCHOR_SAMPLES; m++) {
+            if (!ok) {
+                break;
+            }
+            let o = anchor_offsets[q * ANCHOR_SAMPLES + m];
+            let uv = warp_sample(s, a, bx, by, o.x, o.y);
+            // An anchor window leaving the source image costs the maximum.
+            if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= f32(s.dims.x) || uv.y >= f32(s.dims.y)) {
+                ok = false;
+                break;
+            }
+            let value = source_gray(j, s, uv.x, uv.y) - anchor_centers[q];
+            s1 += value;
+            s2 += value * value;
+            sr += anchor_values[q * ANCHOR_SAMPLES + m] * value;
+        }
+        if (ok) {
+            let nn = f32(ANCHOR_SAMPLES);
+            let mean = s1 / nn;
+            let var_s = s2 / nn - mean * mean;
+            if (var_s >= 1e-5) {
+                let cov = sr / nn - anchor_means[q] * mean;
+                cost = clamp(1.0 - cov / sqrt(anchor_vars[q] * var_s), 0.0, MAX_COST);
+            }
+        }
+        sum += cost;
+    }
+    return params.center_weight * center
+        + (1.0 - params.center_weight) * min(sum / f32(anchor_count), MAX_COST);
 }
 
 // lambda times the forward-backward reprojection error through source j's
@@ -415,6 +520,395 @@ fn init(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// ---- APD-MVS's deformable patches (`deformable.rs`) ----
+
+// The class of a cost curve of `len` samples (centre at the pixel's
+// depth): `deformable::classify`.
+fn classify_curve(curve: ptr<function, array<f32, 61>>, len: u32) -> u32 {
+    let center = i32(len / 2u);
+    var lowest = -1;
+    var low = 3.0e38;
+    var peaks = 0u;
+    for (var i = 2u; i + 2u < len; i++) {
+        let c = (*curve)[i];
+        if ((*curve)[i - 1u] > c && (*curve)[i + 1u] > c) {
+            peaks += 1u;
+            if (c < low) {
+                low = c;
+                lowest = i32(i);
+            }
+        }
+    }
+    if (lowest < 0) {
+        return WEAK;
+    }
+    if (abs(lowest - center) > params.peak_radius || low > params.max_peak_cost) {
+        return WEAK;
+    }
+    if (peaks == 1u) {
+        if (low <= params.strong_cost) {
+            return STRONG;
+        }
+        return WEAK;
+    }
+    var excess = 0.0;
+    for (var i = 2u; i + 2u < len; i++) {
+        let c = (*curve)[i];
+        if (i32(i) != lowest && (*curve)[i - 1u] > c && (*curve)[i + 1u] > c) {
+            excess += (c - low) * (c - low);
+        }
+    }
+    if (sqrt(excess) / f32(peaks - 1u) > params.peak_spread) {
+        return STRONG;
+    }
+    return WEAK;
+}
+
+// Each pixel's class from its cost (`top_k_cost`) at `2 sweep + 1` depths
+// one pseudo-disparity step apart along its ray, normal fixed.
+@compute @workgroup_size(16, 8, 1)
+fn classify(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    let w = params.width;
+    let h = params.height;
+    if (x >= w || y >= h) {
+        return;
+    }
+    let i = y * w + x;
+    if (params.num_sources == 0u || x < BORDER || y < BORDER || x + BORDER >= w || y + BORDER >= h) {
+        classes[i] = UNKNOWN;
+        return;
+    }
+    let ray = pixel_ray(x, y);
+    let plane = planes[i];
+    let depth = plane_depth(plane, ray);
+    if (depth <= 0.0) {
+        classes[i] = UNKNOWN;
+        return;
+    }
+    load_patch(x, y);
+    let disparity = params.fx * params.baseline / depth;
+    let len = min(u32(2 * params.sweep + 1), MAX_CURVE);
+    var curve: array<f32, 61>;
+    for (var m = 0u; m < len; m++) {
+        let step = disparity + f32(i32(m) - params.sweep);
+        let d = params.fx * params.baseline / step;
+        if (step <= 0.0 || !(d >= params.depth_min && d <= params.depth_max)) {
+            curve[m] = MAX_COST;
+        } else {
+            curve[m] = min(top_k_cost(x, y, ray, plane_from_depth(d, plane.xyz, ray)), MAX_COST);
+        }
+    }
+    classes[i] = classify_curve(&curve, len);
+}
+
+// `deformable::Draws`: xorshift32, seeded with a set low bit.
+fn draws_below(n: u32) -> u32 {
+    draw_state = draw_state ^ (draw_state << 13u);
+    draw_state = draw_state ^ (draw_state >> 17u);
+    draw_state = draw_state ^ (draw_state << 5u);
+    return draw_state % max(n, 1u);
+}
+
+// `deformable::in_triangle`.
+fn in_triangle(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, p: vec2<f32>) -> bool {
+    if (distance(a, b) <= 2.0 || distance(b, c) <= 2.0 || distance(c, a) <= 2.0) {
+        return false;
+    }
+    let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    if (abs(area) < 1e-6) {
+        return false;
+    }
+    let d1 = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+    let d2 = (c.x - b.x) * (p.y - b.y) - (c.y - b.y) * (p.x - b.x);
+    let d3 = (a.x - c.x) * (p.y - c.y) - (a.y - c.y) * (p.x - c.x);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    return !(has_neg && has_pos);
+}
+
+// `deformable::plane_through`: (n, w) with n · X + w = 0, zero for
+// collinear points.
+fn plane_through(a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> vec4<f32> {
+    let n = cross(a - c, b - c);
+    let norm = length(n);
+    if (norm < 1e-12) {
+        return vec4<f32>(0.0);
+    }
+    let u = n / norm;
+    return vec4<f32>(u, -dot(u, a));
+}
+
+// The 3D point of pixel index `q` on its current plane, w 0 for none.
+fn anchor_point(q: u32) -> vec4<f32> {
+    let ray = pixel_ray(q % params.width, q / params.width);
+    let d = plane_depth(planes[q], ray);
+    if (d <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(ray * d, 1.0);
+}
+
+fn pixel_xy(q: u32) -> vec2<f32> {
+    return vec2<f32>(f32(q % params.width), f32(q / params.width));
+}
+
+// A weak pixel's anchors: the first strong pixel along each sector's ray
+// (or a weak sample's nearest strong pixel within the sector), kept if
+// RANSAC finds enough coplanar around it (`Context::find_anchors`).
+@compute @workgroup_size(16, 8, 1)
+fn find_anchors(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    let w = params.width;
+    let h = params.height;
+    if (x >= w || y >= h) {
+        return;
+    }
+    let i = y * w + x;
+    for (var k = 0u; k < MAX_ANCHORS; k++) {
+        anchors[i * MAX_ANCHORS + k] = NO_VIEW;
+    }
+    if (classes[i] != WEAK) {
+        return;
+    }
+    let sectors = clamp(params.sectors, 1u, MAX_SECTORS);
+    let half = 3.14159265 / f32(sectors);
+    let cos_half = cos(half);
+    var found: array<u32, 32>;
+    var count = 0u;
+    for (var sector = 0u; sector < sectors; sector++) {
+        let angle = 2.0 * half * f32(sector);
+        let dir = vec2<f32>(cos(angle), sin(angle));
+        var radius = 2.0;
+        loop {
+            let qx = floor(f32(x) + 0.5 + dir.x * radius);
+            let qy = floor(f32(y) + 0.5 + dir.y * radius);
+            if (qx < 0.0 || qy < 0.0 || qx >= f32(w) || qy >= f32(h)) {
+                break;
+            }
+            let ux = u32(qx);
+            let uy = u32(qy);
+            var taken = false;
+            if (ux >= BORDER && uy >= BORDER && ux + BORDER < w && uy + BORDER < h) {
+                let q = uy * w + ux;
+                var a = NO_VIEW;
+                if (classes[q] == STRONG) {
+                    a = q;
+                } else {
+                    a = nearest[q];
+                }
+                if (a != NO_VIEW) {
+                    let off = pixel_xy(a) - vec2<f32>(f32(x), f32(y));
+                    let norm = length(off);
+                    if (norm > 0.0 && dot(off, dir) / norm > cos_half) {
+                        found[count] = a;
+                        count += 1u;
+                        taken = true;
+                    }
+                }
+            }
+            if (taken) {
+                break;
+            }
+            radius = min(2.0 * radius, radius + 25.0);
+        }
+    }
+    if (count < 4u) {
+        return;
+    }
+    let center_point = anchor_point(i);
+    if (center_point.w == 0.0) {
+        return;
+    }
+    // The anchors with a depth, as `Context::find_anchors` keeps them.
+    var pixels: array<u32, 32>;
+    var points: array<vec3<f32>, 32>;
+    var n = 0u;
+    for (var k = 0u; k < count; k++) {
+        let p = anchor_point(found[k]);
+        if (p.w != 0.0) {
+            pixels[n] = found[k];
+            points[n] = p.xyz;
+            n += 1u;
+        }
+    }
+    if (n < 3u) {
+        return;
+    }
+    let center = vec2<f32>(f32(x), f32(y));
+    draw_state = (params.seed ^ (i * 0x9e3779b9u)) | 1u;
+    var best_inliers = 0u;
+    var best_center = 3.0e38;
+    var best_plane = vec4<f32>(0.0);
+    var best_sample = vec3<u32>(0u);
+    for (var it = 0u; it < 50u; it++) {
+        let ia = draws_below(n);
+        let ib = draws_below(n);
+        let ic = draws_below(n);
+        if (ia == ib || ib == ic || ia == ic) {
+            continue;
+        }
+        if (!in_triangle(pixel_xy(pixels[ia]), pixel_xy(pixels[ib]), pixel_xy(pixels[ic]), center)) {
+            continue;
+        }
+        let plane = plane_through(points[ia], points[ib], points[ic]);
+        if (all(plane.xyz == vec3<f32>(0.0))) {
+            continue;
+        }
+        var inliers = 0u;
+        for (var k = 0u; k < n; k++) {
+            if (abs(dot(plane.xyz, points[k]) + plane.w) < params.ransac_threshold) {
+                inliers += 1u;
+            }
+        }
+        if (inliers < params.min_inliers) {
+            continue;
+        }
+        let cd = abs(dot(plane.xyz, center_point.xyz) + plane.w);
+        if (best_inliers == 0u || inliers > best_inliers || (inliers == best_inliers && cd < best_center)) {
+            best_inliers = inliers;
+            best_center = cd;
+            best_plane = plane;
+            best_sample = vec3<u32>(ia, ib, ic);
+        }
+    }
+    if (best_inliers == 0u) {
+        return;
+    }
+    // Inliers: the sample first, then by distance (index order on ties).
+    var order: array<u32, 32>;
+    var keys: array<f32, 32>;
+    var m = 0u;
+    for (var k = 0u; k < n; k++) {
+        let d = abs(dot(best_plane.xyz, points[k]) + best_plane.w);
+        if (d < params.ransac_threshold) {
+            var key = d;
+            if (k == best_sample.x || k == best_sample.y || k == best_sample.z) {
+                key = -1.0;
+            }
+            // Insertion into the sorted keys (stable).
+            var at = m;
+            while (at > 0u && keys[at - 1u] > key) {
+                keys[at] = keys[at - 1u];
+                order[at] = order[at - 1u];
+                at -= 1u;
+            }
+            keys[at] = key;
+            order[at] = k;
+            m += 1u;
+        }
+    }
+    for (var k = 0u; k < min(m, MAX_ANCHORS); k++) {
+        anchors[i * MAX_ANCHORS + k] = pixels[order[k]];
+    }
+}
+
+// The anchor windows of pixel (x, y): a 3x3 grid 5 pixels apart around each
+// anchor (`Context::anchor_patches`).
+fn load_anchor_patches(x: u32, y: u32) {
+    let i = y * params.width + x;
+    anchor_count = 0u;
+    for (var k = 0u; k < MAX_ANCHORS; k++) {
+        let a = anchors[i * MAX_ANCHORS + k];
+        if (a == NO_VIEW) {
+            break;
+        }
+        let ax = i32(a % params.width);
+        let ay = i32(a / params.width);
+        let center = ref_gray(ax, ay);
+        var s1 = 0.0;
+        var s2 = 0.0;
+        var m = 0u;
+        for (var dy = -5; dy <= 5; dy += 5) {
+            for (var dx = -5; dx <= 5; dx += 5) {
+                let sx = clamp(ax + dx, 0, i32(params.width) - 1);
+                let sy = clamp(ay + dy, 0, i32(params.height) - 1);
+                let value = ref_gray(sx, sy) - center;
+                anchor_offsets[k * ANCHOR_SAMPLES + m] =
+                    vec2<f32>(f32(sx - i32(x)), f32(sy - i32(y)));
+                anchor_values[k * ANCHOR_SAMPLES + m] = value;
+                s1 += value;
+                s2 += value * value;
+                m += 1u;
+            }
+        }
+        let nn = f32(ANCHOR_SAMPLES);
+        anchor_centers[k] = center;
+        anchor_means[k] = s1 / nn;
+        anchor_vars[k] = s2 / nn - (s1 / nn) * (s1 / nn);
+        anchor_count = k + 1u;
+    }
+}
+
+// `deformable::fitted_plane` on pixel (x, y)'s anchors' current points, as
+// a plane `(n, rho)` facing the camera; zero for none.
+fn fitted_plane(x: u32, y: u32, ray: vec3<f32>) -> vec4<f32> {
+    let i = y * params.width + x;
+    var pixels: array<u32, 8>;
+    var points: array<vec3<f32>, 8>;
+    var n = 0u;
+    for (var k = 0u; k < MAX_ANCHORS; k++) {
+        let a = anchors[i * MAX_ANCHORS + k];
+        if (a == NO_VIEW) {
+            break;
+        }
+        let p = anchor_point(a);
+        if (p.w != 0.0) {
+            pixels[n] = a;
+            points[n] = p.xyz;
+            n += 1u;
+        }
+    }
+    if (n < 3u) {
+        return vec4<f32>(0.0);
+    }
+    let center = vec2<f32>(f32(x), f32(y));
+    var best = vec4<f32>(0.0);
+    var best_score = 3.0e38;
+    var found = false;
+    for (var it = 0u; it < 50u; it++) {
+        let ia = draws_below(n);
+        let ib = draws_below(n);
+        let ic = draws_below(n);
+        if (ia == ib || ib == ic || ia == ic) {
+            continue;
+        }
+        if (!in_triangle(pixel_xy(pixels[ia]), pixel_xy(pixels[ib]), pixel_xy(pixels[ic]), center)) {
+            continue;
+        }
+        let plane = plane_through(points[ia], points[ib], points[ic]);
+        if (all(plane.xyz == vec3<f32>(0.0))) {
+            continue;
+        }
+        var score = 0.0;
+        for (var k = 0u; k < n; k++) {
+            if (k != ia && k != ib && k != ic) {
+                score += abs(dot(plane.xyz, points[k]) + plane.w);
+            }
+        }
+        if (!found || score < best_score) {
+            found = true;
+            best_score = score;
+            best = plane;
+            if (score == 0.0) {
+                break;
+            }
+        }
+    }
+    if (!found) {
+        return vec4<f32>(0.0);
+    }
+    // n · X + w = 0 is n · X = rho with rho = -w, the normal facing the
+    // camera.
+    var plane = vec4<f32>(best.xyz, -best.w);
+    if (dot(plane.xyz, ray) > 0.0) {
+        plane = -plane;
+    }
+    return plane;
+}
+
 // Hypotheses rank by cost, or by ACMP's posterior where the planar prior
 // pass has a prior (`prior_depth > 0`, the prior's depth on the ray):
 // larger is better either way.
@@ -485,6 +979,13 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let ray = pixel_ray(x, y);
     load_patch(x, y);
+    // A weak pixel with anchors: matched with its deformable patch, its
+    // candidates the anchors' planes (APD-MVS).
+    anchor_count = 0u;
+    if (params.deformable == 1u && anchors[i * MAX_ANCHORS] != NO_VIEW) {
+        load_anchor_patches(x, y);
+    }
+    let weak = anchor_count > 0u;
     // The planar prior pass's prior here, and its depth on the ray.
     var prior_plane = vec4<f32>(0.0);
     var prior_depth = -1.0;
@@ -499,6 +1000,13 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     var cand: array<vec4<f32>, 9>;
     var valid: array<bool, 9>;
     for (var region = 0u; region < 8u; region++) {
+        if (weak) {
+            valid[region] = region < anchor_count;
+            if (valid[region]) {
+                cand[region] = planes[anchors[i * MAX_ANCHORS + region]];
+            }
+            continue;
+        }
         var count = 7u;
         if (region >= 4u) {
             count = 11u;
@@ -717,6 +1225,29 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let depth_perturbed = depth_now * (1.0 + (uniform01() - 0.5) * params.depth_perturbation);
     let normal_perturbed = perturb_normal(normal_now, ray, params.normal_perturbation);
+    // A weak pixel first tries the plane fitted to its anchors' depths.
+    if (weak) {
+        draw_state = rng_state | 1u;
+        let plane = fitted_plane(x, y, ray);
+        let depth = plane_depth(plane, ray);
+        if (any(plane.xyz != vec3<f32>(0.0)) && depth >= params.depth_min && depth <= params.depth_max) {
+            var sum = 0.0;
+            for (var j = 0u; j < n; j++) {
+                if (uniform_weights) {
+                    sum += view_cost(j, x, y, ray, plane);
+                } else if (weights[j] > 0.0) {
+                    sum += weights[j] * view_cost(j, x, y, ray, plane);
+                }
+            }
+            let c = sum / weight_sum;
+            let s = hypothesis_score(c, plane, ray, prior_plane, prior_depth);
+            if (s > best_score) {
+                best_cost = c;
+                best_score = s;
+                best_plane = plane;
+            }
+        }
+    }
     for (var hyp = 0u; hyp < 6u; hyp++) {
         var depth = depth_now;
         var normal = normal_now;
@@ -748,7 +1279,20 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
             best_plane = plane;
         }
     }
-    if (params.restore != 0u && best_cost >= pre_costs[i] - params.restore_margin) {
+    if (weak) {
+        // A weak pixel keeps the plain cost, which its neighbours' sampling
+        // compares; the detail restorer does not hold it.
+        anchor_count = 0u;
+        var sum = 0.0;
+        for (var j = 0u; j < n; j++) {
+            if (uniform_weights) {
+                sum += view_cost(j, x, y, ray, best_plane);
+            } else if (weights[j] > 0.0) {
+                sum += weights[j] * view_cost(j, x, y, ray, best_plane);
+            }
+        }
+        best_cost = sum / weight_sum;
+    } else if (params.restore != 0u && best_cost >= pre_costs[i] - params.restore_margin) {
         best_plane = current;
         best_cost = current_cost;
     }

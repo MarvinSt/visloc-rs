@@ -13,15 +13,18 @@
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 10] \
 //!     [--min-mean-consistency 0] [--no-average] \
-//!     [--mesh] [--mesh-voxel <world units>] [--mesh-voxel-pixels 2] [--mesh-min-weight 2]
+//!     [--deformable] \
+//!     [--mesh] [--mesh-voxel <world units>] [--mesh-voxel-pixels 1] [--mesh-min-weight 1]
 //! ```
 //!
 //! Three scales in ACMMP's order by default: at every scale a photometric
 //! pass, ACMP's planar prior pass (`--no-planar-prior` leaves it out) and
 //! the geometric passes; `--scales 1` runs one. `--gpu` (a `--features gpu`
 //! build) runs PatchMatch on the GPU. `--mesh` also writes `mesh.ply`: the
-//! fused points' depths in a TSDF (voxels of two pixels' footprint by
-//! default), extracted with surface nets.
+//! depths that source views agree with in a TSDF (voxels of one pixel's
+//! footprint by default), extracted with surface nets. `--deformable` adds
+//! APD-MVS's deformable patches for weak-texture pixels at the finer
+//! scales.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -136,10 +139,6 @@ fn main() {
             other => panic!("unknown argument {other}"),
         }
     }
-    assert!(
-        !(deformable && use_gpu),
-        "--deformable runs on the CPU only for now"
-    );
     let sparse = sparse.expect("--sparse is required");
     let images = images.expect("--images is required");
     let out = out.expect("--out is required");

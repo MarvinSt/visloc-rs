@@ -6,7 +6,8 @@
 //! cargo run --release -p visloc-mvs --example mvs -- \
 //!     --sparse <dir with cameras.txt/images.txt/points3D.txt> \
 //!     --images <image dir> --out <dir> [--max-image-size 3200] \
-//!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 3] [--gpu] \
+//!     [--sources 10] [--iterations 3] [--geom-passes 2] [--geom-iterations 3] \
+//!     [--scales 3] [--gpu] \
 //!     [--view-selection confidence|sampled] [--init-top-k 3] \
 //!     [--restorer infinity|start|off] [--detail-threshold 0.1] [--no-planar-prior] \
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
@@ -37,6 +38,7 @@ fn main() {
     let mut pm_options = PatchMatchOptions::default();
     let fusion_options = FusionOptions::default();
     let mut geom_passes = 2usize;
+    let mut geom_iterations = None;
     let mut scales = 3usize;
     let mut restorer = "infinity".to_owned();
     let mut detail_threshold = 0.1f32;
@@ -66,6 +68,7 @@ fn main() {
             }
             "--init-top-k" => pm_options.init_top_k = value().parse().unwrap(),
             "--geom-passes" => geom_passes = value().parse().unwrap(),
+            "--geom-iterations" => geom_iterations = Some(value().parse().unwrap()),
             "--scales" => scales = value().parse().unwrap(),
             "--restorer" => restorer = value(),
             "--detail-threshold" => detail_threshold = value().parse().unwrap(),
@@ -175,6 +178,7 @@ fn main() {
             .collect()
     } else if scales > 1 {
         let options = MultiScaleOptions {
+            geom_iterations: geom_iterations.unwrap_or(pm_options.iterations),
             patch_match: pm_options,
             scales,
             geom_passes,
@@ -211,9 +215,13 @@ fn main() {
             );
             eprintln!("planar prior pass: {:.1} s", t.elapsed().as_secs_f64());
         }
+        let geom_options = PatchMatchOptions {
+            iterations: geom_iterations.unwrap_or(pm_options.iterations),
+            ..pm_options.clone()
+        };
         for pass in 0..geom_passes {
             let t = Instant::now();
-            maps = geometric_pass(&ws, maps, &pm_options, &run);
+            maps = geometric_pass(&ws, maps, &geom_options, &run);
             eprintln!(
                 "geometric pass {}: {:.1} s",
                 pass + 1,

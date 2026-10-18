@@ -27,6 +27,9 @@ pub struct MultiScaleOptions {
     pub scales: usize,
     /// Geometric passes per scale.
     pub geom_passes: usize,
+    /// Red-black iterations of each geometric pass (`patch_match`'s for
+    /// the other passes); ACMMP's code runs 2.
+    pub geom_iterations: usize,
     /// The detail restorer of the photometric pass at each finer scale.
     pub restorer: DetailRestorer,
     /// The planar prior pass after each scale's photometric pass, if any.
@@ -39,6 +42,7 @@ impl Default for MultiScaleOptions {
             patch_match: PatchMatchOptions::default(),
             scales: 3,
             geom_passes: 2,
+            geom_iterations: 3,
             restorer: DetailRestorer::Infinity(0.1),
             planar_prior: Some(PlanarPriorOptions::default()),
         }
@@ -158,6 +162,10 @@ pub fn multi_scale_depth_maps(
     // The current level, `None` for `ws`.
     let mut current = coarser.next();
     let pm = &options.patch_match;
+    let geom_pm = PatchMatchOptions {
+        iterations: options.geom_iterations,
+        ..pm.clone()
+    };
     // The planar prior and geometric passes of one scale.
     let refine = |level: usize,
                   ws: &Workspace,
@@ -176,7 +184,7 @@ pub fn multi_scale_depth_maps(
         }
         for pass in 0..options.geom_passes {
             let t = std::time::Instant::now();
-            maps = geometric_pass(ws, maps, pm, geometric);
+            maps = geometric_pass(ws, maps, &geom_pm, geometric);
             log(&format!(
                 "scale {level}: geometric {} {:.1} s",
                 pass + 1,

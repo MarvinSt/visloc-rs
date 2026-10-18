@@ -189,6 +189,13 @@ impl Reconstruction {
             .get(&camera_id)
             .unwrap_or_else(|| panic!("camera {camera_id} does not exist"))
     }
+    /// Whether any camera is a spherical (equirectangular) panorama, which
+    /// only the native bundle adjustment solves.
+    pub fn has_spherical_camera(&self) -> bool {
+        self.cameras
+            .values()
+            .any(|c| c.model == visloc_core::types::CameraModel::Equirectangular)
+    }
     pub fn rig_mut(&mut self, rig_id: RigT) -> &mut Rig {
         self.rigs
             .get_mut(&rig_id)

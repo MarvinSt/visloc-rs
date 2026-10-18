@@ -57,7 +57,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use nalgebra::Vector3;
+use nalgebra::{Point2, Vector3};
 use visloc_core::geometry::{reproject, SE3};
 use visloc_vision::pnp::{
     estimate_gr6p_ransac_with_config, Correspondence2D3D, GaussNewtonPoseRefiner,
@@ -552,10 +552,9 @@ impl IncrementalMapper {
         let num_points2d = recon.image(image_id).num_points2d();
         for idx in 0..num_points2d {
             let xy = recon.image(image_id).points2d[idx].xy;
-            let Some(n) = camera.normalize_pixel(&xy) else {
+            let Some(query_ray) = pixel_ray(&camera, &xy) else {
                 continue;
             };
-            let query_ray = Vector3::new(n.x, n.y, 1.0);
             for corr in graph.find_correspondences(image_id as usize, idx) {
                 let world_id = corr.image_id as ImageT;
                 if !recon.is_image_registered(world_id) {
@@ -580,12 +579,13 @@ impl IncrementalMapper {
                 };
                 let world_image = recon.image(world_id);
                 let world_camera = recon.camera(world_image.camera_id);
-                let Some(wn) = world_camera
-                    .normalize_pixel(&world_image.points2d[corr.point2d_idx as usize].xy)
-                else {
+                let Some(world_ray_cam) = pixel_ray(
+                    world_camera,
+                    &world_image.points2d[corr.point2d_idx as usize].xy,
+                ) else {
                     continue;
                 };
-                let world_ray = cam_from_world.rotation.inverse() * Vector3::new(wn.x, wn.y, 1.0);
+                let world_ray = cam_from_world.rotation.inverse() * world_ray_cam;
                 let (Ok(world_obs), Ok(query_obs)) = (
                     GeneralizedCameraObservation::new(*centre, world_ray),
                     GeneralizedCameraObservation::new(Vector3::zeros(), query_ray),
@@ -608,13 +608,13 @@ impl IncrementalMapper {
             return false;
         }
 
-        let (fx, fy, _, _) = camera.intrinsics().unwrap_or((1.0, 1.0, 0.0, 0.0));
+        let pixels_per_radian = camera.pixels_per_radian().unwrap_or(1.0);
         let cfg = GeneralizedRelativePoseRansacConfig {
             max_iterations: 2000,
             min_iterations: 100,
             confidence: 0.9999,
             // Epipolar errors gate inliers more tightly (`0.5 *`).
-            inlier_angular_threshold: 0.5 * options.abs_pose_max_error / (0.5 * (fx + fy)),
+            inlier_angular_threshold: 0.5 * options.abs_pose_max_error / pixels_per_radian,
             seed: options.random_seed,
             min_inliers: 6,
         };
@@ -675,14 +675,16 @@ impl IncrementalMapper {
                 self.triangulator.add_modified_point3d(point3d_id);
                 continue;
             }
-            // Otherwise triangulate a new track; as in COLMAP, the default
-            // (angular) residual with `abs_pose_max_error` as its bound.
+            // Otherwise triangulate a new track with the default (angular)
+            // residual. COLMAP bounds it by `abs_pose_max_error` (pixels) as
+            // if it were radians, which accepts every ray; convert, as the
+            // GR6P threshold above does.
             let mut tri_views = views.clone();
             tri_views.push((image_id, idx));
             let Some((xyz, inliers)) = estimate_triangulation_of_views(
                 recon,
                 &tri_views,
-                options.abs_pose_max_error,
+                options.abs_pose_max_error / pixels_per_radian,
                 options.filter_min_tri_angle_deg.to_radians(),
             ) else {
                 continue;
@@ -1558,6 +1560,16 @@ impl IncrementalMapper {
         }
         ranked
     }
+}
+
+/// The camera-frame ray of pixel `xy`: `(x, y, 1)` on the normalized image
+/// plane, or a spherical camera's unit ray, which may point behind it.
+fn pixel_ray(camera: &visloc_core::types::Camera, xy: &Point2<f64>) -> Option<Vector3<f64>> {
+    if camera.model.is_spherical() {
+        return camera.unit_ray_from_pixel(xy);
+    }
+    let n = camera.normalize_pixel(xy)?;
+    Some(Vector3::new(n.x, n.y, 1.0))
 }
 
 #[cfg(test)]

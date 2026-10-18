@@ -536,7 +536,9 @@ fn score_hypothesis(
         let Some(projected) = reproject(camera, pose, &correspondence.point3d) else {
             continue;
         };
-        let error = (projected - correspondence.point2d).norm();
+        let error = camera
+            .pixel_residual(&projected, &correspondence.point2d)
+            .norm();
         if error <= threshold {
             inliers.push(index);
             error_sum += error;
@@ -567,7 +569,9 @@ fn score_pose(
         let Some(projected) = reproject(camera, pose, &correspondence.point3d) else {
             continue;
         };
-        let error = (projected - correspondence.point2d).norm();
+        let error = camera
+            .pixel_residual(&projected, &correspondence.point2d)
+            .norm();
         if error <= threshold {
             inliers.push(index);
             inlier_errors.push(error);

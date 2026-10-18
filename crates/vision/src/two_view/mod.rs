@@ -54,6 +54,7 @@ pub mod five_point;
 pub mod fundamental;
 pub mod homography;
 pub mod rescue;
+pub mod spherical;
 
 pub use colmap_verification::{
     two_view_pose_and_triangulation_angle, two_view_triangulation_angle, ConfigurationType,

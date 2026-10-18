@@ -313,6 +313,24 @@ The pipeline has three stages:
    `--normal-weight 0.005` depth-normal loss makes surfaces smoother for
    -0.2 dB.
 
+**360° cameras.** `--equirect` takes a folder of 2:1 equirectangular
+panoramas and cuts each one into its six 90° cube faces, at most
+`--max-size` square. The faces then go through the three stages as pinhole
+images with their exact focal length held fixed, the six of a panorama as
+one rig: one pose per panorama, the faces at its centre
+(`--equirect-independent-faces` solves them as separate cameras). Faces of
+one panorama are never matched with each other, and `--window` counts
+panoramas. `--equirect-native` runs SfM on the panoramas themselves as
+equirectangular cameras (COLMAP's `EQUIRECTANGULAR`), at most
+`2 x --max-size` wide: several times faster, with fewer points. Either way
+training sees the cube faces that see SfM points; a camera mount or selfie
+stick below the camera is left out. Panoramas taken from almost the same
+spot (slow video) have too little parallax to reconstruct: space the
+frames out. Without `--equirect`, a folder
+that looks like panoramas gets a warning: 2:1 images whose left and right
+edges meet and whose top and bottom rows are poles, or whose metadata says
+equirectangular. The pinhole model gives no usable result on them.
+
 ## Visual-Inertial SLAM (Basalt Rust port)
 
 A separate, faithful Rust port of upstream

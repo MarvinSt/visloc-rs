@@ -50,6 +50,16 @@
 //!   *all* cross-frame image-pair correspondences (not just the picked
 //!   pair's own) and the same final recomposition
 //!   `orig_cam2_from_rig2 * rig2_from_rig1 * inverse(orig_cam1_from_rig1)`.
+//! - **Not in COLMAP: central rigs skip that step.** When every sensor of
+//!   both rigs sits at its rig's origin (all `sensor_from_rig` translations
+//!   zero, e.g. the cube faces of one panorama), every ray passes through
+//!   the rig centre: GR6P is degenerate there and the pair's ordinary
+//!   `cam2_from_cam1` (up to scale, like any single-camera init) is
+//!   already the answer.
+//! - **Not in COLMAP's port: spherical cameras.** A pair with an
+//!   equirectangular camera initializes on unit rays
+//!   (`estimate_initial_spherical_two_view_geometry`), without the
+//!   forward-motion gate.
 
 use nalgebra::{Point2, Vector3};
 use std::collections::BTreeMap;
@@ -285,6 +295,11 @@ pub fn estimate_initial_two_view_geometry(
         ));
         return None;
     }
+    if camera1.model.is_spherical() || camera2.model.is_spherical() {
+        return estimate_initial_spherical_two_view_geometry(
+            options, recon, &matches, image1, image2, &camera1, &camera2,
+        );
+    }
     let correspondences: Vec<TwoViewCorrespondence> = matches
         .iter()
         .map(|&(i1, i2)| TwoViewCorrespondence::new(image1.points2d[i1].xy, image2.points2d[i2].xy))
@@ -365,13 +380,136 @@ pub fn estimate_initial_two_view_geometry(
     let rig1 = recon.rig(frame1.rig_id());
     let rig2 = recon.rig(frame2.rig_id());
 
-    if rig1.num_sensors() > 1 || rig2.num_sensors() > 1 {
+    if (rig1.num_sensors() > 1 || rig2.num_sensors() > 1)
+        && !(rig_is_central(rig1) && rig_is_central(rig2))
+    {
         estimate_initial_generalized_two_view_geometry(
             options, recon, graph, image1, image2, frame1, frame2, rig1, rig2,
         )
     } else {
         Some(cam2_from_cam1)
     }
+}
+
+/// Not in COLMAP's port: [`estimate_initial_two_view_geometry`] for a pair
+/// with a spherical (equirectangular) camera, on unit rays: the essential
+/// matrix from [`visloc_vision::two_view::spherical`] (its angular
+/// threshold `init_max_error` over the pixels per radian), no forward-
+/// motion gate (a panorama has no forward), and the triangulation angle
+/// gated per view direction (below). Single-camera frames only.
+fn estimate_initial_spherical_two_view_geometry(
+    options: &InitGateOptions,
+    recon: &Reconstruction,
+    matches: &[(usize, usize)],
+    image1: &Image,
+    image2: &Image,
+    camera1: &super::reconstruction::Camera,
+    camera2: &super::reconstruction::Camera,
+) -> Option<SE3> {
+    use visloc_vision::two_view::spherical::{
+        estimate_spherical_relative_pose, SphericalRansacConfig,
+    };
+    let (image_id1, image_id2) = (image1.image_id, image2.image_id);
+    let frame1 = recon.frame(image1.frame_id);
+    let frame2 = recon.frame(image2.frame_id);
+    if recon.rig(frame1.rig_id()).num_sensors() > 1 || recon.rig(frame2.rig_id()).num_sensors() > 1
+    {
+        debug_init(&format!(
+            "init rejected: spherical camera in a multi-sensor rig (images {image_id1}/{image_id2})"
+        ));
+        return None;
+    }
+    let mut pairs = Vec::with_capacity(matches.len());
+    let (mut rays1, mut rays2) = (Vec::with_capacity(matches.len()), Vec::new());
+    for &(i1, i2) in matches {
+        let (xy1, xy2) = (image1.points2d[i1].xy, image2.points2d[i2].xy);
+        if let (Some(r1), Some(r2)) = (
+            camera1.unit_ray_from_pixel(&xy1),
+            camera2.unit_ray_from_pixel(&xy2),
+        ) {
+            pairs.push((xy1, xy2));
+            rays1.push(r1);
+            rays2.push(r2);
+        }
+    }
+    let pixels_per_radian = 0.5
+        * (camera1.pixels_per_radian().unwrap_or(1.0) + camera2.pixels_per_radian().unwrap_or(1.0));
+    let config = SphericalRansacConfig {
+        max_angle: options.init_max_error / pixels_per_radian,
+        seed: options.random_seed,
+        ..SphericalRansacConfig::default()
+    };
+    let Some(pose) = estimate_spherical_relative_pose(&rays1, &rays2, &config) else {
+        debug_init(&format!(
+            "init rejected: spherical two-view estimate failed (images {image_id1}/{image_id2})"
+        ));
+        return None;
+    };
+    if pose.inliers.len() < options.init_min_num_inliers {
+        debug_init(&format!(
+            "init rejected: spherical inliers={} < init_min_num_inliers={} (images {image_id1}/{image_id2})",
+            pose.inliers.len(),
+            options.init_min_num_inliers
+        ));
+        return None;
+    }
+    // Exact for any angle (`from_matrix` iterates and can stall near 180°).
+    let rotation = nalgebra::Rotation3::from_matrix_unchecked(pose.rotation);
+    let cam2_from_cam1 = SE3::new(
+        nalgebra::UnitQuaternion::from_rotation_matrix(&rotation),
+        pose.translation,
+    );
+    let identity = SE3::identity();
+    let cam1_center = nalgebra::Point3::origin();
+    let cam2_center = nalgebra::Point3::from(cam2_from_cam1.inverse().translation);
+    // The triangulation angle of each inlier, with the cube face its ray
+    // points through in camera 1 (the largest of its six axis components).
+    // A panorama always shows the epipoles, where any motion has no
+    // parallax, and usually the far distance: the median over the whole
+    // sphere sits far below what any one view direction sees. The gate is
+    // the largest median of a face with at least half `init_min_num_inliers`
+    // inliers: a pinhole camera looking that way would pass COLMAP's.
+    let mut by_face: [Vec<f64>; 6] = Default::default();
+    for &k in &pose.inliers {
+        let (xy1, xy2) = pairs[k];
+        let Some(xyz) =
+            triangulate_dlt(&[(&identity, xy1, camera1), (&cam2_from_cam1, xy2, camera2)])
+        else {
+            continue;
+        };
+        let ray = rays1[k];
+        let axis = (0..3)
+            .max_by(|&a, &b| ray[a].abs().total_cmp(&ray[b].abs()))
+            .expect("three axes");
+        let face = 2 * axis + usize::from(ray[axis] < 0.0);
+        by_face[face].push(calculate_triangulation_angle(cam1_center, cam2_center, xyz));
+    }
+    let min_face_inliers = (options.init_min_num_inliers / 2).max(1);
+    let best_median = by_face
+        .iter_mut()
+        .filter(|angles| angles.len() >= min_face_inliers)
+        .map(|angles| {
+            angles.sort_by(|a, b| a.total_cmp(b));
+            angles[angles.len() / 2]
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    if best_median <= options.init_min_tri_angle_deg.to_radians() {
+        debug_init(&format!(
+            "init rejected: best face median tri angle {:.2}deg <= {:.2}deg (images {image_id1}/{image_id2})",
+            best_median.to_degrees(),
+            options.init_min_tri_angle_deg
+        ));
+        return None;
+    }
+    Some(cam2_from_cam1)
+}
+
+/// Every sensor of `rig` at the rig's origin: each non-reference sensor
+/// calibrated with a zero `sensor_from_rig` translation.
+fn rig_is_central(rig: &Rig) -> bool {
+    rig.non_ref_sensors()
+        .values()
+        .all(|s| s.as_ref().is_some_and(|s| s.translation.norm() < 1.0e-9))
 }
 
 fn unit_camera() -> super::reconstruction::Camera {

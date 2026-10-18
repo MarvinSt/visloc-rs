@@ -24,7 +24,7 @@
 //! depths that source views agree with in a TSDF (voxels of one pixel's
 //! footprint by default), extracted with surface nets. `--deformable` adds
 //! APD-MVS's deformable patches for weak-texture pixels at the finer
-//! scales.
+//! scales (experimental: below the defaults on ETH3D, see docs/mvs.md).
 
 use std::path::PathBuf;
 use std::time::Instant;

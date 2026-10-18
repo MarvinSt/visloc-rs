@@ -395,6 +395,40 @@ with credible-pixel blocks of 20, 10 and 5 pixels at the finest scale
 and office against 82.6% with one prior pass, within 0.4 point on each
 scene, in 1.45 times the time; the run stopped there.
 
+### Tried and not adopted: APD-MVS's deformable patches
+
+`--deformable` adds APD-MVS's adaptive patch deformation (Y. Wang et al.,
+CVPR 2023; [`deformable`](../crates/mvs/src/deformable.rs)) at the two
+finer scales. Each pass sorts its pixels at its end: a pixel is strong
+when its cost along its ray has one clear minimum near its depth. A weak
+pixel in the next pass is matched with its own window plus small windows
+at strong anchors that RANSAC finds coplanar around it, and it tries
+only the anchors' planes and a plane fitted to them. On an L4 at
+3200 px, ground-truth poses, F1 at 1, 2 and 5 cm:
+
+| Run | terrace | office |
+|---|---|---|
+| Defaults (r37) | 84.1 / 91.0 / 95.7% | 68.4 / 79.0 / 88.6% |
+| `--deformable`, sorted at each pass's start (`70d438e`) | 76.3 / 83.9 / 90.0% | 64.5 / 75.4 / 85.3% |
+| `--deformable`, sorted at each pass's end (`96257a8`) | 82.9 / 90.1 / 95.1% | 65.0 / 76.1 / 86.2% |
+
+- **Sorting.** The first version sorted at the start of each pass. At a
+  new scale that meant sorting the coarse depths upsampled. On office at
+  400 px the cost curves had their minima 8 to 11 steps off the pixel's
+  depth, and 72 to 93% of terrace's pixels came out weak. Sorting at the
+  end of each pass, as APD's code does, makes the first pass at a scale
+  start from the coarser scale's classes. That brought terrace down to
+  30% weak in that pass and recovered 6.2 points of F1.
+- **Still below the defaults.** On terrace 40 to 49% of pixels stay weak
+  in the later passes. A fifth to a third of the anchored pixels move by
+  more than 1% in every pass, against 4 to 13% of the others: the anchor
+  planes do not settle. ACMP's planar prior and the detail restorer
+  already cover weak texture here. APD's own pipeline has neither; it
+  filters strong pixels and refines depths locally after each pass.
+  Matching it would mean porting that pipeline, not the patches alone.
+- **Time:** about 3.5 times the defaults on these scenes (12 and 14
+  minutes with the debug statistics on).
+
 ### Fusion settings
 
 The same depth maps fused with different rules (CPU runs with one

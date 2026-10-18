@@ -179,6 +179,10 @@ All notable changes to `visloc-rs` will be documented here.
     a TSDF and writes `mesh.ply` (surface nets); on pipes at 1600 px F1
     68.1% at 2 cm against the cloud's 74.8%. The TSDF moved from
     `visloc-gsplat-train` to `visloc-gsplat-core` (feature `mesh`).
+  - **Experimental:** `--deformable`, APD-MVS's deformable patches for
+    weak texture (CPU and GPU). On an L4 at 3200 px it scored F1 90.1% on
+    terrace and 76.1% on office at 2 cm, against 91.0% and 79.0% for the
+    defaults, so it is off (docs/mvs.md).
   - **Run it:** `cargo run --release -p visloc-mvs --features gpu
     --example mvs -- --sparse <model> --images <dir> --out <dir> --gpu`.
 

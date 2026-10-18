@@ -11,10 +11,10 @@ use crate::workspace::Workspace;
 ///
 /// By default one agreeing source view within 10° of normal angle keeps a
 /// point; ACMM's and ACMP's code ask for two. Over the 13 ETH3D training
-/// scenes at 3200 px (with the planar prior), F1 at 2 cm is 81.4% with
-/// these defaults, 81.3% at 15°, 80.6% at 30° and 79.3% with two views at
-/// 30°. On pipes at 1600 px, one view instead of two raises F1 from 66.9%
-/// to 76.0%.
+/// scenes at 3200 px, F1 at 2 cm is 83.5% with these defaults and 83.1% at
+/// 15° (three scales); with one scale, 81.4%, 81.3% at 15°, 80.6% at 30°
+/// and 79.3% with two views at 30°. On pipes at 1600 px, one view instead
+/// of two raises F1 from 66.9% to 76.0%.
 #[derive(Debug, Clone)]
 pub struct FusionOptions {
     /// Pixels between the pixel and the source depth's point projected back.
@@ -25,6 +25,15 @@ pub struct FusionOptions {
     pub max_normal_angle_deg: f64,
     /// Source views that must agree.
     pub min_consistent_views: usize,
+    /// ACMMP's released code also asks the agreeing views to agree well on
+    /// average: the mean over them of `exp(-(e + 200 d + 10 a))`, `e` the
+    /// reprojection error in pixels, `d` the relative depth difference and
+    /// `a` the normal angle in radians, must exceed this (0.3 there); 0
+    /// leaves it out.
+    pub min_mean_consistency: f64,
+    /// A point averages the agreeing pixels; without, it is the reference
+    /// pixel's (ACMMP's released code).
+    pub average: bool,
 }
 
 impl Default for FusionOptions {
@@ -34,6 +43,8 @@ impl Default for FusionOptions {
             max_relative_depth_diff: 0.01,
             max_normal_angle_deg: 10.0,
             min_consistent_views: 1,
+            min_mean_consistency: 0.0,
+            average: true,
         }
     }
 }
@@ -81,6 +92,7 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
                 let point = view.unproject(u, v, depth);
                 let normal = world_normal(i, map.normal[p]);
                 agreeing.clear();
+                let mut consistency = 0.0;
                 let mut sum_point = point;
                 let mut sum_normal = normal;
                 let mut sum_color = view.rgb[p].map(f64::from);
@@ -106,11 +118,14 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
                     let reproj = ((ru - u).powi(2) + (rv - v).powi(2)).sqrt();
                     let depth_diff = (rz - depth).abs() / depth;
                     let source_normal = world_normal(j, source_map.normal[q]);
+                    let cos_angle = normal.dot(&source_normal);
                     if reproj <= options.max_reproj_error
                         && depth_diff <= options.max_relative_depth_diff
-                        && normal.dot(&source_normal) >= cos_max_angle
+                        && cos_angle >= cos_max_angle
                     {
                         agreeing.push((j, q));
+                        let angle = cos_angle.clamp(-1.0, 1.0).acos();
+                        consistency += (-(reproj + 200.0 * depth_diff + 10.0 * angle)).exp();
                         sum_point += source_point;
                         sum_normal += source_normal;
                         for (s, c) in sum_color.iter_mut().zip(source.rgb[q]) {
@@ -118,14 +133,23 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
                         }
                     }
                 }
-                if agreeing.len() >= options.min_consistent_views {
-                    let count = (agreeing.len() + 1) as f64;
-                    let position = sum_point / count;
-                    let normal = sum_normal.normalize();
+                let consistent = agreeing.len() >= options.min_consistent_views
+                    && consistency >= options.min_mean_consistency * agreeing.len() as f64;
+                if consistent {
+                    let (position, normal, color) = if options.average {
+                        let count = (agreeing.len() + 1) as f64;
+                        (
+                            sum_point / count,
+                            sum_normal.normalize(),
+                            sum_color.map(|s| s / count),
+                        )
+                    } else {
+                        (point, normal, view.rgb[p].map(f64::from))
+                    };
                     points.push(FusedPoint {
                         position: [position.x as f32, position.y as f32, position.z as f32],
                         normal: [normal.x as f32, normal.y as f32, normal.z as f32],
-                        color: sum_color.map(|s| (s / count).round().clamp(0.0, 255.0) as u8),
+                        color: color.map(|c| c.round().clamp(0.0, 255.0) as u8),
                     });
                     set(&mut used[i], p);
                     for &(j, q) in &agreeing {

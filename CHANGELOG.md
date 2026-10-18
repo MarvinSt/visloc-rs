@@ -231,26 +231,37 @@ All notable changes to `visloc-rs` will be documented here.
 
 - **Multi-view stereo: `visloc-mvs`.** Dense point clouds from a COLMAP
   sparse model with undistorted images: PatchMatch depth and normal maps
-  (ACMH, with ACMP's planar prior and ACMM's geometric consistency and
-  multi-scale scheme), fused into `fused.ply`, on the CPU or on the GPU
-  through wgpu (`--features gpu`). Details and scores in `docs/mvs.md`.
+  (ACMH, with ACMP's planar prior and ACMM's geometric consistency, on an
+  image pyramid in ACMMP's order), fused into `fused.ply`, on the CPU or
+  on the GPU through wgpu (`--features gpu`). Details and scores in
+  `docs/mvs.md`.
   - **ETH3D high-res training, all 13 scenes at 3200 px, one NVIDIA L4:**
-    F1 81.4% at 2 cm on average (accuracy 87.7%, completeness 76.9%) with
-    the example's defaults (one scale, the planar prior pass, two
-    geometric passes). On the same scenes ACMMP reports 83.42%, ACMP
-    79.79%, ACMM 78.86% and COLMAP 67.66%.
+    F1 83.5% at 2 cm on average (accuracy 86.6%, completeness 81.0%) with
+    the example's defaults (three scales, each with a photometric pass,
+    the planar prior pass and two geometric passes). On the same scenes
+    ACMMP reports 83.42%, HPM-MVS 84.58%, ACMP 79.79%, ACMM 78.86% and
+    COLMAP 67.66%.
+  - **Multi-scale** in ACMMP's order: a finer scale's photometric pass
+    starts from the upsampled coarser maps, and the detail restorer lets
+    a pixel leave its upsampled plane only for one that beats the plane
+    at infinity's cost by 0.1, as ACMM's and ACMMP's code compute. Three
+    scales score 2.1 points above one (81.4%), most on meadow (+12.1),
+    kicker (+4.7) and pipes (+3.2), with the detailed scenes within half a
+    point. Our first scheme, with the restorer of ACMM's paper and no
+    prior, scored 78.0%: it held upsampled planes that were slightly off.
+    `--scales 1` runs one scale.
   - **Planar prior** (ACMP): credible pixels are triangulated into
     planes that a prior pass favours where the costs cannot tell planes
-    apart. It raises F1 on all 13 scenes, from 79.5% to 81.4%, most on
-    office (+7.2 points), meadow (+3.8) and pipes (+3.4);
-    `--no-planar-prior` leaves it out. ACMM's multi-scale scheme
-    (`--scales 3`, without the prior) scores 78.0%: it helps weakly
-    textured scenes and costs accuracy on detailed ones.
-  - **Time:** 77 minutes for all 13 scenes, 1:54 to 14:17 per scene,
-    loading and fusion included (65 minutes without the planar prior).
+    apart. With one scale it raises F1 on all 13 scenes, from 79.5% to
+    81.4%, most on office (+7.2 points), meadow (+3.8) and pipes (+3.4);
+    `--no-planar-prior` leaves it out.
+  - **Time:** 74 minutes for all 13 scenes, 1:53 to 13:46 per scene,
+    loading and fusion included (65 minutes with one scale).
   - **Fusion:** one agreeing source view within 10° keeps a point by
-    default (ACMM and ACMP ask for two): over the 13 scenes, 81.4%
-    against 79.3% with two views at 30°.
+    default (ACMM and ACMP ask for two): with one scale, 81.4% against
+    79.3% with two views at 30°. ACMMP's mean consistency and reference
+    points are options (`--min-mean-consistency`, `--no-average`), off by
+    default.
   - **Memory:** one set of depth maps at a time (a geometric pass and
     fusion drop each map after the last view that reads it), costs only
     with `--save-maps`, grey levels computed from the colours. On ETH3D

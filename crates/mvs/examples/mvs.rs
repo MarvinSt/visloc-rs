@@ -1,30 +1,32 @@
 //! Multi-view stereo on a COLMAP sparse model with undistorted (pinhole)
-//! images: PatchMatch depth maps, geometric-consistency passes, optionally
-//! on an image pyramid, then fusion into `fused.ply`.
+//! images: PatchMatch depth maps, planar prior and geometric-consistency
+//! passes on an image pyramid, then fusion into `fused.ply`.
 //!
 //! ```text
 //! cargo run --release -p visloc-mvs --example mvs -- \
 //!     --sparse <dir with cameras.txt/images.txt/points3D.txt> \
 //!     --images <image dir> --out <dir> [--max-image-size 3200] \
-//!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 1] [--gpu] \
-//!     [--view-selection confidence|sampled] [--init-top-k 3] [--detail-threshold 0.1] \
-//!     [--no-planar-prior] [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
-//!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 10]
+//!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 3] [--gpu] \
+//!     [--view-selection confidence|sampled] [--init-top-k 3] \
+//!     [--restorer infinity|start|off] [--detail-threshold 0.1] [--no-planar-prior] \
+//!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
+//!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 10] \
+//!     [--min-mean-consistency 0] [--no-average]
 //! ```
 //!
-//! With one scale, ACMP's planar prior pass runs between the photometric
-//! and the geometric passes (`--no-planar-prior` leaves it out); `--scales 3`
-//! runs ACMM's multi-scale scheme instead, without it; `--gpu` (a
-//! `--features gpu` build) runs PatchMatch on the GPU.
+//! Three scales in ACMMP's order by default: at every scale a photometric
+//! pass, ACMP's planar prior pass (`--no-planar-prior` leaves it out) and
+//! the geometric passes; `--scales 1` runs one. `--gpu` (a `--features gpu`
+//! build) runs PatchMatch on the GPU.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use visloc_mvs::{
-    estimate, estimate_with_prior, fuse, geometric_pass, multi_scale_depth_maps, photometric_score,
-    planar_prior_pass, read_text_model, write_ply, DepthMap, Estimator, FusionOptions,
-    MultiScaleOptions, PatchMatchOptions, PlanarPrior, PlanarPriorOptions, ViewSelection,
-    Workspace, WorkspaceOptions,
+    estimate, estimate_from, estimate_with_prior, fuse, geometric_pass, multi_scale_depth_maps,
+    planar_prior_pass, read_text_model, write_ply, DepthMap, DetailRestorer, Estimator,
+    FusionOptions, MultiScaleOptions, PatchMatchOptions, PlanarPrior, PlanarPriorOptions,
+    ViewSelection, Workspace, WorkspaceOptions,
 };
 
 fn main() {
@@ -35,8 +37,9 @@ fn main() {
     let mut pm_options = PatchMatchOptions::default();
     let fusion_options = FusionOptions::default();
     let mut geom_passes = 2usize;
-    let mut scales = 1usize;
-    let mut detail_threshold = None;
+    let mut scales = 3usize;
+    let mut restorer = "infinity".to_owned();
+    let mut detail_threshold = 0.1f32;
     let mut use_gpu = false;
     let mut save_depth = false;
     let mut save_maps = false;
@@ -64,7 +67,8 @@ fn main() {
             "--init-top-k" => pm_options.init_top_k = value().parse().unwrap(),
             "--geom-passes" => geom_passes = value().parse().unwrap(),
             "--scales" => scales = value().parse().unwrap(),
-            "--detail-threshold" => detail_threshold = Some(value().parse().unwrap()),
+            "--restorer" => restorer = value(),
+            "--detail-threshold" => detail_threshold = value().parse().unwrap(),
             "--gpu" => use_gpu = true,
             "--planar-prior" => planar_prior = Some(true),
             "--no-planar-prior" => planar_prior = Some(false),
@@ -75,18 +79,23 @@ fn main() {
             "--max-reproj" => fusion_options.max_reproj_error = value().parse().unwrap(),
             "--max-depth-diff" => fusion_options.max_relative_depth_diff = value().parse().unwrap(),
             "--max-normal-angle" => fusion_options.max_normal_angle_deg = value().parse().unwrap(),
+            "--min-mean-consistency" => {
+                fusion_options.min_mean_consistency = value().parse().unwrap()
+            }
+            "--no-average" => fusion_options.average = false,
             other => panic!("unknown argument {other}"),
         }
     }
     let sparse = sparse.expect("--sparse is required");
     let images = images.expect("--images is required");
     let out = out.expect("--out is required");
-    // The planar prior pass runs with one scale (by default).
-    assert!(
-        !(planar_prior == Some(true) && scales > 1),
-        "--planar-prior runs with one scale"
-    );
-    let planar_prior = planar_prior.unwrap_or(scales == 1);
+    let planar_prior = planar_prior.unwrap_or(true);
+    let restorer = match restorer.as_str() {
+        "infinity" => DetailRestorer::Infinity(detail_threshold),
+        "start" => DetailRestorer::Start(detail_threshold),
+        "off" => DetailRestorer::Off,
+        other => panic!("--restorer: infinity, start or off, not {other}"),
+    };
     std::fs::create_dir_all(&out).expect("creating the output directory");
 
     let started = Instant::now();
@@ -148,28 +157,40 @@ fn main() {
         }
         map
     };
-    let score =
-        |ws: &Workspace, view: usize, options: &PatchMatchOptions, map: &visloc_mvs::DepthMap| {
-            #[cfg(feature = "gpu")]
-            if let Some(gpu) = &gpu {
-                return gpu.photometric_score(ws, view, options, map);
-            }
-            photometric_score(ws, view, options, map)
-        };
+    let run_from = |ws: &Workspace,
+                    view: usize,
+                    options: &PatchMatchOptions,
+                    start: &DepthMap,
+                    restorer: DetailRestorer| {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &gpu {
+            return gpu.estimate_from(ws, view, options, start, restorer);
+        }
+        estimate_from(ws, view, options, start, restorer)
+    };
     let map_path = |v: usize| out.join(format!("map_{v:04}.bin"));
     let maps = if load_maps {
         (0..ws.views.len())
             .map(|v| visloc_mvs::DepthMap::read(&map_path(v)).expect("reading a saved depth map"))
             .collect()
     } else if scales > 1 {
-        let defaults = MultiScaleOptions::default();
         let options = MultiScaleOptions {
             patch_match: pm_options,
             scales,
             geom_passes,
-            detail_threshold: detail_threshold.unwrap_or(defaults.detail_threshold),
+            restorer,
+            planar_prior: planar_prior.then(|| prior_options.clone()),
         };
-        multi_scale_depth_maps(&ws, &options, &run, &score, &mut |line| eprintln!("{line}"))
+        // The photometric passes keep their costs for the planar prior.
+        multi_scale_depth_maps(
+            &ws,
+            &options,
+            &estimate_one,
+            &run_from,
+            &run_prior,
+            &run,
+            &mut |line| eprintln!("{line}"),
+        )
     } else {
         let t = Instant::now();
         // The planar prior is built from the photometric costs.

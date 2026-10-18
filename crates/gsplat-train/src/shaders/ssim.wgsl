@@ -77,10 +77,13 @@ fn apron_pixel(tx: u32, ty: u32, ax: u32, ay: u32) -> i32 {
 }
 
 @compute @workgroup_size(256)
-fn ssim_fwd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn ssim_fwd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let tiles_x = (su.width + T - 1u) / T;
-    let tx = wid.x % tiles_x;
-    let ty = wid.x / tiles_x;
+    let tiles_y = (su.height + T - 1u) / T;
+    let tile = wid.x + wid.y * nwg.x;
+    if (tile >= tiles_x * tiles_y) { return; }
+    let tx = tile % tiles_x;
+    let ty = tile / tiles_x;
     let t = lid.x;
     let ox = t % T;
     let oy = t / T;
@@ -179,10 +182,13 @@ fn ssim_fwd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
 }
 
 @compute @workgroup_size(256)
-fn ssim_bwd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn ssim_bwd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let tiles_x = (su.width + T - 1u) / T;
-    let tx = wid.x % tiles_x;
-    let ty = wid.x / tiles_x;
+    let tiles_y = (su.height + T - 1u) / T;
+    let tile = wid.x + wid.y * nwg.x;
+    if (tile >= tiles_x * tiles_y) { return; }
+    let tx = tile % tiles_x;
+    let ty = tile / tiles_x;
     let t = lid.x;
     let ox = t % T;
     let oy = t / T;

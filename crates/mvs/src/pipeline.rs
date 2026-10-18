@@ -1,22 +1,25 @@
-//! ACMM's multi-scale depth estimation: ACMH on an image pyramid, coarse to
-//! fine, with geometric consistency at every scale.
+//! ACMM's multi-scale depth estimation, with ACMMP's planar priors: ACMH on
+//! an image pyramid, coarse to fine, with geometric consistency at every
+//! scale.
 //!
-//! At the coarsest scale every view gets a photometric pass, then
-//! `geom_passes` geometric ones. Each finer scale starts from the coarser
-//! maps, upsampled by joint bilateral upsampling guided by the finer image.
-//! The detail restorer then runs a photometric pass at the finer scale and
-//! keeps its estimate wherever the upsampled plane's photometric cost is
-//! worse by more than `detail_threshold` (upsampling blurs thin structures
-//! and boundaries), before the geometric passes at that scale.
+//! At the coarsest scale every view gets a photometric pass; each finer
+//! scale starts from the coarser maps, upsampled by joint bilateral
+//! upsampling guided by the finer image, and runs a photometric pass from
+//! them in which the detail restorer decides which pixels may leave their
+//! upsampled plane (upsampling blurs thin structures and boundaries, while
+//! weak texture is better resolved at the coarser scale). With ACMMP, a
+//! planar prior pass follows the photometric pass at every scale (ACMP,
+//! [`mod@crate::planar_prior`]); then `geom_passes` geometric passes.
 
 use rayon::prelude::*;
 
-use crate::patch_match::{DepthMap, PatchMatchOptions};
+use crate::patch_match::{DepthMap, DetailRestorer, PatchMatchOptions};
 use crate::planar_prior::{planar_prior, PlanarPrior, PlanarPriorOptions};
 use crate::workspace::{View, Workspace};
 
-/// Multi-scale estimation parameters (ACMM's `k`, `eta`, `xi` and two
-/// geometric passes per scale by default).
+/// Multi-scale estimation parameters (ACMMP's code by default: three
+/// scales, the restorer against the plane at infinity with a margin of
+/// 0.1, a planar prior pass and two geometric passes per scale).
 #[derive(Debug, Clone)]
 pub struct MultiScaleOptions {
     pub patch_match: PatchMatchOptions,
@@ -24,8 +27,10 @@ pub struct MultiScaleOptions {
     pub scales: usize,
     /// Geometric passes per scale.
     pub geom_passes: usize,
-    /// The detail restorer's cost margin.
-    pub detail_threshold: f32,
+    /// The detail restorer of the photometric pass at each finer scale.
+    pub restorer: DetailRestorer,
+    /// The planar prior pass after each scale's photometric pass, if any.
+    pub planar_prior: Option<PlanarPriorOptions>,
 }
 
 impl Default for MultiScaleOptions {
@@ -34,7 +39,8 @@ impl Default for MultiScaleOptions {
             patch_match: PatchMatchOptions::default(),
             scales: 3,
             geom_passes: 2,
-            detail_threshold: 0.1,
+            restorer: DetailRestorer::Infinity(0.1),
+            planar_prior: Some(PlanarPriorOptions::default()),
         }
     }
 }
@@ -56,9 +62,10 @@ pub type PriorEstimator<'a> = dyn Fn(
     ) -> DepthMap
     + 'a;
 
-/// How well a depth map of one view fits the images:
-/// [`crate::patch_match::photometric_score`] or the GPU's equivalent.
-pub type Scorer<'a> = dyn Fn(&Workspace, usize, &PatchMatchOptions, &DepthMap) -> Vec<f32> + 'a;
+/// One view's photometric pass from a start map:
+/// [`crate::patch_match::estimate_from`] or the GPU's equivalent.
+pub type StartEstimator<'a> =
+    dyn Fn(&Workspace, usize, &PatchMatchOptions, &DepthMap, DetailRestorer) -> DepthMap + 'a;
 
 /// One geometric pass: the depth map of every view of `ws` re-estimated by
 /// `estimate` against `earlier`, the previous pass's maps (indexed like
@@ -125,13 +132,17 @@ pub fn planar_prior_pass(
 }
 
 /// Depth maps of every view of `ws` (at its resolution), estimated coarse
-/// to fine by `estimate`, with `score` judging the details to restore.
-/// `log` receives a line per stage.
+/// to fine: `photometric` passes at the coarsest scale, `from_start` ones at
+/// the finer scales, `prior` passes (when `options.planar_prior` is set)
+/// and `geometric` passes. The photometric passes must keep their costs
+/// for the planar prior. `log` receives a line per stage.
 pub fn multi_scale_depth_maps(
     ws: &Workspace,
     options: &MultiScaleOptions,
-    estimate: &Estimator<'_>,
-    score: &Scorer<'_>,
+    photometric: &Estimator<'_>,
+    from_start: &StartEstimator<'_>,
+    prior: &PriorEstimator<'_>,
+    geometric: &Estimator<'_>,
     log: &mut dyn FnMut(&str),
 ) -> Vec<DepthMap> {
     let scales = options.scales.max(1);
@@ -147,11 +158,38 @@ pub fn multi_scale_depth_maps(
     // The current level, `None` for `ws`.
     let mut current = coarser.next();
     let pm = &options.patch_match;
+    // The planar prior and geometric passes of one scale.
+    let refine = |level: usize,
+                  ws: &Workspace,
+                  mut maps: Vec<DepthMap>,
+                  log: &mut dyn FnMut(&str)|
+     -> Vec<DepthMap> {
+        if let Some(prior_options) = &options.planar_prior {
+            let t = std::time::Instant::now();
+            maps = planar_prior_pass(ws, maps, pm, prior_options, prior, &mut |line| {
+                log(&format!("scale {level}: {line}"))
+            });
+            log(&format!(
+                "scale {level}: planar prior {:.1} s",
+                t.elapsed().as_secs_f64()
+            ));
+        }
+        for pass in 0..options.geom_passes {
+            let t = std::time::Instant::now();
+            maps = geometric_pass(ws, maps, pm, geometric);
+            log(&format!(
+                "scale {level}: geometric {} {:.1} s",
+                pass + 1,
+                t.elapsed().as_secs_f64()
+            ));
+        }
+        maps
+    };
 
     let coarsest = current.as_ref().unwrap_or(ws);
     let started = std::time::Instant::now();
-    let mut maps: Vec<DepthMap> = (0..coarsest.views.len())
-        .map(|v| estimate(coarsest, v, pm, None))
+    let maps: Vec<DepthMap> = (0..coarsest.views.len())
+        .map(|v| photometric(coarsest, v, pm, None))
         .collect();
     log(&format!(
         "scale 0 ({}x{}): photometric {:.1} s",
@@ -159,64 +197,31 @@ pub fn multi_scale_depth_maps(
         coarsest.views[0].height,
         started.elapsed().as_secs_f64()
     ));
-    for pass in 0..options.geom_passes {
-        let t = std::time::Instant::now();
-        maps = geometric_pass(coarsest, maps, pm, estimate);
-        log(&format!(
-            "scale 0: geometric {} {:.1} s",
-            pass + 1,
-            t.elapsed().as_secs_f64()
-        ));
-    }
+    let mut maps = refine(0, coarsest, maps, log);
     for level in 1..scales {
         let next = coarser.next();
         let coarse = current.as_ref().unwrap_or(ws);
         let fine = next.as_ref().unwrap_or(ws);
         let t = std::time::Instant::now();
-        // View by view, so only one photometric map is held at a time, and
-        // each coarse map is dropped once upsampled.
-        let mut replaced = 0usize;
-        let mut total = 0usize;
+        // View by view, so each coarse map is dropped once upsampled.
         let restored: Vec<DepthMap> = maps
             .into_iter()
             .enumerate()
             .map(|(v, coarse_map)| {
                 let upsampled = upsample(&coarse_map, &coarse.views[v], &fine.views[v]);
                 drop(coarse_map);
-                let photometric = estimate(fine, v, pm, None);
-                let upsampled_scores = score(fine, v, pm, &upsampled);
-                let photometric_scores = score(fine, v, pm, &photometric);
-                let (map, count) = restore_details(
-                    upsampled,
-                    &upsampled_scores,
-                    &photometric,
-                    &photometric_scores,
-                    options.detail_threshold,
-                );
-                replaced += count;
-                total += map.depth.len();
-                map
+                from_start(fine, v, pm, &upsampled, options.restorer)
             })
             .collect();
         log(&format!(
-            "scale {level} ({}x{}): upsampled, photometric and restored {:.1}% of pixels in {:.1} s",
+            "scale {level} ({}x{}): upsampled and photometric {:.1} s",
             fine.views[0].width,
             fine.views[0].height,
-            100.0 * replaced as f64 / total.max(1) as f64,
             t.elapsed().as_secs_f64()
         ));
-        maps = restored;
         current = next;
         let fine = current.as_ref().unwrap_or(ws);
-        for pass in 0..options.geom_passes {
-            let t = std::time::Instant::now();
-            maps = geometric_pass(fine, maps, pm, estimate);
-            log(&format!(
-                "scale {level}: geometric {} {:.1} s",
-                pass + 1,
-                t.elapsed().as_secs_f64()
-            ));
-        }
+        maps = refine(level, fine, restored, log);
     }
     maps
 }
@@ -374,39 +379,6 @@ pub fn upsample(map: &DepthMap, coarse: &View, fine: &View) -> DepthMap {
     out
 }
 
-/// ACMM's detail restorer: the upsampled map, with the photometric pass's
-/// estimate wherever the upsampled plane's photometric score at this scale
-/// exceeds the photometric estimate's by more than `threshold`. Returns the
-/// map and how many pixels it replaced.
-fn restore_details(
-    mut upsampled: DepthMap,
-    init_scores: &[f32],
-    photometric: &DepthMap,
-    photo_scores: &[f32],
-    threshold: f32,
-) -> (DepthMap, usize) {
-    // Costs only where both maps have them.
-    if photometric.cost.is_empty() {
-        upsampled.cost = Vec::new();
-    }
-    let with_costs = !upsampled.cost.is_empty();
-    let mut replaced = 0usize;
-    for i in 0..upsampled.depth.len() {
-        let upsampled_missing = upsampled.depth[i] <= 0.0;
-        if photometric.depth[i] > 0.0
-            && (upsampled_missing || init_scores[i] - photo_scores[i] > threshold)
-        {
-            upsampled.depth[i] = photometric.depth[i];
-            upsampled.normal[i] = photometric.normal[i];
-            if with_costs {
-                upsampled.cost[i] = photometric.cost[i];
-            }
-            replaced += 1;
-        }
-    }
-    (upsampled, replaced)
-}
-
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -439,6 +411,36 @@ mod tests {
             assert_eq!(a.depth, b.depth);
             assert_eq!(a.normal, b.normal);
             assert_eq!(a.cost, b.cost);
+        }
+    }
+
+    /// ACMMP's order (photometric, planar prior and geometric passes at
+    /// each scale) recovers the plane, also where view 0 has no texture.
+    #[test]
+    fn multi_scale_with_priors_recovers_the_plane() {
+        use crate::patch_match::{estimate_from, estimate_with_prior};
+        use crate::planar_prior::{mean_relative_error, textureless_scene};
+        let (ws, textureless) = textureless_scene();
+        let truth = plane_scene_truth(&ws, 0);
+        let options = MultiScaleOptions {
+            scales: 2,
+            ..MultiScaleOptions::default()
+        };
+        let maps = multi_scale_depth_maps(
+            &ws,
+            &options,
+            &estimate,
+            &estimate_from,
+            &estimate_with_prior,
+            &estimate,
+            &mut |_| {},
+        );
+        let inside: Vec<usize> = (8..40)
+            .flat_map(|y| (12..52).map(move |x| y * 64 + x))
+            .collect();
+        for pixels in [&inside, &textureless] {
+            let error = mean_relative_error(&maps[0], &truth, pixels);
+            assert!(error < 0.005, "{error}");
         }
     }
 

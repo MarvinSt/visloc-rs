@@ -9,6 +9,7 @@
 //!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 3] [--gpu] \
 //!     [--view-selection confidence|sampled] [--init-top-k 3] \
 //!     [--restorer infinity|start|off] [--detail-threshold 0.1] [--no-planar-prior] \
+//!     [--hierarchical-prior] \
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 10] \
 //!     [--min-mean-consistency 0] [--no-average]
@@ -45,7 +46,7 @@ fn main() {
     let mut save_maps = false;
     let mut load_maps = false;
     let mut planar_prior = None;
-    let prior_options = PlanarPriorOptions::default();
+    let mut prior_options = PlanarPriorOptions::default();
     let mut fusion_options = fusion_options;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -72,6 +73,7 @@ fn main() {
             "--gpu" => use_gpu = true,
             "--planar-prior" => planar_prior = Some(true),
             "--no-planar-prior" => planar_prior = Some(false),
+            "--hierarchical-prior" => prior_options.hierarchical = true,
             "--save-depth" => save_depth = true,
             "--save-maps" => save_maps = true,
             "--load-maps" => load_maps = true,
@@ -152,7 +154,8 @@ fn main() {
             estimate_with_prior(ws, view, options, prior_options, start, prior)
         };
         let mut map = estimate_prior();
-        if !save_maps {
+        // Hierarchical priors build the next level's prior from these costs.
+        if !save_maps && !prior_options.hierarchical {
             map.cost = Vec::new();
         }
         map

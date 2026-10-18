@@ -103,7 +103,11 @@ pub fn geometric_pass(
 /// ACMP's planar prior pass over every view of `ws`: each view's photometric
 /// map in `maps` (with its costs) gives the view's planar prior
 /// ([`planar_prior`]) and its start, and is dropped once the view is done.
-/// `log` receives the share of pixels the priors cover.
+/// With [`PlanarPriorOptions::hierarchical`], HPM-MVS's coarse-to-fine
+/// priors: one prior pass per level ([`prior_levels`]), each prior built
+/// from the previous pass's map with credible-pixel blocks twice as large
+/// as the next level's, so `estimate` must keep the costs. `log` receives
+/// the share of pixels the finest priors cover.
 pub fn planar_prior_pass(
     ws: &Workspace,
     maps: Vec<DepthMap>,
@@ -118,10 +122,26 @@ pub fn planar_prior_pass(
         .into_iter()
         .enumerate()
         .map(|(v, start)| {
-            let prior = planar_prior(&ws.views[v], &start, prior_options);
-            covered += prior.covered();
-            total += prior.planes.len();
-            estimate(ws, v, options, prior_options, &start, &prior)
+            let view = &ws.views[v];
+            let levels = if prior_options.hierarchical {
+                prior_levels(view.width.max(view.height))
+            } else {
+                1
+            };
+            let mut map = start;
+            for level in (0..levels).rev() {
+                let level_options = PlanarPriorOptions {
+                    block: prior_options.block << level,
+                    ..prior_options.clone()
+                };
+                let prior = planar_prior(view, &map, &level_options);
+                if level == 0 {
+                    covered += prior.covered();
+                    total += prior.planes.len();
+                }
+                map = estimate(ws, v, options, prior_options, &map, &prior);
+            }
+            map
         })
         .collect();
     log(&format!(
@@ -129,6 +149,19 @@ pub fn planar_prior_pass(
         100.0 * covered as f64 / total.max(1) as f64
     ));
     out
+}
+
+/// HPM-MVS's number of prior levels for an image of `size` pixels on its
+/// longer side: one, and one more per halving while the size exceeds 1000
+/// (three at 3200 pixels, two at 1600, one at 1000 and below).
+pub fn prior_levels(size: usize) -> usize {
+    let mut levels = 1;
+    let mut size = size;
+    while size > 1000 {
+        size /= 2;
+        levels += 1;
+    }
+    levels
 }
 
 /// Depth maps of every view of `ws` (at its resolution), estimated coarse
@@ -441,6 +474,45 @@ mod tests {
         for pixels in [&inside, &textureless] {
             let error = mean_relative_error(&maps[0], &truth, pixels);
             assert!(error < 0.005, "{error}");
+        }
+    }
+
+    #[test]
+    fn prior_levels_follow_hpm_mvs() {
+        assert_eq!(prior_levels(3200), 3);
+        assert_eq!(prior_levels(1600), 2);
+        assert_eq!(prior_levels(1000), 1);
+        assert_eq!(prior_levels(800), 1);
+    }
+
+    /// Hierarchical priors run one prior pass per level: on a small image,
+    /// one, the same as the plain pass.
+    #[test]
+    fn hierarchical_priors_on_a_small_image_are_one_pass() {
+        use crate::patch_match::estimate_with_prior;
+        use crate::planar_prior::textureless_scene;
+        let (ws, _) = textureless_scene();
+        let options = PatchMatchOptions::default();
+        let photometric: Vec<DepthMap> = (0..ws.views.len())
+            .map(|v| estimate(&ws, v, &options, None))
+            .collect();
+        let plain = PlanarPriorOptions::default();
+        let hierarchical = PlanarPriorOptions {
+            hierarchical: true,
+            ..PlanarPriorOptions::default()
+        };
+        let run = |prior_options: &PlanarPriorOptions| {
+            planar_prior_pass(
+                &ws,
+                photometric.clone(),
+                &options,
+                prior_options,
+                &estimate_with_prior,
+                &mut |_| {},
+            )
+        };
+        for (a, b) in run(&plain).iter().zip(&run(&hierarchical)) {
+            assert_eq!(a.depth, b.depth);
         }
     }
 

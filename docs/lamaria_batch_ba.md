@@ -1063,6 +1063,96 @@ Sim(3) RMSE against the pseudo-GT (1.50 m) and a lower 60 s segment RMSE
 (0.199 m against 0.206 m). It keeps the mapper's heading drift, though, and
 that is what the CPs see. The lowest cost does not pick the better start.
 
+### Where the second sequences' heading drift comes from
+
+Against the pseudo-GT, per window, the heading change of the solve, of the
+VIO and of the gyroscope integrated with the solve's biases (first solve):
+
+| Sequence | Solve, whole sequence | Of it in the first ~6.5 min | VIO | Gyroscope |
+|---|---:|---:|---:|---:|
+| sequence_2_11 | within ±1.2° | −0.1° | −1.3° | +3.3° (+2.7° in the first 2 min) |
+| sequence_2_12 | +9.0° | +5.5° | +6.8° (+5.1° in the first minute) | +14.0° |
+| sequence_3_18 | −9.5° | −3.7° | −10.1° | −6.2° |
+
+The gyroscope with the solve's biases drifts steadily: on sequence_2_12 its
+vertical bias is 0.15 mrad/s off on average, whether the wearer walks or
+not. The solve follows its errors there: the 30 s windows' heading errors,
+with the trend removed, correlate with the gyroscope's at +0.76, against
++0.39 on sequence_2_11.
+
+Without ground truth nothing pins that bias. On sequence_3_18 the first
+solve started from the VIO with its heading error removed (pseudo-GT,
+diagnosis only) keeps it and scores 74.97 instead of 36.01 (pose recall
+89.4 % against 9.1 %), but ends at a higher cost (197,486 against 196,792):
+its reprojection cost per observation is higher in 12 of the 15 windows of
+120 s (by up to 0.7 %), the IMU cost the same. Both solves have converged. The objective
+prefers the drift slightly, so neither more iterations nor another optimizer
+would fix it. Nor do these:
+
+- A third solve from the pipeline's result: 36.13, unchanged.
+- Matching guided by the solve instead of the VIO: 8.6 % more matches, three
+  quarters of them at offsets 4–32; at 64 and more, 0–4 % more.
+- Revisits up to 100 m apart, at least 128 s later, with the optical axes
+  within 45°: of 6,490 image pairs, none is verified.
+- Longer tracks: a landmark of the solve projects into the image of 564,507
+  keyframes within 32 of its observed span, but is observed in 8.9 % of them,
+  and a feature with a similar descriptor lies within 3 px in another 1.5 %.
+  SIFT does not find the same point again as the view changes.
+- Far points: without the 1° triangulation angle the solve gains 69,537
+  landmarks, 124 of them over 64 keyframes or more.
+- The stops: sequence_3_18 has one of at least 4 s.
+- A prior from other recordings: on 1WM093701G1276 the vertical component of
+  the solved gyro bias ranges from −0.29 to +0.36 mrad/s between them.
+- Horizontal building lines as a compass: by the pseudo-GT, the dominant
+  direction of the frame's horizontal lines stays within 2° for at least 20 s
+  in 11 stretches (285 s of 1,689 s), to 0.37° per frame. The shift between two
+  frames' line-direction histograms 8–40 s apart follows the true change of
+  the solve's heading error at a correlation of 0.35 at most, 0.34–0.71° off at
+  the median, and its mean rate over the sequence misses the drift.
+
+Over a one-way route, the heading beyond a minute is the integrated
+gyroscope's, and the cameras and the IMU leave its bias undetermined.
+
+### A ride the VIO halves
+
+Keyframes on a moving platform are easy to find without ground truth: the
+accelerometer norm varies by less than 0.5 m/s² over 4 s while the
+trajectory still moves faster than 0.5 m/s. That marks 83–166 s of
+sequence_5_12 (the tram; and 10 s around it), 119–188 s of sequence_5_11 (the
+funicular) and nothing on sequence_3_18. The tracks of the cabin, whose observations the
+rotation alone explains within 3 px, are already gone, though: dropping
+them leaves sequence_5_12's landmarks the same (310,282 against 310,284),
+and of sequence_5_11's 1,047 only 78 pass the triangulation check. The BA
+keeps the ride the VIO gives it. Starts with the ride's displacements scaled
+(first solve, sequence_5_12):
+
+| Ride ×  | Ride length against the survey | Final cost | CP Score |
+|---|---:|---:|---:|
+| 1 (60 iterations, the others 30) | 0.50 | 131,722 | 8.05 |
+| 1.5 | 0.70 | 130,613 | 5.21 |
+| 2 | 0.92 | 130,122 | 4.44 |
+| 2.5 | 1.15 | 129,381 | 3.67 |
+
+The cost falls past the true length, so it cannot choose the factor, and the
+score is set elsewhere: after the ride the CP errors (pipeline) stay at 2–16 m
+for 13 minutes and grow to 24–37 m in the last five, where the distances
+between the CPs come out 15–42 % too long after the Sim(3) fit.
+
+### Low light: matching guided by the solve
+
+Matching the low-light sequences again, guided by the pipeline's final
+trajectory instead of the VIO, and running the pipeline once more from the
+VIO (30 iterations):
+
+| Sequence | First solve | + `loop-correct` | + second solve |
+|---|---:|---:|---:|
+| sequence_4_10, VIO-guided matches | 63.44 | 63.09 | 67.81 |
+| sequence_4_10, solve-guided matches | **69.11** | **69.57** | **71.13** (pose recall 74.5 %) |
+| sequence_4_11, VIO-guided matches | **57.22** | **56.47** | **56.49** |
+| sequence_4_11, solve-guided matches | 54.47 | 54.05 | 53.97 |
+
+The track mean moves by 0.4: within the spread of the flat directions.
+
 ## Usage
 
 ```bash

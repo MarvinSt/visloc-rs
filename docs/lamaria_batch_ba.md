@@ -897,9 +897,13 @@ the heading the gyroscope integrates with the solve's bias doubles the
 error: that heading drifts +5° the other way.
 
 The VIO does not cause it at its start either. With the solve's gyro bias
-subtracted from the start (`calib_gyro_bias`), or with a 100 times looser
-gyro bias random walk, its first five minutes keep the same heading error
-(−3.6° and −4.6° in the first 30 s, against −4.0°). Within 30–90 s the
+subtracted from the start (`calib_gyro_bias`), with a 100 times looser gyro
+bias random walk, or with the solve's IMU-camera rotations instead of the
+per-device rig rotation, its first five minutes keep the same heading error
+(−3.6°, −4.6° and −4.2° in the first 30 s, against −4.0°). The online demo's
+`trajectory_vio.tum` is the same as the VIO-only demo's there, so the
+VIO-only runs of the second sequences of each track (sequence_1_20, 2_12,
+3_18, 4_11) are not the difference either. Within 30–90 s the
 heading changes the solve, the gyroscope and the pseudo-GT measure between
 pseudo-GT timestamps agree to 0.2–0.4° per interval. The solve still turns
 1.5° more than the other two over the minute.

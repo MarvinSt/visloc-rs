@@ -9,6 +9,7 @@
 //! points that enough source views agree on, and [`mod@mesh`] fuses their
 //! depths into a TSDF mesh.
 
+pub mod deformable;
 pub mod fusion;
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -20,6 +21,7 @@ pub mod planar_prior;
 pub mod ply;
 pub mod workspace;
 
+pub use deformable::Deformable;
 pub use fusion::{fuse, fuse_with, FusedPoint, FusionOptions};
 #[cfg(feature = "gpu")]
 pub use gpu::GpuPatchMatch;

@@ -28,7 +28,7 @@ use std::time::Instant;
 
 use visloc_mvs::{
     estimate, estimate_from, estimate_with_prior, fuse, fuse_with, geometric_pass,
-    multi_scale_depth_maps, planar_prior_pass, read_text_model, write_ply, DepthMap,
+    multi_scale_depth_maps, planar_prior_pass, read_text_model, write_ply, Deformable, DepthMap,
     DetailRestorer, Estimator, FusionOptions, MeshOptions, MultiScaleOptions, PatchMatchOptions,
     PlanarPrior, PlanarPriorOptions, TsdfMesher, ViewSelection, Workspace, WorkspaceOptions,
 };
@@ -41,6 +41,7 @@ fn main() {
     let mut pm_options = PatchMatchOptions::default();
     let fusion_options = FusionOptions::default();
     let mut mesh_options: Option<MeshOptions> = None;
+    let mut deformable = false;
     let mut geom_passes = 2usize;
     let mut geom_iterations = None;
     let mut scales = 3usize;
@@ -90,6 +91,7 @@ fn main() {
                 fusion_options.min_mean_consistency = value().parse().unwrap()
             }
             "--no-average" => fusion_options.average = false,
+            "--deformable" => deformable = true,
             "--mesh" => {
                 mesh_options.get_or_insert_with(MeshOptions::default);
             }
@@ -134,6 +136,10 @@ fn main() {
             other => panic!("unknown argument {other}"),
         }
     }
+    assert!(
+        !(deformable && use_gpu),
+        "--deformable runs on the CPU only for now"
+    );
     let sparse = sparse.expect("--sparse is required");
     let images = images.expect("--images is required");
     let out = out.expect("--out is required");
@@ -223,6 +229,7 @@ fn main() {
             .collect()
     } else if scales > 1 {
         let options = MultiScaleOptions {
+            deformable: deformable.then(Deformable::default),
             geom_iterations: geom_iterations.unwrap_or(pm_options.iterations),
             patch_match: pm_options,
             scales,

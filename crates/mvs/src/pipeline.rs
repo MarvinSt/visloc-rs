@@ -13,6 +13,7 @@
 
 use rayon::prelude::*;
 
+use crate::deformable::Deformable;
 use crate::patch_match::{DepthMap, DetailRestorer, PatchMatchOptions};
 use crate::planar_prior::{planar_prior, PlanarPrior, PlanarPriorOptions};
 use crate::workspace::{View, Workspace};
@@ -34,6 +35,11 @@ pub struct MultiScaleOptions {
     pub restorer: DetailRestorer,
     /// The planar prior pass after each scale's photometric pass, if any.
     pub planar_prior: Option<PlanarPriorOptions>,
+    /// APD-MVS's deformable patches at every scale but the coarsest, as its
+    /// code schedules them: 16 sectors and a RANSAC threshold of 0.875% at
+    /// the middle scales, 32 and 0.75% at the finest; a minimum within 6
+    /// disparity steps in the photometric pass, then 4 and 2.
+    pub deformable: Option<Deformable>,
 }
 
 impl Default for MultiScaleOptions {
@@ -45,6 +51,7 @@ impl Default for MultiScaleOptions {
             geom_iterations: 3,
             restorer: DetailRestorer::Infinity(0.1),
             planar_prior: Some(PlanarPriorOptions::default()),
+            deformable: None,
         }
     }
 }
@@ -162,9 +169,23 @@ pub fn multi_scale_depth_maps(
     // The current level, `None` for `ws`.
     let mut current = coarser.next();
     let pm = &options.patch_match;
-    let geom_pm = PatchMatchOptions {
-        iterations: options.geom_iterations,
-        ..pm.clone()
+    // A pass's options at scale `level`: `pass` 0 for the photometric
+    // pass, 1 for the planar prior pass, 2 and on for the geometric ones.
+    let pass_options = |level: usize, pass: usize| -> PatchMatchOptions {
+        let mut o = pm.clone();
+        if pass >= 2 {
+            o.iterations = options.geom_iterations;
+        }
+        o.deformable = options.deformable.as_ref().filter(|_| level > 0).map(|d| {
+            let finest = level + 1 == scales;
+            Deformable {
+                sectors: if finest { 32 } else { 16 },
+                ransac_threshold: if finest { 0.0075 } else { 0.00875 },
+                peak_radius: [6, 4, 2][pass.min(2)],
+                ..d.clone()
+            }
+        });
+        o
     };
     // The planar prior and geometric passes of one scale.
     let refine = |level: usize,
@@ -174,7 +195,8 @@ pub fn multi_scale_depth_maps(
      -> Vec<DepthMap> {
         if let Some(prior_options) = &options.planar_prior {
             let t = std::time::Instant::now();
-            maps = planar_prior_pass(ws, maps, pm, prior_options, prior, &mut |line| {
+            let prior_pm = pass_options(level, 1);
+            maps = planar_prior_pass(ws, maps, &prior_pm, prior_options, prior, &mut |line| {
                 log(&format!("scale {level}: {line}"))
             });
             log(&format!(
@@ -184,6 +206,7 @@ pub fn multi_scale_depth_maps(
         }
         for pass in 0..options.geom_passes {
             let t = std::time::Instant::now();
+            let geom_pm = pass_options(level, 2 + pass);
             maps = geometric_pass(ws, maps, &geom_pm, geometric);
             log(&format!(
                 "scale {level}: geometric {} {:.1} s",
@@ -211,6 +234,7 @@ pub fn multi_scale_depth_maps(
         let coarse = current.as_ref().unwrap_or(ws);
         let fine = next.as_ref().unwrap_or(ws);
         let t = std::time::Instant::now();
+        let photometric_pm = pass_options(level, 0);
         // View by view, so each coarse map is dropped once upsampled.
         let restored: Vec<DepthMap> = maps
             .into_iter()
@@ -218,7 +242,7 @@ pub fn multi_scale_depth_maps(
             .map(|(v, coarse_map)| {
                 let upsampled = upsample(&coarse_map, &coarse.views[v], &fine.views[v]);
                 drop(coarse_map);
-                from_start(fine, v, pm, &upsampled, options.restorer)
+                from_start(fine, v, &photometric_pm, &upsampled, options.restorer)
             })
             .collect();
         log(&format!(

@@ -903,7 +903,15 @@ per-device rig rotation, its first five minutes keep the same heading error
 (−3.6°, −4.6° and −4.2° in the first 30 s, against −4.0°). The online demo's
 `trajectory_vio.tum` is the same as the VIO-only demo's there, so the
 VIO-only runs of the second sequences of each track (sequence_1_20, 2_12,
-3_18, 4_11) are not the difference either. Within 30–90 s the
+3_18, 4_11) are not the difference either.
+
+Revisits cannot fix it on these routes. By the pseudo-GT, the keyframes
+that come back within 10 m more than 120 s later are 3.8 % on sequence_2_12
+(204 s at most), 3.5 % on sequence_1_20, and none on sequence_3_18,
+sequence_4_11 and sequence_3_17, against 9.8 % on sequence_2_11. The
+heading over a one-way route is the odometry's alone. sequence_3_17 and
+sequence_2_11 start from VIOs that stay within ±1.5° and ±0.5° of it;
+sequence_2_12, 3_18 and 4_11 do not. Within 30–90 s the
 heading changes the solve, the gyroscope and the pseudo-GT measure between
 pseudo-GT timestamps agree to 0.2–0.4° per interval. The solve still turns
 1.5° more than the other two over the minute.

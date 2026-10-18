@@ -268,10 +268,10 @@ before/after on training sequences.
    67.81; the second Low light sequence, sequence_4_11, 54.09 → 56.49).
    On the second training sequence of each track the mean is only 32.95
    (2026-10-18): sequence_1_20, 2_12 and 3_18 keep their VIO's heading drift
-   of 4–8°, which these one-way routes give no revisit to correct; a start
-   with that drift removed (from the pseudo-GT, diagnosis only) ends lower in
-   cost and scores 55 instead of 21 on sequence_2_12, but no pGT-free change
-   tried reaches it. sequence_5_12 starts on a moving platform that the VIO
+   of 4–8°, which these one-way routes give no revisit to correct and their
+   far-apart views too few matches to measure; a start with that drift
+   removed (from the pseudo-GT, diagnosis only) scores 55 instead of 21 on
+   sequence_2_12, but no pGT-free change tried reaches it. sequence_5_12 starts on a moving platform that the VIO
    halves (6.37) ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).
 
 ## 5. Test-set operational pipeline

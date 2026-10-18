@@ -895,10 +895,10 @@ Started from the same VIO with only the heading error removed (from the
 pseudo-GT, per 60 s window; diagnosis only), the first solve keeps the
 heading within ±0.4° and scores 55.23 (pose recall 34.7 %, Sim(3) RMSE
 1.67 m against 5.56 m). It also ends lower, at 172,310 against 173,335 with
-0.3 % fewer observations, and its IMU cost is lower too. The better
-solution is there in the objective; the solve from the VIO does not reach
-it. Nothing tried so far gets there without the pseudo-GT (first solve, CP
-Score):
+0.3 % fewer observations, and its IMU cost is lower too, but both solves
+stop at their 30 iterations still descending by about 40 per iteration, so
+the difference does not show which minimum is lower. Nothing tried so far
+gets there without the pseudo-GT (first solve, CP Score):
 
 | Run | CP Score | Heading error per 300 s (°) |
 |---|---:|---|
@@ -935,6 +935,16 @@ per-device rig rotation, its first five minutes keep the same heading error
 `trajectory_vio.tum` is the same as the VIO-only demo's there, so the
 VIO-only runs of the second sequences of each track (sequence_1_20, 2_12,
 3_18, 4_11) are not the difference either.
+
+The far-apart views do not hold the heading either. On sequence_3_18, the
+image pairs of the same camera with at least 40 matches number 1,152 at 24
+keyframes apart, 282 at 64, 89 at 96 and 9 at 192: the 100,000 matches per
+offset beyond 64 keyframes are spread a few per pair. An essential matrix
+(RANSAC, 1 px) on those pairs measures the relative heading to about 0.3°.
+That is more than the solve's heading error over such spans (0.11° at the
+median against the pseudo-GT, on the 36 pairs it covers), and it does not
+follow that error (correlation 0.05). Rotation averaging over these pairs
+would know less than the BA already does.
 
 Revisits cannot fix it on these routes. By the pseudo-GT, the keyframes
 that come back within 10 m more than 120 s later are 3.8 % on sequence_2_12

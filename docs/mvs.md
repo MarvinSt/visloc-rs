@@ -293,7 +293,12 @@ default pipeline, on pipes and meadow pre-resized to 800 px (CPU, F1 at
   more pixels, mostly with planes that are wrong there.
 
 HPM-MVS pairs them with priors built at three scales in a single-scale
-estimation; neither part alone pays here.
+estimation; neither part alone pays here. Those hierarchical priors do
+not pay either: on an L4 at 3200 px (commit `8f6a956`), prior passes
+with credible-pixel blocks of 20, 10 and 5 pixels at the finest scale
+(10 and 5 at the middle one) scored F1 82.4% on pipes, meadow, terrace
+and office against 82.6% with one prior pass, within 0.4 point on each
+scene, in 1.45 times the time; the run stopped there.
 
 ### Fusion settings
 

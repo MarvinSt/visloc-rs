@@ -32,9 +32,6 @@ pub struct PlanarPriorOptions {
     pub depth_bandwidth: f32,
     /// The normal bandwidth σθ, degrees.
     pub angle_bandwidth_deg: f32,
-    /// HPM-MVS's hierarchical priors: [`crate::pipeline::planar_prior_pass`]
-    /// runs a prior pass per level, coarse to fine.
-    pub hierarchical: bool,
 }
 
 impl Default for PlanarPriorOptions {
@@ -46,7 +43,6 @@ impl Default for PlanarPriorOptions {
             gamma: 0.5,
             depth_bandwidth: 1.0 / 64.0,
             angle_bandwidth_deg: 5.0,
-            hierarchical: false,
         }
     }
 }

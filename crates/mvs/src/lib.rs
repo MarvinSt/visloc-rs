@@ -27,8 +27,8 @@ pub use patch_match::{
     PatchMatchOptions, ViewSelection,
 };
 pub use pipeline::{
-    geometric_pass, multi_scale_depth_maps, planar_prior_pass, prior_levels, Estimator,
-    MultiScaleOptions, PriorEstimator, StartEstimator,
+    geometric_pass, multi_scale_depth_maps, planar_prior_pass, Estimator, MultiScaleOptions,
+    PriorEstimator, StartEstimator,
 };
 pub use planar_prior::{planar_prior, PlanarPrior, PlanarPriorOptions};
 pub use ply::write_ply;

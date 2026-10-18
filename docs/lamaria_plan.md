@@ -26,8 +26,9 @@ named inline; nothing is tuned against ground truth unless stated.
   2026-10-17)**. Aria's SLAM is the LaMAria team's run of the closed-source
   Aria system, from which the pseudo-GT pipeline is initialized. The page
   recorded on 2026-09-15 listed microSLAM at 64.5–85.6; it now shows the
-  numbers below. Our rows are one training sequence per track (batch BA with
-  the revisits, lever 14), not a submission:
+  numbers below. Our rows are training sequences (batch BA with the
+  revisits, lever 14), not a submission: one per track, the ones the method
+  was developed on, and in the last row both per track:
 
   | Method | Sensors | Short | Medium | Long | Low light | Moving | Mean |
   |---|---|---:|---:|---:|---:|---:|---:|
@@ -41,6 +42,7 @@ named inline; nothing is tuned against ground truth unless stated.
   | Ours, eight rotation segments (training: 1_19, 2_11, 3_17, 4_10, 5_11) | bino + IMU | 87.22 | 77.31 | 60.00 | 49.52 | 57.15 | 66.24 |
   | Ours, + focal lengths, keypoint sizes, low-light denoising (training) | bino + IMU | 84.14 | 81.26 | 65.38 | 63.99 | 57.70 | 70.49 |
   | **Ours, + matches up to 128 s apart (training)** | bino + IMU | 83.15 | **83.83** | 65.41 | 67.81 | **57.17** | 71.47 |
+  | Ours, the same, two training sequences per track | bino + IMU | 64.73 | 52.32 | 50.08 | 62.15 | 31.77 | 52.21 |
 
 - Test data must be **streamed and deleted** (~862 GB total; server throttles
   per connection — use `aria2c -x16`, ~57 MB/s, from the official file list).
@@ -263,8 +265,14 @@ before/after on training sequences.
    focal lengths go wrong on the moving platform, which keeps the
    calibration. Matching keyframes up to 256 steps (128 s) and 200 m apart
    instead of 64 steps and 80 m raises the mean to **71.47** (sequence_4_10:
-   67.81; the second Low light sequence, sequence_4_11, 54.09 → 56.49)
-   ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).
+   67.81; the second Low light sequence, sequence_4_11, 54.09 → 56.49).
+   On the second training sequence of each track the mean is only 32.95
+   (2026-10-18): sequence_1_20, 2_12 and 3_18 keep their VIO's heading drift
+   of 4–8°, which these one-way routes give no revisit to correct; a start
+   with that drift removed (from the pseudo-GT, diagnosis only) ends lower in
+   cost and scores 55 instead of 21 on sequence_2_12, but no pGT-free change
+   tried reaches it. sequence_5_12 starts on a moving platform that the VIO
+   halves (6.37) ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).
 
 ## 5. Test-set operational pipeline
 

@@ -685,6 +685,37 @@ sequence_4_11 starts from the VIO of the test-submission pipeline
 features. These are now the defaults (`match --offsets`, `match
 --max-dist`, `solve --max-offset`).
 
+### Two sequences per track
+
+The other five training sequences, through the test-submission pipeline's
+VIO (`scripts/run_lamaria_test_submission.py --split training`, the
+VIO-only build) and the same batch BA (the defaults above, `--est-focal
+--sigma-size 2.7 --sigma-size-pow 0.35`, no `--est-focal` on the moving
+platform). Final CP Score (pose recall at 1 m):
+
+| Track | Sequence | VIO | Batch BA | Sequence | VIO | Batch BA | Mean |
+|---|---|---:|---:|---|---:|---:|---:|
+| Short | sequence_1_19 | 71.96 | 83.15 (93.4 %) | sequence_1_20 | 38.32 | 46.31 (22.2 %) | 64.73 |
+| Medium | sequence_2_11 | 49.68 | 83.83 (99.3 %) | sequence_2_12 | 18.03 | 20.81 (0.0 %) | 52.32 |
+| Long | sequence_3_17 | 50.06 | 65.41 (61.7 %) | sequence_3_18 | 34.68 | 34.75 (8.7 %) | 50.08 |
+| Low light | sequence_4_10 | 38.99 | 67.81 (68.4 %) | sequence_4_11 | 36.37 | 56.49 (37.6 %) | 62.15 |
+| Moving platform | sequence_5_11 | 43.14 | 57.17 | sequence_5_12 | 4.98 | 6.37 | 31.77 |
+| **Mean** | | | **71.47** | | | 32.95 | **52.21** |
+
+The first sequence of each track is the one the method was developed on.
+On the second ones the BA gains far less. sequence_2_12, 3_18 and 1_20 keep
+the heading drift of their VIO: see [A heading drift that is not linear:
+sequence_2_12](#a-heading-drift-that-is-not-linear-sequence_2_12). The VIO
+of sequence_3_18 runs +5.3° … −2.2° per 300 s window, and the BA +6.3° …
+−2.1°.
+
+sequence_5_12 starts on a moving platform. Between its first two control
+points (19 s and 209 s) the route rises 23.4 m and runs 257 m in a straight
+line, while the solve rises 9.6 m and runs 128 m. After that, its
+control-point-to-control-point distances agree to 0–6 % for 15 minutes. The
+first control point is 153 m off after the Sim(3) fit and the others 2–36 m,
+until the last four minutes, where the solve runs 22–51 % too far.
+
 ### What is left on sequence_3_17
 
 The CP errors left on the Long sequence are not a slow drift: fitting a

@@ -767,6 +767,21 @@ the default; in low light the pipeline keeps 30 (`--iterations 30 --rel-tol
 30, scored 70.08 on sequence_4_10, so the first solve is where the extra
 iterations hurt there.
 
+Averaging the 30- and 60-iteration solutions frame by frame lands between
+the two on every sequence (sequence_4_10: 65.35, sequence_3_17: 69.61). The
+extra iterations move the solution one way, not around the truth.
+
+In low light the error left is mostly local scale. Per 60 s window against
+the pseudo-GT, the solve's scale is off by 2.4 % rms on sequence_4_10 and
+2.2 % on sequence_4_11, against 0.7–1.4 % by day; the heading stays within
+±0.9°. The VIO is worse still (5.4 % and 3.9 %). Keyframes at 10 Hz instead
+of 2 Hz, on the 200 s window from keyframe 1000 of sequence_4_10 (the same
+images, denoised SIFT, offsets scaled to the same times), do not tighten
+it: 0.378 m against 0.389 m after a Sim(3) fit of the window, with sub-window
+scales off by 4.8 % rms per 40 s against 4.1 %. The 2 Hz keyframes sample
+the walking cadence at about one phase, but the scale does not hinge on
+that.
+
 ### What is left on sequence_3_17
 
 The CP errors left on the Long sequence are not a slow drift: fitting a

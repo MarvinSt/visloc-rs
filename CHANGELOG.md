@@ -4,6 +4,106 @@ All notable changes to `visloc-rs` will be documented here.
 
 ## Unreleased
 
+### Added
+
+- **`gsplat_photos --equirect`: 360° panoramas as cube faces** (#301).
+  `PhotoSfmConfig::equirect` cuts each 2:1 equirectangular panorama into
+  six 90° cube faces (`visloc_gsplat_train::equirect`), at most `max_size`
+  square, before SfM and training. Their focal length `size / 2` is exact
+  and stays fixed. Faces of one panorama are not matched with each other,
+  and the window counts panoramas. The log reports how far apart each
+  panorama's face centres land. Off by default. The numbers below solve
+  each face as its own camera, now `--equirect-independent-faces` (the
+  six-face rig below is the default).
+  - Five synthetic room panoramas (`equirect_end_to_end`, an ignored
+    test): all 30 faces register. Relative rotations are within 0.13° of
+    the truth, and panorama distances within 0.4 mm over 0.58 m spacing.
+  - The five real panoramas of the
+    [ScanVan example](https://github.com/ScanVan/sfs-framework-example)
+    (CPU, `--steps 0`): the four side faces of every panorama register;
+    the up and down faces (sky, the camera mount) do not. Panorama
+    distances match ScanVan's own trajectory within 0.4%. As pinhole
+    images the same panoramas reconstruct nothing.
+  - The same five on an RTX 5080 (GPU SIFT and matching, 30k steps): the
+    same 20 faces register, and SfM, training and the mesh take 5 to
+    14 min depending on the host. The held-out panorama (the first, a
+    step behind every training one) renders at 17.8 to 22.2 dB per face
+    (19.2 dB mean), the training faces at 35 to 38 dB. The buildings
+    land where they should. The losses are thin branches, and the lens
+    rims and camera mount that move with the camera (`gsplat_photos`
+    takes no mask for them).
+  - With `equirect`, the held-out views are whole panoramas. Every 8th
+    registered face would have held out the same face of every
+    panorama: on ScanVan it took 3 of the 5 front faces, which left the
+    view ahead with two training images.
+- **`--equirect`: the six cube faces of a panorama as one rig** (#301).
+  `PhotoSfmConfig::equirect_rig`, on by default: the mapper solves one pose
+  per panorama, its faces at the panorama's centre with their fixed
+  rotations, instead of six independent cameras
+  (`--equirect-independent-faces` restores those). The COLMAP-port mapper
+  initializes a central rig (every `sensor_from_rig` translation zero) from
+  the pair's ordinary two-view geometry: its generalized relative pose
+  solver (GR6P) is degenerate when every ray passes through one centre.
+  - Synthetic room (`equirect_end_to_end`): relative rotations within
+    0.006° of the truth (independent faces: 0.13°), panorama distances
+    within 0.2 mm (0.4 mm).
+  - Twelve synthetic panoramas 5 cm apart: both register all 72 faces;
+    independent faces spread their centres by 16.7% of the step, the rig
+    by none, in half the SfM time. 2 cm apart (22 cm in all, 4 m from the
+    walls) neither reconstructs: a rig does not add parallax.
+  - ScanVan: every panorama registers with all six faces posed
+    (independent: the 20 side faces); distances match ScanVan's
+    trajectory within 0.26% (0.33%).
+  - With a rig every face of a registered panorama has a pose. Faces that
+    see fewer than `min_matches` SfM points are left out of training: sky,
+    or a camera mount or selfie stick that moves with the camera. On
+    ScanVan that drops the five down faces (the mount) and keeps the up
+    faces (trees and buildings).
+  - ScanVan on an RTX 5080 (GPU SIFT and matching, 30k steps, 13 min with
+    the mesh): the held-out panorama renders at 19.12 dB over its five
+    kept faces (19.03 dB over the four side faces, against 19.2 dB with
+    independent faces), the 20 training faces at 34.7 dB.
+- **`--equirect-native`: SfM on the panoramas as equirectangular cameras**
+  (#301). `PhotoSfmConfig::equirect_native`: SIFT runs on the whole
+  panorama, at most `2 max_size` wide (COLMAP's 3200 px cap at the
+  default), and the mapper solves `CameraModel::Equirectangular`, COLMAP
+  4.1's `EQUIRECTANGULAR` (parameters `w, h`). The cube faces are then
+  posed from each panorama for training, with the same face filter.
+  - `visloc_core`: `CameraModel::Equirectangular` (projection, rays over
+    the whole sphere, analytic Jacobian), COLMAP model id 17 in the text
+    and binary readers and writers.
+  - Two-view verification on unit rays
+    (`visloc_vision::two_view::spherical`): five-point essential-matrix
+    RANSAC scored by the angle between a ray and its epipolar plane.
+  - The COLMAP-port mapper on unit rays where a pinhole uses the `z = 1`
+    plane: P3P bearings, DLT triangulation rows, cheirality, angular
+    errors, the native bundle adjustment's residual and Jacobians (the
+    panorama's left and right edges are one meridian: residuals wrap).
+    Its initial pair gates the triangulation angle per cube-face
+    direction, as a pinhole camera looking that way would be gated: a
+    panorama always shows the epipoles of the motion, where nothing has
+    parallax, and the median over the whole sphere fell to 1-3° on
+    ScanVan.
+  - Synthetic room (`equirect_native_end_to_end`): 5/5 panoramas,
+    relative face rotations within 0.010° of the truth, panorama
+    distances within 0.05 mm.
+  - ScanVan (CPU): 5/5 panoramas, distances within 0.29% of ScanVan's
+    trajectory, in 22 s against the rig's 163 s (SIFT on 3200 x 1600
+    panoramas instead of thirty 1504 px faces), with 2,052 SfM points
+    against 4,893. On the RTX 5080 (30k steps, 12 min) the held-out
+    panorama renders at 18.66 dB over five faces (rig: 19.12 dB), the
+    training faces at 33.1 dB (34.7 dB). As COLMAP notes for its own
+    model, faster but coarser than perspective views; the rig stays the
+    default.
+- **A warning for panoramas fed as pinhole photos.** When at least half the
+  images look equirectangular, `build_photo_dataset` logs a warning that
+  points to `--equirect`. An image counts when it is 2:1 with left and
+  right edges that meet and smooth pole rows, or when its metadata says
+  equirectangular (Photo Sphere XMP). Outputs are unchanged. It flags
+  three stitched Poly Haven panoramas and none of the 128 south-building
+  photos or their 2:1 crops. It misses the ScanVan panoramas, whose left
+  and right edges are lens rims that do not meet.
+
 ### Fixed
 
 - **COLMAP-port mapper: resuming a reconstruction with 3D points

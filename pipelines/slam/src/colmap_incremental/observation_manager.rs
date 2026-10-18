@@ -300,6 +300,11 @@ pub fn camera_has_bogus_params(
     max_focal_length_ratio: f64,
     _max_extra_param: f64,
 ) -> bool {
+    // COLMAP's `EquirectangularCameraModel::HasBogusParams`: the image size
+    // is the whole model.
+    if camera.model.is_spherical() {
+        return false;
+    }
     let Some((fx, fy, _, _)) = camera.intrinsics() else {
         return true;
     };
@@ -320,6 +325,9 @@ pub fn calculate_squared_reprojection_error(
 ) -> f64 {
     let point_cam = cam_from_world.transform_point(&point3d);
     match camera.project(&point_cam) {
+        Some(projected) if camera.model.is_spherical() => {
+            camera.pixel_residual(&projected, &xy).norm_squared()
+        }
         Some(projected) => (projected - xy).norm_squared(),
         None => f64::INFINITY,
     }
@@ -769,6 +777,7 @@ impl ObservationManager {
             .par_iter()
             .flat_map_iter(|&image_id| {
                 let cam_from_world = image_cam_from_world(recon_ref, image_id);
+                let camera = recon_ref.camera(recon_ref.image(image_id).camera_id);
                 recon_ref
                     .image(image_id)
                     .points2d
@@ -777,11 +786,13 @@ impl ObservationManager {
                     .filter_map(move |(point2d_idx, p)| {
                         let point3d_id = p.point3d_id?;
                         let xyz = recon_ref.point3d(point3d_id).xyz;
-                        (!has_point_positive_depth(&cam_from_world, xyz)).then_some((
-                            image_id,
-                            point2d_idx,
-                            point3d_id,
-                        ))
+                        let in_front = if camera.model.is_spherical() {
+                            let point_camera = cam_from_world.transform_point(&xyz);
+                            camera.sees_in_front(&point_camera, &p.xy)
+                        } else {
+                            has_point_positive_depth(&cam_from_world, xyz)
+                        };
+                        (!in_front).then_some((image_id, point2d_idx, point3d_id))
                     })
                     .collect::<Vec<_>>()
             })

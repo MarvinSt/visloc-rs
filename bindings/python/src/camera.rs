@@ -26,6 +26,7 @@ const MODELS: &[(&str, &[usize])] = &[
     ("RADIAL_FISHEYE", &[5]),
     ("FOV", &[5]),
     ("DOUBLE_SPHERE", &[6]),
+    ("EQUIRECTANGULAR", &[2]),
 ];
 
 pub(crate) fn model_name(model: &CameraModel) -> String {

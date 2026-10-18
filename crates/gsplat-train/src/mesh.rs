@@ -872,7 +872,11 @@ mod tests {
         dirs.iter()
             .map(|&d: &Vector3<f32>| {
                 let fwd = sign * d;
-                let up = if d.y.abs() > 0.5 { Vector3::z() } else { Vector3::y() };
+                let up = if d.y.abs() > 0.5 {
+                    Vector3::z()
+                } else {
+                    Vector3::y()
+                };
                 let right = up.cross(&fwd).normalize();
                 let down = fwd.cross(&right);
                 let r = Matrix3::from_rows(&[right.transpose(), down.transpose(), fwd.transpose()]);

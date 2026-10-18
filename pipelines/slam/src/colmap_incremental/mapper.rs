@@ -675,14 +675,16 @@ impl IncrementalMapper {
                 self.triangulator.add_modified_point3d(point3d_id);
                 continue;
             }
-            // Otherwise triangulate a new track; as in COLMAP, the default
-            // (angular) residual with `abs_pose_max_error` as its bound.
+            // Otherwise triangulate a new track with the default (angular)
+            // residual. COLMAP bounds it by `abs_pose_max_error` (pixels) as
+            // if it were radians, which accepts every ray; convert, as the
+            // GR6P threshold above does.
             let mut tri_views = views.clone();
             tri_views.push((image_id, idx));
             let Some((xyz, inliers)) = estimate_triangulation_of_views(
                 recon,
                 &tri_views,
-                options.abs_pose_max_error,
+                options.abs_pose_max_error / pixels_per_radian,
                 options.filter_min_tri_angle_deg.to_radians(),
             ) else {
                 continue;

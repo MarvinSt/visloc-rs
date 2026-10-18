@@ -588,6 +588,29 @@ fn classify(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     load_patch(x, y);
+    // The curve's views: the best `init_top_k` at the pixel's depth (ties
+    // to the lower index), the same at every depth.
+    let n = params.num_sources;
+    let k = clamp(params.init_top_k, 1u, min(n, 8u));
+    var center_costs: array<f32, 32>;
+    for (var j = 0u; j < n; j++) {
+        center_costs[j] = view_cost(j, x, y, ray, plane);
+    }
+    var views: array<u32, 8>;
+    var taken = 0u;
+    for (var q = 0u; q < k; q++) {
+        var best = NO_VIEW;
+        for (var j = 0u; j < n; j++) {
+            if (((taken >> j) & 1u) == 1u) {
+                continue;
+            }
+            if (best == NO_VIEW || center_costs[j] < center_costs[best]) {
+                best = j;
+            }
+        }
+        views[q] = best;
+        taken |= 1u << best;
+    }
     let disparity = params.fx * params.baseline / depth;
     let len = min(u32(2 * params.sweep + 1), MAX_CURVE);
     var curve: array<f32, 61>;
@@ -597,7 +620,12 @@ fn classify(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (step <= 0.0 || !(d >= params.depth_min && d <= params.depth_max)) {
             curve[m] = MAX_COST;
         } else {
-            curve[m] = min(top_k_cost(x, y, ray, plane_from_depth(d, plane.xyz, ray)), MAX_COST);
+            let p = plane_from_depth(d, plane.xyz, ray);
+            var sum = 0.0;
+            for (var q = 0u; q < k; q++) {
+                sum += view_cost(views[q], x, y, ray, p);
+            }
+            curve[m] = min(sum / f32(k), MAX_COST);
         }
     }
     classes[i] = classify_curve(&curve, len);

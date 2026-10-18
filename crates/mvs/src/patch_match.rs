@@ -1468,22 +1468,39 @@ impl<'a> Context<'a> {
                             return Class::Unknown;
                         };
                         let patch = self.ref_patch(x, y);
+                        // The curve's views: the best `init_top_k` at the
+                        // pixel's depth, the same at every depth (APD keeps
+                        // the pixel's selected views; a best-k at each depth
+                        // is a lower envelope with spurious minima).
+                        self.view_costs(&patch, (x, y), ray, &plane, (&mut photo, &mut geo));
+                        sorted.clear();
+                        sorted.extend((0..n).map(|j| (photo[j] + geo[j], j)));
+                        sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                        let views: Vec<usize> = sorted[..k].iter().map(|&(_, j)| j).collect();
                         let disparity = self.fx * baseline / depth;
                         for (m, cost) in costs.iter_mut().enumerate() {
                             let step = disparity + (m as i32 - options.sweep) as f32;
                             let d = self.fx * baseline / step;
-                            *cost = if step <= 0.0
-                                || !(self.depth_min..=self.depth_max).contains(&d)
-                            {
-                                MAX_COST
-                            } else {
-                                let p = Plane::from_depth(d, plane.n, ray);
-                                self.view_costs(&patch, (x, y), ray, &p, (&mut photo, &mut geo));
-                                sorted.clear();
-                                sorted.extend((0..n).map(|j| photo[j] + geo[j]));
-                                sorted.sort_by(f32::total_cmp);
-                                (sorted[..k].iter().sum::<f32>() / k as f32).min(MAX_COST)
-                            };
+                            *cost =
+                                if step <= 0.0 || !(self.depth_min..=self.depth_max).contains(&d) {
+                                    MAX_COST
+                                } else {
+                                    let p = Plane::from_depth(d, plane.n, ray);
+                                    let total: f32 = views
+                                        .iter()
+                                        .map(|&j| {
+                                            let source = &self.sources[j];
+                                            let geo = if self.geometric {
+                                                self.options.geom_lambda
+                                                    * self.reprojection_error(source, x, y, ray, &p)
+                                            } else {
+                                                0.0
+                                            };
+                                            self.photometric_cost(&patch, source, ray, &p) + geo
+                                        })
+                                        .sum();
+                                    (total / k as f32).min(MAX_COST)
+                                };
                         }
                         deformable::classify(&costs, options)
                     })

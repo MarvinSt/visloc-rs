@@ -201,10 +201,6 @@ the same GPU type and driver, after its upload failed.)
 | delivery area | 44 | 90.1% | 89.0% | 91.1% | 89.6% | 89.8% | 6:44 | 5:40 |
 | electro | 45 | 89.4% | 94.5% | 84.9% | 88.7% | 89.2% | 6:55 | 6:03 |
 | facade | 76 | 67.5% | 74.4% | 61.7% | 65.4% | 67.3% | 13:46 | 11:53 |
-MEAN s avg      : 13 scenes, F1 81.36, accuracy 87.64, completeness 76.84  (r36 on these: 81.44)
-MEAN s one15    : 13 scenes, F1 81.16, accuracy 85.94, completeness 77.81  (r36 on these: 81.44)
-MEAN m avg      : 13 scenes, F1 83.49, accuracy 86.62, completeness 80.95  (r36 on these: 81.44)
-MEAN m one15    : 13 scenes, F1 83.13, accuracy 85.04, completeness 81.70  (r36 on these: 81.44)
 
 - **Mean over the 13 scenes:** F1 83.5%, accuracy 86.6%, completeness
   81.0%, against 81.4% (87.6%, 76.8%) with one scale. Over the same
@@ -228,6 +224,68 @@ MEAN m one15    : 13 scenes, F1 83.13, accuracy 85.04, completeness 81.70  (r36 
   2:08 and 2:05 for the geometric passes; the two coarser scales take
   2:26 together. Peak memory 14.6 GiB on facade (13.7 GiB with one scale;
   `--save-maps` keeps the costs).
+
+### End to end, against COLMAP
+
+The whole pipeline from the photos: visloc-rs (`gsplat_photos`' SfM, then
+`visloc-mvs`) against COLMAP 4.2.1 built with CUDA (SfM, then its
+`patch_match_stereo` and `stereo_fusion`), each on an NVIDIA L4 pod (the
+same GPU type), visloc-rs at commit `b05aeca`. Both take the images at
+3200 px, one pinhole camera for all of them (the scene's most used
+ground-truth camera, intrinsics held fixed), GPU SIFT and exhaustive
+matching; each model is then moved onto the ground-truth camera centres
+by a Sim(3) (`scripts/align_colmap_model.py`, refitted without centres
+beyond three times the median error), and the clouds are scored like the
+ground-truth-pose runs. visloc-mvs runs with its defaults, COLMAP with
+`image_undistorter --max_image_size 3200`, `patch_match_stereo
+--PatchMatchStereo.geom_consistency true` and `stereo_fusion`'s defaults.
+COLMAP's pod stopped at its 7-hour cap after 10 scenes. F1 at 2 cm
+(accuracy / completeness), the median camera-centre error after the
+alignment (visloc-rs / COLMAP), and the SfM + MVS times:
+
+| Scene | Images | Ground-truth poses | visloc-rs | COLMAP | Centre error | visloc-rs time | COLMAP time |
+|---|---|---|---|---|---|---|---|
+| pipes | 14 | 84.4% | 89.3% (96.4 / 83.1) | 37.5% (98.2 / 23.1) | 0.11 / 0.11 cm | 0:06 + 2:23 | 0:12 + 17:28 |
+| meadow | 15 | 76.0% | 26.0% (61.3 / 16.5) | 31.2% (83.6 / 19.2) | 2.70 / 1.00 cm | 0:07 + 3:06 | 0:13 + 17:38 |
+| terrace | 23 | 91.0% | 90.0% (95.6 / 84.9) | 80.5% (94.7 / 70.0) | 0.33 / 0.22 cm | 0:09 + 4:36 | 0:24 + 28:17 |
+| office | 26 | 79.0% | 76.5% (73.0 / 80.5) | 37.9% (92.3 / 23.8) | 0.18 / 0.14 cm | 0:07 + 4:33 | 0:19 + 31:33 |
+| kicker | 31 | 82.3% | 80.3% (77.7 / 83.1) | 49.9% (95.4 / 33.8) | 0.32 / 0.11 cm | 0:11 + 5:59 | 0:37 + 37:26 |
+| relief | 31 | 87.8% | 85.1% (90.9 / 80.0) | 68.7% (95.9 / 53.5) | 0.11 / 0.10 cm | 0:13 + 6:14 | 1:07 + 38:55 |
+| relief 2 | 31 | 86.5% | 83.7% (85.8 / 81.6) | 68.0% (93.1 / 53.5) | 0.10 / 0.10 cm | 0:13 + 6:25 | 0:53 + 38:38 |
+| courtyard | 38 | 90.4% | 85.0% (90.3 / 80.3) | 75.1% (91.0 / 63.9) | 0.68 / 0.45 cm | 0:16 + 7:00 | 1:17 + 49:04 |
+| playground | 38 | 69.8% | 60.4% (63.4 / 57.8) | 51.1% (76.7 / 38.3) | 0.21 / 0.27 cm | 0:16 + 7:49 | 0:42 + 50:21 |
+| terrains | 42 | 91.2% | 86.6% (82.0 / 91.7) | 73.9% (94.0 / 60.9) | 0.23 / 0.20 cm | 0:18 + 8:14 | 0:48 + 56:04 |
+| delivery area | 44 | 90.1% | 83.9% (78.0 / 90.7) | – | 0.30 cm | 0:16 + 8:22 | – |
+| electro | 45 | 89.4% | 80.5% (87.5 / 74.6) | – | 0.32 cm | 0:20 + 8:07 | – |
+| facade | 76 | 67.5% | 61.0% (63.8 / 58.4) | – | 0.98 cm | 0:41 + 16:01 | – |
+
+- **Against COLMAP, over the 10 scenes both finished:** F1 76.3% against
+  57.4%, higher on 9 of 10 (meadow, below, is the exception), in 58
+  minutes against 372 (6.4 times faster). COLMAP's clouds are more
+  accurate (91.5% against 81.6%) and far less complete (44.0% against
+  73.9%): its fusion keeps a point seen consistently in at least 5
+  images. Its MVS takes 17 to 56 minutes a scene; visloc-rs' SfM takes
+  6 to 41 seconds and its MVS 2:23 to 16:01.
+- **Against the ground-truth poses:** 76.0% over the 13 scenes against
+  83.5%. Office, kicker and the reliefs, with one camera, lose 2.0 to 2.8
+  points (delivery area 6.2; pipes gains 4.9); the scenes with several
+  cameras lose 4.6 to 9.4 (courtyard, playground, terrains, electro,
+  facade; terrace 1.0): one camera for every image leaves the
+  others' focal lengths and principal points a few pixels off at 3200 px
+  (COLMAP's run shares that handicap). The loss is mostly accuracy at the
+  tightest tolerance, a misregistration of a few millimetres: on delivery
+  area accuracy falls from 77% to 57% at 1 cm but only from 96.7% to
+  94.1% at 5 cm, and completeness is unchanged at 5 cm.
+- **Meadow** defeats both SfMs: visloc-rs registers all 15 images but
+  triangulates 850 points and leaves a 2.7 cm median centre error (one
+  image 9 cm off); COLMAP registers 14, one 23 cm off. With 16384
+  keypoints instead of 8192 visloc-rs keeps a 25 cm outlier.
+- **Tools for a next run:** `scripts/eth3d_one_camera.py` resamples a
+  scene's images onto its most used camera (`K K_i^-1`, exact for pinhole
+  images: patches at the moved observations match with NCC 0.997), and
+  `scripts/eth3d_icp_align.py` refines the alignment by ICP against the
+  scan; on pipes the latter moves a ground-truth-pose cloud by 1.8 mm
+  (F1 74.8% → 74.4% at 1600 px), so it measures little beyond noise there.
 
 ### One scale and the planar prior
 

@@ -12,6 +12,11 @@ keyframes more than a few seconds apart together.
 VIO trajectory afterwards with one batch optimization over the whole
 sequence. It uses no ground truth.
 
+The sections below follow the development in order. The current pipeline and
+its results on ten training sequences are in [Two sequences per
+track](#two-sequences-per-track) (mean 74.64 over the five sequences it was
+developed on, 54.34 over all ten), the commands in [Usage](#usage).
+
 ## Method
 
 1. **Keyframes.** Every 10th frame of the VIO trajectory (2 Hz).
@@ -40,6 +45,8 @@ sequence. It uses no ground truth.
    The landmarks are eliminated by the Schur complement. A landmark keeps
    its observations within 64 keyframes of its first one (`--band`), so the
    reduced system is banded and is factored by LAPACK's banded Cholesky.
+   The second solve of the pipeline keeps all of them (see
+   [Revisits](#revisits)).
    The camera rotations form a dense border. A prior on the first pose fixes
    the gauge.
 
@@ -146,7 +153,7 @@ factory camera rig. On sequence_4_10 the VIO is the low-light configuration
 first version of the solver had neither the outlier rejection nor the
 landmark damping floor; the 10 px column has both but keeps 10 px to the end;
 the 3 px column also tightens it to 3 px from the 8th iteration on (see
-[Method](#method)). The last column, the default, also estimates the camera
+[Method](#method)). The last column also estimates the camera
 rotations in eight time segments (see [During a
 recording](#during-a-recording)).
 
@@ -286,8 +293,8 @@ image stretches fastest radially), by keypoint octave:
 | sequence_1_19 | −0.007 px | −0.001 px | +0.012 px | +0.051 px |
 
 Only the offset common to all octaves differs between the devices. Moving
-every keypoint by its octave's and radius's mean residual (`--xy-correction`,
-a table from the first solve) leaves the local scale trend of
+every keypoint by its octave's and radius's mean residual (a table from the
+first solve) leaves the local scale trend of
 sequence_2_11 at +2.55 % per 1,000 s (+2.53 % with three times the
 correction; CP Score 71.75 and 68.01), and keeping only matches between
 keypoints of similar size raises it (+3.22 % within a size ratio of 1.25,
@@ -295,8 +302,8 @@ keypoints of similar size raises it (+3.22 % within a size ratio of 1.25,
 the drift.
 
 The ratio of the image's angular scale to the gyroscope's does. Changing the
-focal lengths linearly over the recording (`--focal-trend`, the mean
-unchanged; first solve, eight segments) moves the trend in proportion:
+focal lengths linearly over the recording (the mean unchanged; first solve,
+eight segments) moves the trend in proportion:
 
 | Focal length change from the first to the last segment | CP Score | Pose recall at 1 m | Local scale trend per 1,000 s |
 |---|---:|---:|---:|
@@ -506,7 +513,7 @@ is NaN in the VRS records). Letting the bias move does not help in general
 | Default | **71.18** | 47.65 |
 | Gyro bias random walk ×100 | | 49.38 |
 | Gyro bias random walk ×1000 | 66.56 | 50.53 |
-| ×1000 at the start, decaying with a time constant of 120 s (`--gyro-rw-warmup 120`) | 67.51 | **50.72** |
+| ×1000 at the start, decaying with a time constant of 120 s | 67.51 | **50.72** |
 | The same with 300 s | | 49.29 |
 | Accelerometer bias random walk ×30 at the start, 120 s | 68.36 | |
 
@@ -970,7 +977,7 @@ gets there without the pseudo-GT (first solve, CP Score):
 |---|---:|---|
 | Default | 20.98 | |
 | Gyro bias random walk ×100 | 21.77 | −3.32 −1.58 −0.15 +0.58 +0.73 +0.18 |
-| Warm-up random walk (`--gyro-rw-warmup 300`) | 20.90 | −2.80 −1.58 −0.14 +0.66 +0.70 +0.10 |
+| Gyro bias random walk ×1000 at the start, decaying over 300 s | 20.90 | −2.80 −1.58 −0.14 +0.66 +0.70 +0.10 |
 | `--modes yaw` | 24.14 | −3.41 −1.49 −0.31 +0.42 +0.72 +0.49 |
 | `--modes yaw8` (eight time pieces) | 17.65 | −3.03 −1.92 −0.57 +0.79 +2.18 +2.47 |
 | IMU noise halved (`--imu-noise-scale 0.5`) | 19.22 | −4.24 −2.09 −0.40 +0.43 +0.73 +0.72 |
@@ -1100,7 +1107,10 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   drift a loop edge may disagree by.
 - **Other options.** `--prior-rot-sigma` loosens the first keyframe's
   rotation prior (1e-4 rad). `--omega-coriolis x,y,z` puts Earth's rotation
-  (rad/s, in the VIO's world frame) into the IMU factors.
+  (rad/s, in the VIO's world frame) into the IMU factors. `--imu-noise-scale`,
+  `--gyro-rw-scale` and `--accel-rw-scale` multiply the calibration's noise
+  densities and bias random walks. `--kf-range START:END` solves a window of
+  keyframes only.
 - **Heading drift.** `--modes yaw` lets the solve correct a slow heading
   drift of its starting trajectory (see [Slow heading drift](#slow-heading-drift));
   `--modes yawN` splits it into N time pieces.
@@ -1113,9 +1123,7 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   `--focal-mean-sigma`); leave it off on a moving platform. `loop-correct`
   takes the estimates from the states.
 - **Keypoint sizes.** `solve --sigma-size 2.7 --sigma-size-pow 0.35` gives
-  larger keypoints a larger pixel sigma. `features` stores the sizes; for a
-  `features.npz` written before, `sizes --mav0 ... --work ...` (with the
-  same `--clahe`/`--denoise`) recovers them into `kp_size.npz`.
+  larger keypoints a larger pixel sigma (`features` stores the sizes).
 - **Recommended.** The [table above](#with-the-focal-lengths-the-keypoint-sizes-and-denoising)
   uses `--est-focal --sigma-size 2.7 --sigma-size-pow 0.35` in both solves,
   `features --clahe --denoise 7` in low light, and no `--est-focal` on the
@@ -1131,3 +1139,7 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   default 60 take up to twice as long. `loops` takes 3–6 min with
   four processes and `loop-correct` a minute. sequence_3_17's solves need
   about 6.5 GB of memory.
+- **Removed options.** The options of some experiments above that did not
+  help are gone: the keypoint position correction, the focal length trend,
+  the keypoint size ratio filter, the warm-up random walk, and the `sizes`
+  stage for features written without sizes. Commit `adfe888` still has them.

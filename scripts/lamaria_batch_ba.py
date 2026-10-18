@@ -17,7 +17,8 @@ afterwards with one batch optimization over the whole sequence:
             landmarks are eliminated by the Schur complement; because every
             landmark is seen within --band keyframes, the reduced system is
             banded and is factored by LAPACK's banded Cholesky, with the
-            camera rotations as a dense border.
+            camera rotations as a dense border (with --loops, conjugate
+            gradients on the whole system, preconditioned by that factor).
 
 The output is the VIO's per-frame trajectory with each frame moved by the
 correction of the surrounding keyframes (TUM, seconds, world_from_imu), plus a
@@ -68,7 +69,8 @@ def quat_to_rot(q):
 
 def load_calib(path):
     """Pinhole intrinsics, IMU-camera extrinsics and IMU noise of a Basalt calibration."""
-    v = json.load(open(path))["value0"]
+    with open(path) as f:
+        v = json.load(f)["value0"]
     cams = []
     for c in range(len(v["T_imu_cam"])):
         e = v["T_imu_cam"][c]
@@ -96,17 +98,6 @@ def load_tum(path):
 def load_features(work, desc=True):
     f = np.load(os.path.join(work, "features.npz"))  # lazy: the descriptors are read only when asked for
     return f["kf_ns"], f["offsets"], f["xy"], f["desc"] if desc else None
-
-
-def load_sizes(work):
-    """SIFT keypoint sizes (px) aligned with features.npz: stored there, or by `sizes` in kp_size.npz."""
-    f = np.load(os.path.join(work, "features.npz"))
-    if "size" in f.files:
-        return f["size"]
-    path = os.path.join(work, "kp_size.npz")
-    if not os.path.exists(path):
-        sys.exit("no keypoint sizes: features.npz predates them, run `sizes` first")
-    return np.load(path)["size"]
 
 
 def keyframe_poses(kf_ns, vio):
@@ -143,16 +134,6 @@ def _sift_worker(task):
     return xy, des, size
 
 
-def _size_worker(task):
-    """Sizes of an image's stored keypoints, detected again (same detector) and found by their position."""
-    import cv2
-    path, nfeat, clahe, denoise, xy = task
-    cv2.setNumThreads(1)
-    kp = cv2.SIFT_create(nfeatures=nfeat, contrastThreshold=0.01).detect(_sift_image(path, clahe, denoise), None)
-    lut = {np.array(k.pt, np.float32).tobytes(): k.size for k in kp}
-    return np.array([lut.get(p.tobytes(), np.nan) for p in xy], np.float32)
-
-
 def cmd_features(a):
     os.makedirs(a.work, exist_ok=True)
     vio_ns, _, _ = load_tum(a.vio)
@@ -175,19 +156,6 @@ def cmd_features(a):
              xy=np.concatenate([r[0] for r in res]), desc=np.concatenate([r[1] for r in res]),
              size=np.concatenate([r[2] for r in res]))
     print(f"features: {offsets[-1]} keypoints, {counts.mean():.0f}/image, {time.time() - t0:.0f} s", flush=True)
-
-
-def cmd_sizes(a):
-    """kp_size.npz: the keypoint sizes of a features.npz written without them."""
-    kf_ns, offsets, xy, _ = load_features(a.work, desc=False)
-    tasks = [(os.path.join(a.mav0, f"cam{c}", "data", f"{t}.png"), a.num_features, a.clahe, a.denoise,
-              xy[offsets[2 * k + c]:offsets[2 * k + c + 1]]) for k, t in enumerate(kf_ns) for c in range(2)]
-    t0 = time.time()
-    with mp.Pool(a.jobs) as pool:
-        size = np.concatenate(pool.map(_size_worker, tasks, chunksize=8))
-    np.savez(os.path.join(a.work, "kp_size.npz"), size=size)
-    print(f"sizes: {len(size)} keypoints, {np.isnan(size).mean() * 100:.2f} % not found again, "
-          f"median {np.nanmedian(size):.2f} px, {time.time() - t0:.0f} s", flush=True)
 
 
 # ----------------------------------------------------------------------------- matching
@@ -457,7 +425,7 @@ def cmd_loops(a):
                 out_matches.append(m)
     pairs = np.concatenate(out_pairs) if out_pairs else np.zeros((0, 4), np.int32)
     matches = np.concatenate(out_matches) if out_matches else np.zeros((0, 2), np.int32)
-    np.savez(os.path.join(a.work, a.out_file), pairs=pairs, matches=matches)
+    np.savez(os.path.join(a.work, "loops.npz"), pairs=pairs, matches=matches)
     print(f"loops: {len(matches)} matches over {len(out_pairs)} verified image pairs "
           f"({len(np.unique(pairs[:, [0, 2]], axis=0))} keyframe pairs, {by_rotation} rejected by rotation), "
           f"{time.time() - t0:.0f} s", flush=True)
@@ -989,15 +957,12 @@ class Reprojection:
 
 
 def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_rw_scale=1.0, gyro_rw_scale=1.0,
-               prior_rot_sigma=1e-4, omega_coriolis=None, warmup_s=0.0, warmup_scale=1.0, warmup_accel_scale=1.0):
+               prior_rot_sigma=1e-4, omega_coriolis=None):
     """GTSAM values and factors for poses, velocities, biases, the IMU and the gauge priors.
 
     The first keyframe's position is pinned (1e-4 m); its rotation gets prior_rot_sigma (rad). Gravity
     makes roll and pitch observable, so a loose rotation prior lets the solve fix a tilt the VIO got
-    wrong at its start instead of pinning it there. With warmup_s > 0 the gyro bias random walk starts
-    warmup_scale times larger (the accelerometer's warmup_accel_scale times) and decays to its normal
-    value with that time constant (s): the biases still settle while the device warms up after the
-    start of a recording.
+    wrong at its start instead of pinning it there.
     """
     import gtsam
     from gtsam.symbol_shorthand import B, V, X
@@ -1005,18 +970,14 @@ def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_r
     imu = np.loadtxt(imu_path, delimiter=",", comments="#")
     imu_ns = imu[:, 0].astype(np.int64)
 
-    def make_params(gyro_rw, accel_rw=accel_rw_scale):
-        params = gtsam.PreintegrationCombinedParams.MakeSharedU(9.81)
-        params.setAccelerometerCovariance(np.eye(3) * (noise_scale * noise["accel_noise_std"]) ** 2)
-        params.setGyroscopeCovariance(np.eye(3) * (noise_scale * noise["gyro_noise_std"]) ** 2)
-        params.setIntegrationCovariance(np.eye(3) * 1e-8)
-        params.setBiasAccCovariance(np.eye(3) * (accel_rw * noise["accel_bias_std"]) ** 2)
-        params.setBiasOmegaCovariance(np.eye(3) * (gyro_rw * noise["gyro_bias_std"]) ** 2)
-        if omega_coriolis is not None:  # Earth's rotation in the world frame, which the gyroscope also measures
-            params.setOmegaCoriolis(np.asarray(omega_coriolis, float))
-        return params
-
-    params = make_params(gyro_rw_scale)
+    params = gtsam.PreintegrationCombinedParams.MakeSharedU(9.81)
+    params.setAccelerometerCovariance(np.eye(3) * (noise_scale * noise["accel_noise_std"]) ** 2)
+    params.setGyroscopeCovariance(np.eye(3) * (noise_scale * noise["gyro_noise_std"]) ** 2)
+    params.setIntegrationCovariance(np.eye(3) * 1e-8)
+    params.setBiasAccCovariance(np.eye(3) * (accel_rw_scale * noise["accel_bias_std"]) ** 2)
+    params.setBiasOmegaCovariance(np.eye(3) * (gyro_rw_scale * noise["gyro_bias_std"]) ** 2)
+    if omega_coriolis is not None:  # Earth's rotation in the world frame, which the gyroscope also measures
+        params.setOmegaCoriolis(np.asarray(omega_coriolis, float))
     graph, values = gtsam.NonlinearFactorGraph(), gtsam.Values()
     imu_factors = []
     zero_bias = gtsam.imuBias.ConstantBias()
@@ -1036,11 +997,7 @@ def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_r
                 np.array([0.1, 0.1, 0.1, 1e-3, 1e-3, 1e-3]))))
     for k in range(n - 1):
         ta, tb = kf_ns[k], kf_ns[k + 1]
-        decay = np.exp(-(ta - kf_ns[0]) * 1e-9 / warmup_s) if warmup_s > 0 else 0.0
-        boost = ((warmup_scale - 1.0) * decay, (warmup_accel_scale - 1.0) * decay)
-        pim = gtsam.PreintegratedCombinedMeasurements(
-            make_params(gyro_rw_scale * (1.0 + boost[0]), accel_rw_scale * (1.0 + boost[1]))
-            if max(boost) > 0.01 else params, zero_bias)
+        pim = gtsam.PreintegratedCombinedMeasurements(params, zero_bias)
         s = max(np.searchsorted(imu_ns, ta, side="right") - 1, 0)
         e = np.searchsorted(imu_ns, tb, side="left")
         for i in range(s, min(e, len(imu_ns) - 1)):
@@ -1165,8 +1122,6 @@ def cmd_solve(a):
 
     t0 = time.time()
     kf_ns, offsets, xy, _ = load_features(a.work, desc=False)
-    if a.xy_correction:  # per-keypoint position corrections (px), e.g. for a detector bias
-        xy = xy + np.load(a.xy_correction)["dxy"]
     cams, noise = load_calib(a.calib)
     vio = load_tum(a.vio)
     kf_p, kf_r = keyframe_poses(kf_ns, a.vio)
@@ -1175,13 +1130,6 @@ def cmd_solve(a):
     k1 = min(k1, len(kf_ns))
     sel = (m["pairs"][:, 0] >= k0) & (m["pairs"][:, 2] < k1) & (m["pairs"][:, 2] - m["pairs"][:, 0] <= a.max_offset)
     pairs, matches = m["pairs"][sel], m["matches"][sel]
-    if a.max_size_ratio > 0:  # keep the matches whose two keypoints have similar sizes
-        size = load_sizes(a.work)
-        ratio = size[offsets[2 * pairs[:, 2] + pairs[:, 3]] + matches[:, 1]] / \
-            size[offsets[2 * pairs[:, 0] + pairs[:, 1]] + matches[:, 0]]
-        keep = np.abs(np.log(ratio)) <= np.log(a.max_size_ratio)
-        print(f"  {keep.mean() * 100:.1f} % of the matches within a size ratio of {a.max_size_ratio}", flush=True)
-        pairs, matches = pairs[keep], matches[keep]
     if a.loops:  # verified revisit matches from the loops stage
         lm = np.load(os.path.join(a.work, "loops.npz"))
         lsel = (lm["pairs"][:, 0] >= k0) & (lm["pairs"][:, 2] < k1)
@@ -1190,7 +1138,7 @@ def cmd_solve(a):
     tracks, image_of, conflicts = build_tracks(offsets, pairs, matches, 1 << 30)
     pts, kept = triangulate(tracks, image_of, xy, kf_p, kf_r, cams, a.max_reproj, a.min_angle)
     kf_ns, kf_p, kf_r = kf_ns[k0:k1], kf_p[k0:k1], kf_r[k0:k1]
-    # a landmark keeps the observations within --band keyframes of its first one, a revisit landmark all
+    # a landmark keeps the observations within --band keyframes of its first one; with --loops all of them
     obs_kf, obs_cam, obs_lm, obs_z, obs_f = [], [], [], [], []
     for j, feats in enumerate(kept):
         k = image_of[feats] // 2
@@ -1204,7 +1152,7 @@ def cmd_solve(a):
     obs_lm = np.concatenate(obs_lm)
     obs_sigma = np.full(len(obs_lm), a.pixel_sigma)
     if a.sigma_size > 0:  # a keypoint larger than --sigma-size is located less precisely
-        size = load_sizes(a.work)[np.concatenate(obs_f)]
+        size = np.load(os.path.join(a.work, "features.npz"))["size"][np.concatenate(obs_f)]
         size = np.where(np.isfinite(size), size, a.sigma_size)
         obs_sigma *= np.maximum(size / a.sigma_size, 1.0) ** a.sigma_size_pow
         print(f"  pixel sigma by keypoint size: median {np.median(obs_sigma):.2f}, "
@@ -1223,17 +1171,13 @@ def cmd_solve(a):
         # an IMU-camera rotation per time segment: camera c in segment s becomes camera c * n_seg + s
         obs_cam = obs_cam * n_seg + seg_of_kf[obs_kf]
         cams = [cams[c] for c in range(2) for _ in range(n_seg)]
-        if a.focal_trend:  # diagnosis: focal lengths changing linearly over the recording (mean unchanged)
-            cams = [dict(cm, K=cm["K"] * np.array([[f, 1, 1], [1, f, 1], [1, 1, 1]])) for cm, f in
-                    zip(cams, [1 + a.focal_trend * ((s + 0.5) / n_seg - 0.5) for _ in range(2) for s in range(n_seg)])]
         est_cams = [c * n_seg + s for c in phys_est for s in range(n_seg)]
         print(f"  {n_seg} time segments per camera rotation", flush=True)
     rp = Reprojection(obs_kf, obs_cam, remap[obs_lm], np.concatenate(obs_z), len(pts), cams, est_cams,
                       obs_sigma, a.huber, a.band, est_focal=a.est_focal)
     omega = [float(v) for v in a.omega_coriolis.split(",")] if a.omega_coriolis else None
     graph, values, index, imu_factors = _imu_graph(kf_ns, kf_p, kf_r, vio, a.imu, noise, a.imu_noise_scale,
-                                                   a.accel_rw_scale, a.gyro_rw_scale, a.prior_rot_sigma, omega,
-                                                   a.gyro_rw_warmup, a.gyro_rw_warmup_scale, a.accel_rw_warmup_scale)
+                                                   a.accel_rw_scale, a.gyro_rw_scale, a.prior_rot_sigma, omega)
     n = len(kf_ns)
     nb, ne, npar = n * DOF, rp.n_par * rp.n_ext, rp.n_par
     modes = expand_modes(a.modes)
@@ -1274,7 +1218,7 @@ def cmd_solve(a):
     mu = 0.0  # damping of the modes relative to their own curvature: none until a step with them fails
     for it in range(a.iterations):
         ti = time.time()
-        if a.outlier_px > 0 and it >= a.outlier_start:
+        if a.outlier_px > 0:
             # drop observations that moved far off, then landmarks left with a single observation;
             # from --outlier-start2 on with the tighter --outlier-px2
             thr = a.outlier_px2 if 0 < a.outlier_px2 and it >= a.outlier_start2 else a.outlier_px
@@ -1471,7 +1415,7 @@ def cmd_solve(a):
         comp += [np.sum(ew[i:i + 3] ** 2) for i in (0, 3, 6, 9, 12)]
     comp /= max(len(imu_factors), 1)
     summary = {
-        "keyframes": n, "landmarks": int(rp.n_lm), "observations": int(len(rp.kf)),
+        "keyframes": n, "landmarks": int(rp.n_lm), "observations": len(rp.kf),
         "active_observations": int(rp.active.sum()),
         "final_cost": cost, "reprojection_cost": reproj, "imu_prior_cost": graph.error(values),
         "segment_prior_cost": seg_cost(r_ic),
@@ -1491,7 +1435,8 @@ def cmd_solve(a):
         "seconds": time.time() - t0,
     }
     print(json.dumps(summary, indent=1), flush=True)
-    json.dump(summary, open(os.path.splitext(a.out)[0] + "_summary.json", "w"), indent=1)
+    with open(os.path.splitext(a.out)[0] + "_summary.json", "w") as f:
+        json.dump(summary, f, indent=1)
     write_corrected(a.out, vio, kf_ns, kf_p, kf_r, t_wi, r_wi)
     if a.save_states:  # what loop-correct needs: keyframe poses, landmarks and their observations
         # r_ic per physical camera and time segment (camera c, segment s at c * ext_segments + s)
@@ -1709,7 +1654,7 @@ def cmd_loop_correct(a):
     act = st["active"]
     okf, ocam, olm, oz = st["obs_kf"][act], st["obs_cam"][act], st["obs_lm"][act], st["obs_z"][act]
     _, offsets, xy, _ = load_features(a.work, desc=False)
-    lp = np.load(os.path.join(a.work, a.loops_file))
+    lp = np.load(os.path.join(a.work, "loops.npz"))
     sel = (lp["pairs"][:, 0] >= k0) & (lp["pairs"][:, 2] < k0 + n)
     pairs, matches = lp["pairs"][sel].astype(np.int64), lp["matches"][sel]
     pairs[:, [0, 2]] -= k0
@@ -1795,13 +1740,6 @@ def main():
     f.add_argument("--clahe", action="store_true", help="contrast-limited histogram equalization (low light)")
     f.add_argument("--denoise", type=float, default=0.0,
                    help="non-local means denoising strength h before detection (low light, e.g. 7; 0: off)")
-    z = sub.add_parser("sizes", help="keypoint sizes for a features.npz written without them (kp_size.npz)")
-    z.add_argument("--mav0", required=True)
-    z.add_argument("--work", required=True)
-    z.add_argument("--num-features", type=int, default=1500, help="as in features")
-    z.add_argument("--jobs", type=int, default=2)
-    z.add_argument("--clahe", action="store_true", help="as in features")
-    z.add_argument("--denoise", type=float, default=0.0, help="as in features")
     m = sub.add_parser("match", help="VIO-guided epipolar matching between keyframes")
     m.add_argument("--work", required=True)
     m.add_argument("--vio", required=True)
@@ -1829,7 +1767,6 @@ def main():
     lp.add_argument("--min-inliers", type=int, default=25, help="essential-matrix inliers to accept a pair")
     lp.add_argument("--max-rot", type=float, default=10.0, help="largest disagreement with the VIO rotation (deg)")
     lp.add_argument("--jobs", type=int, default=2)
-    lp.add_argument("--out-file", default="loops.npz", help="written in --work")
     s = sub.add_parser("solve", help="batch VI bundle adjustment")
     s.add_argument("--work", required=True)
     s.add_argument("--imu", required=True, help="IMU csv (ns, gyro, accel) as the VIO used it")
@@ -1851,8 +1788,6 @@ def main():
                    help="keypoint size (px) up to which an observation has --pixel-sigma; a larger keypoint's "
                    "sigma grows as (size / this) ** --sigma-size-pow (0: off)")
     s.add_argument("--sigma-size-pow", type=float, default=1.0)
-    s.add_argument("--xy-correction", default="", help="npz with dxy (px) per keypoint of features.npz, "
-                   "added to the keypoint positions")
     s.add_argument("--est-focal", action="store_true",
                    help="also estimate each estimated camera's focal length scale, per time segment")
     s.add_argument("--focal-seg-sigma", type=float, default=0.0005,
@@ -1861,20 +1796,15 @@ def main():
     s.add_argument("--focal-mean-sigma", type=float, default=0.0,
                    help="prior on the mean of each camera's focal length scales over the segments (0: none); "
                    "a tight one keeps the calibration's focal length on average and lets only its course change")
-    s.add_argument("--focal-trend", type=float, default=0.0,
-                   help="diagnosis: relative focal length change from the first to the last segment")
     s.add_argument("--pcg-tol", type=float, default=1e-4,
                    help="relative residual at which conjugate gradients stop (with revisit matches)")
     s.add_argument("--pcg-iters", type=int, default=200, help="most conjugate-gradient iterations per step")
-    s.add_argument("--max-size-ratio", type=float, default=0.0,
-                   help="drop matches whose keypoint sizes differ by more than this factor (0: keep all)")
     s.add_argument("--huber", type=float, default=2.0, help="Huber threshold in sigmas")
     s.add_argument("--iterations", type=int, default=60)
     s.add_argument("--rel-tol", type=float, default=1e-7, help="stop once an iteration lowers the cost less")
     s.add_argument("--lambda0", type=float, default=1e-4)
     s.add_argument("--outlier-px", type=float, default=10.0,
                    help="each iteration drops observations whose error exceeds this (0: keep all)")
-    s.add_argument("--outlier-start", type=int, default=0, help="first iteration that drops outliers")
     s.add_argument("--outlier-px2", type=float, default=3.0,
                    help="tighter threshold (px) from --outlier-start2 on, once the solution has settled (0: off)")
     s.add_argument("--outlier-start2", type=int, default=8)
@@ -1889,13 +1819,6 @@ def main():
                    help="multiplies the calibration's accelerometer and gyroscope noise densities")
     s.add_argument("--accel-rw-scale", type=float, default=1.0, help="multiplies the accel bias random walk")
     s.add_argument("--gyro-rw-scale", type=float, default=1.0, help="multiplies the gyro bias random walk")
-    s.add_argument("--gyro-rw-warmup", type=float, default=0.0,
-                   help="time constant (s) over which a larger gyro bias random walk at the start of the "
-                   "recording decays to the normal one (0: off)")
-    s.add_argument("--gyro-rw-warmup-scale", type=float, default=1000.0,
-                   help="how many times larger the gyro bias random walk is at the start, with --gyro-rw-warmup")
-    s.add_argument("--accel-rw-warmup-scale", type=float, default=1.0,
-                   help="the same for the accelerometer bias random walk, with --gyro-rw-warmup")
     s.add_argument("--loops", action="store_true", help="add the revisit matches of the loops stage")
     s.add_argument("--modes", default="", help="undamped deformation modes of the whole solution: yaw, scale "
                    "(comma-separated); they let LM move along slow drifts the damped steps cannot follow. "
@@ -1912,7 +1835,6 @@ def main():
     c.add_argument("--states", required=True, help="<out>_states.npz of the solve")
     c.add_argument("--tum", required=True, help="the solve's output trajectory")
     c.add_argument("--out", required=True, help="corrected trajectory (TUM)")
-    c.add_argument("--loops-file", default="loops.npz", help="revisit matches in --work")
     c.add_argument("--min-inliers", type=int, default=15, help="PnP inliers for a loop edge")
     c.add_argument("--gate", default="0.3,0.01,2.0",
                    help="drop an edge disagreeing with the solve by more than BASE + RATE * (time between the visits)"
@@ -1922,7 +1844,7 @@ def main():
     c.add_argument("--loop-rot-sigma", type=float, default=0.005, help="rad")
     c.add_argument("--loop-pos-sigma", type=float, default=0.1, help="m")
     a = p.parse_args()
-    {"features": cmd_features, "sizes": cmd_sizes, "match": cmd_match, "loops": cmd_loops, "solve": cmd_solve,
+    {"features": cmd_features, "match": cmd_match, "loops": cmd_loops, "solve": cmd_solve,
      "loop-correct": cmd_loop_correct}[a.cmd](a)
 
 

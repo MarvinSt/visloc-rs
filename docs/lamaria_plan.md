@@ -291,11 +291,14 @@ before/after on training sequences.
 3. Propagate corrections (`scripts/propagate_basalt_mapper_corrections.py`) and
    convert to the submission format
    (`scripts/basalt_tum_to_lamaria_estimate.py`). For the batch BA (lever
-   14), run `scripts/lamaria_batch_ba.py` `features`, `match` and `solve` on
-   the VIO trajectory first (about 15 + 3 + 10–21 min per sequence on 4
-   cores); with the revisits, `loops`, `solve --save-states`, `loop-correct`
-   and a second `solve --loops` from the corrected trajectory (another
-   10–40 min and 22–40 min).
+   14), start `scripts/lamaria_batch_ba.py` from the VIO trajectory:
+   `features`, `match`, `loops`, `solve --save-states`, `loop-correct`, and
+   a second `solve --loops` from the corrected trajectory, with the options
+   of [its Usage](lamaria_batch_ba.md#usage) (low light: denoised features
+   and 30 iterations; moving platform: no `--est-focal`). On 4 cores that
+   takes about 15 min for the features (30 with the denoising), 2–7 min for
+   the matching, 3–6 min for `loops`, and 10–40 min per solve at 30
+   iterations, up to twice that at the default 60.
 4. Delete the sequence data; add `slam/<seq>.txt` to the submission zip.
 5. Submit via <https://lamaria.ethz.ch/login> (24 h rate limit).
 

@@ -707,14 +707,13 @@ platform). Final CP Score (pose recall at 1 m):
 | Track | Sequence | VIO | Batch BA | Sequence | VIO | Batch BA | Mean |
 |---|---|---:|---:|---|---:|---:|---:|
 | Short | sequence_1_19 | 71.96 | 88.16 (95.8 %) | sequence_1_20 | 38.32 | 49.00 (27.8 %) | 68.58 |
-| Medium | sequence_2_11 | 49.68 | 85.46 (99.5 %) | sequence_2_12 | 18.03 | 20.81 (0.0 %)¹ | 53.14 |
+| Medium | sequence_2_11 | 49.68 | 85.46 (99.5 %) | sequence_2_12 | 18.03 | 20.82 (0.4 %) | 53.14 |
 | Long | sequence_3_17 | 50.06 | 71.43 (72.3 %) | sequence_3_18 | 34.68 | 36.13 (8.5 %) | 53.78 |
-| Low light | sequence_4_10 | 38.99 | 67.81 (68.4 %)² | sequence_4_11 | 36.37 | 56.49 (37.6 %)² | 62.15 |
+| Low light | sequence_4_10 | 38.99 | 67.81 (68.4 %)¹ | sequence_4_11 | 36.37 | 56.49 (37.6 %)¹ | 62.15 |
 | Moving platform | sequence_5_11 | 43.14 | 60.32 | sequence_5_12 | 4.98 | 7.73 | 34.03 |
 | **Mean** | | | **74.64** | | | 34.03 | **54.34** |
 
-¹ 30 iterations per solve (its features are no longer on disk). ² 30
-iterations per solve, as recommended in low light (see
+¹ 30 iterations per solve, as recommended in low light (see
 [Iterations](#iterations)).
 
 The first sequence of each track is the one the method was developed on.
@@ -1138,6 +1137,16 @@ score is set elsewhere: after the ride the CP errors (pipeline) stay at 2–16 m
 for 13 minutes and grow to 24–37 m in the last five, where the distances
 between the CPs come out 15–42 % too long after the Sim(3) fit.
 
+Nor is the ride's length an accelerometer bias the solve made up. Over the
+ride the first solve's accelerometer bias changes by 0.07 m/s² on one axis,
+seven times its random walk's 1σ; with a random walk ten times stiffer
+(`--accel-rw-scale 0.1`) it stays within 0.01 m/s², but the ride's
+displacement from 80 s to 170 s stays 157 m and the score 8.11 (4.73 from
+the ride doubled). The directions between consecutive CPs show what is left: in
+every solution (pipeline, online, ride doubled) the first one, across the
+ride, points 16–20° off, the next twelve 0.7–5.4° off, and the last three
++21°, −68° and +23° off.
+
 ### Low light: matching guided by the solve
 
 Matching the low-light sequences again, guided by the pipeline's final
@@ -1181,12 +1190,16 @@ sequences at a time on 4 cores, two threads each:
 | sequence_1_19 | **88.16** | 75.73 | 86.9 % | 0.69 |
 | sequence_1_20 | 49.00 | **65.37** | 60.5 % | 0.76 |
 | sequence_2_11 | **85.46** | 83.12 | 100.0 % | 0.67 |
+| sequence_2_12 | **20.82** | 19.87 | 1.6 % | 1.34¹ |
 | sequence_3_17 | **71.43** | 70.33 | 80.3 % | 0.73 |
 | sequence_3_18 | 36.13 | **57.87** | 51.2 % | 0.76 |
 | sequence_4_10 | 67.81 | **69.79** | 72.4 % | 0.40 |
 | sequence_4_11 | 56.49 | **61.03** | 55.0 % | 0.42 |
 | sequence_5_11 | **60.32** | 55.95 | – | 0.65 |
 | sequence_5_12 | **7.73** | 5.17 | – | 0.58 |
+| **Mean** | 54.34 | **56.42** | | |
+
+¹ Alongside four other jobs; the others two at a time.
 
 The one-way routes gain the most. Against the pseudo-GT after the
 evaluator's Sim(3) fit, per 120 s window:
@@ -1203,11 +1216,46 @@ whole recording (see [The solution keeps its starting point's
 drift](#the-solution-keeps-its-starting-points-drift)); on sequence_3_18 it
 starts 6.3° off like the VIO. Online, the VIO's drift comes in 30 s at a
 time, and each window starts from a first keyframe at the earlier windows'
-estimate and from their gyro bias, so only a little of it stays. Where
-revisits tie the whole recording together (sequence_1_19, sequence_2_11),
-the batch solve is better: a window sees the revisits within its 240 s only.
-Low light gains too, as with fewer iterations (see
-[Iterations](#iterations)). The moving platform does not.
+estimate and from their gyro bias, so only a little of it stays. On
+sequence_2_12 the heading error builds up in the first minutes, while the
+windows are still short: −6.0° in the first 120 s window against the
+median (batch −5.6°, VIO −4.1°). Where revisits tie the whole recording
+together (sequence_1_19, sequence_2_11), the batch solve is better: a
+window sees the revisits within its 240 s only. Low light gains too, as
+with fewer iterations (see [Iterations](#iterations)). The moving platform
+does not.
+
+### Real time
+
+A window finished within the 30 s of data the next one waits for (12–23 s
+on average per sequence, at most 28.0 s), except 6 of the 34 of
+sequence_1_20 (up to 34.8 s; the next ones caught up) and those of
+sequence_2_12, which ran alongside four other jobs. What each stage takes
+at the recording's pace, in CPU seconds per second of recording (4 cores;
+the VIO from its CPU time while it waited for the frames as they arrived):
+
+| Stage | Cores |
+|---|---:|
+| VIO, Basalt `euroc_config` | 1.47 |
+| SIFT on the 2 Hz stereo keyframes | 0.85 |
+| The same in low light, with non-local means (h = 7, search window 21) | 1.83 |
+| The same, h = 11, search window 11 (`--denoise-window 11`) | 1.09 |
+| `match` | 0.22 |
+| `loops` (candidate stride 2; stride 4) | 1.08; 0.26 |
+| `online` (two threads) | 1.1 |
+| **Sum, by day, `loops --step 4`** | **3.9** |
+
+The VIO of every result above, `euroc_config_big_window_multicam`, runs at
+0.42 times real time on these 4 cores; `euroc_config` at 1.95 times. From
+it, sequence_2_11 scores 72.50 online (the VIO alone 29.67), against 83.12
+from the big-window VIO; with `loops --step 4` 72.48, without the revisits
+66.99. Matching and revisits use only the VIO poses of the two keyframes,
+and of the 1,579 verified revisits of sequence_2_11 all but one are within
+480 keyframes, so both can run on each new keyframe as it arrives. The
+search window 11 is as accurate on two 200 s windows of sequence_4_10
+(Sim(3) RMSE 0.352 m and 0.516 m, against 0.389 m and 0.486 m with h = 7
+and window 21; window 7: 0.835 m), but the low-light VIO configuration has
+not been run at real-time pace.
 
 ## Usage
 
@@ -1270,7 +1318,8 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
 - **Low light.** `features --clahe` equalizes the contrast before SIFT. On
   sequence_4_10 frames it raises the detections from 130–300 to 1,100–1,500
   per image. `--denoise 7` runs non-local means first (see [Low
-  light](#low-light-features-after-denoising)).
+  light](#low-light-features-after-denoising)); `--denoise 11
+  --denoise-window 11` takes 40 % less time (see [Real time](#real-time)).
 - **Focal lengths.** `solve --est-focal` estimates each camera's focal
   length per time segment (`--focal-seg-sigma`, `--focal-sigma`,
   `--focal-mean-sigma`); leave it off on a moving platform. `loop-correct`

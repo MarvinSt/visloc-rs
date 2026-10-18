@@ -278,7 +278,19 @@ before/after on training sequences.
    removed (from the pseudo-GT, diagnosis only) scores 55 instead of 21 on
    sequence_2_12, but no pGT-free change tried reaches it. sequence_5_12
    starts with a tram ride that the VIO and the BA halve (7.73)
-   ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)).
+   ([`lamaria_batch_ba.md`](lamaria_batch_ba.md)). An online mode
+   (`online`, 2026-10-18) solves the latest 240 s every 30 s, each window
+   warm-started from the one before and seeing no later data: it raises the
+   mean over the ten training sequences from 54.34 to **56.42**
+   (sequence_1_20 49.00 → 65.37, sequence_3_18 36.13 → 57.87, both low-light
+   ones +2.0 and +4.5), with the heading error of the one-way routes a half
+   to a third of the batch's; the revisit-rich sequence_1_19 drops from
+   88.16 to 75.73, sequence_2_12 and the moving platform stay. Its windows
+   keep up with the data on 4 cores, and with Basalt's default
+   configuration the whole chain (VIO, SIFT, matching, revisits at stride
+   4, windows) takes about 3.9 cores: sequence_2_11 scores 72.48 that way,
+   against 83.12 from the big-window VIO, which runs at 0.42 times real time
+   ([Online mode](lamaria_batch_ba.md#online-mode)).
 
 ## 5. Test-set operational pipeline
 

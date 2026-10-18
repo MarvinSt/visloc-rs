@@ -115,13 +115,13 @@ def keyframe_poses(kf_ns, vio):
 
 # ----------------------------------------------------------------------------- features
 
-def _sift_image(path, clahe, denoise=0.0):
+def _sift_image(path, clahe, denoise=0.0, denoise_window=21):
     import cv2
     im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if im is None:
         sys.exit(f"cannot read {path}")
     if denoise > 0:  # low light: non-local means first, so that the equalization does not amplify the noise
-        im = cv2.fastNlMeansDenoising(im, None, denoise, 7, 21)
+        im = cv2.fastNlMeansDenoising(im, None, denoise, 7, denoise_window)
     if clahe:  # low light: local contrast equalization before detection
         im = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(im)
     return im
@@ -129,10 +129,10 @@ def _sift_image(path, clahe, denoise=0.0):
 
 def _sift_worker(task):
     import cv2
-    path, nfeat, clahe, denoise = task
+    path, nfeat, clahe, denoise, denoise_window = task
     cv2.setNumThreads(1)
     sift = cv2.SIFT_create(nfeatures=nfeat, contrastThreshold=0.01)
-    kp, des = sift.detectAndCompute(_sift_image(path, clahe, denoise), None)
+    kp, des = sift.detectAndCompute(_sift_image(path, clahe, denoise, denoise_window), None)
     xy = np.array([k.pt for k in kp], dtype=np.float32).reshape(-1, 2)
     size = np.array([k.size for k in kp], dtype=np.float32)
     des = np.zeros((0, 128), np.uint8) if des is None else np.clip(des, 0, 255).astype(np.uint8)
@@ -150,8 +150,8 @@ def cmd_features(a):
     usable = [t for t in sorted(set(frames[0]) & set(frames[1])) if t in vio_set]
     kf_ns = np.array(usable[::a.kf_step], dtype=np.int64)
     print(f"{len(usable)} stereo frames with a VIO pose, {len(kf_ns)} keyframes", flush=True)
-    tasks = [(os.path.join(a.mav0, f"cam{c}", "data", frames[c][int(t)]), a.num_features, a.clahe, a.denoise)
-             for t in kf_ns for c in range(2)]
+    tasks = [(os.path.join(a.mav0, f"cam{c}", "data", frames[c][int(t)]), a.num_features, a.clahe, a.denoise,
+              a.denoise_window) for t in kf_ns for c in range(2)]
     t0 = time.time()
     with mp.Pool(a.jobs) as pool:
         res = pool.map(_sift_worker, tasks, chunksize=8)
@@ -1795,6 +1795,8 @@ def main():
     f.add_argument("--clahe", action="store_true", help="contrast-limited histogram equalization (low light)")
     f.add_argument("--denoise", type=float, default=0.0,
                    help="non-local means denoising strength h before detection (low light, e.g. 7; 0: off)")
+    f.add_argument("--denoise-window", type=int, default=21,
+                   help="its search window (px); 11 takes about 40 %% less time than 21")
     m = sub.add_parser("match", help="VIO-guided epipolar matching between keyframes")
     m.add_argument("--work", required=True)
     m.add_argument("--vio", required=True)

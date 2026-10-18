@@ -31,7 +31,7 @@ pub struct MeshOptions {
     /// A pixel's depth goes to the level whose voxel is nearest (in
     /// ratio) to this many times its footprint.
     pub voxel_pixels: f64,
-    /// TSDF levels, each [`LEVEL_RATIO`] times coarser.
+    /// TSDF levels, each 4 times coarser than the one before.
     pub levels: usize,
     /// Truncation distance, in voxels.
     pub trunc_voxels: f32,

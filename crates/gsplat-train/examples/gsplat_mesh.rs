@@ -13,16 +13,17 @@
 //! space, and voxels seen from fewer than `--min-weight` views are dropped.
 //! Triangles farther than `--support-voxels` from every SfM point of the
 //! dataset are dropped too (sky and other invented surfaces; 0 keeps them).
-//! Defaults are relative to the camera rig:
-//! `scale` = median distance of the camera centres from their centroid,
-//! voxel = scale / 256, max depth = 2 * scale.
+//! Defaults are relative to the scene: `scale` = the median distance of the
+//! camera centres from their centroid, or half the 90th percentile depth of
+//! the SfM points the views see if larger (cameras close together looking
+//! out); voxel = scale / 256, max depth = 2 * scale.
 
 use std::path::PathBuf;
 
 use visloc_gsplat_core::ply::load_ply;
 use visloc_gsplat_render::GpuContext;
 use visloc_gsplat_train::dataset::load_colmap_dataset;
-use visloc_gsplat_train::mesh::{extract_from_splat, rig_scale, MeshOptions};
+use visloc_gsplat_train::mesh::{extract_from_splat, rig_scale, scene_scale, MeshOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -82,11 +83,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_component,
     };
     println!(
-        "{} gaussians, {} views, {} SfM points; rig scale {:.3}",
+        "{} gaussians, {} views, {} SfM points; rig scale {:.3}, scene scale {:.3}",
         scene.len(),
         views.len(),
         support.len(),
-        rig_scale(&views)
+        rig_scale(&views),
+        scene_scale(&views, &support)
     );
     let (mesh, summary, _) =
         extract_from_splat(GpuContext::new()?, &scene, &views, &support, &opts)?;

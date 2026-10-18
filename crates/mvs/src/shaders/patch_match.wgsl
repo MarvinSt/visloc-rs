@@ -803,6 +803,8 @@ fn find_anchors(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k = 0u; k < min(m, MAX_ANCHORS); k++) {
         anchors[i * MAX_ANCHORS + k] = pixels[order[k]];
     }
+    // For the diagnostics: a weak pixel with anchors.
+    classes[i] = 3u;
 }
 
 // The anchor windows of pixel (x, y): a 3x3 grid 5 pixels apart around each

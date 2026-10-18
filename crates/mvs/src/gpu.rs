@@ -664,6 +664,8 @@ impl GpuPatchMatch {
                 queue.submit(Some(encoder.finish()));
             };
         let (gw, gh) = ((w as u32).div_ceil(16), (h as u32).div_ceil(8));
+        let debug = std::env::var_os("VISLOC_MVS_DEBUG").is_some();
+        let mut anchored: Option<Vec<bool>> = None;
         run(&self.init, &init_group, (gw, gh));
         if let Some(d) = deformable {
             // Sort the pixels, find each one's nearest strong pixel on the
@@ -713,6 +715,24 @@ impl GpuPatchMatch {
                 ],
             });
             run(&self.find_anchors, &anchors_group, (gw, gh));
+            if debug {
+                let mut codes = vec![0u32; w * h];
+                read_into(device, queue, &classes_buf, &mut codes);
+                let share = |c: u32| {
+                    100.0 * codes.iter().filter(|&&x| x == c).count() as f64 / (w * h) as f64
+                };
+                eprintln!(
+                    "DEBUG view {view} {w}x{h} geometric {} prior {} restore {}: weak {:.1}% (anchored {:.1}%) strong {:.1}% unknown {:.1}%",
+                    prior.is_some(),
+                    planar.is_some(),
+                    base.restore,
+                    share(0) + share(3),
+                    share(3),
+                    share(1),
+                    share(2)
+                );
+                anchored = Some(codes.iter().map(|&c| c == 3).collect());
+            }
         }
         let half = (w as u32).div_ceil(2).div_ceil(16);
         for group in &propagate_groups {
@@ -723,6 +743,35 @@ impl GpuPatchMatch {
         read_into(device, queue, &planes_buf, &mut planes);
         let mut costs = vec![0.0f32; w * h];
         read_into(device, queue, &costs_buf, &mut costs);
+        if let (Some(anchored), Some(start)) = (&anchored, start) {
+            // Pixels whose depth moved by more than 1% from the start, with
+            // and without anchors.
+            let (fx, fy) = (reference.fx as f32, reference.fy as f32);
+            let (cx, cy) = (reference.cx as f32, reference.cy as f32);
+            let (mut moved, mut total) = ([0usize; 2], [0usize; 2]);
+            for (i, p) in planes.iter().enumerate() {
+                let d0 = start.depth[i];
+                if d0 <= 0.0 {
+                    continue;
+                }
+                let (x, y) = ((i % w) as f32 + 0.5, (i / w) as f32 + 0.5);
+                let denom = p[0] * (x - cx) / fx + p[1] * (y - cy) / fy + p[2];
+                let d = if denom < -1e-6 { p[3] / denom } else { 0.0 };
+                let k = usize::from(anchored[i]);
+                total[k] += 1;
+                if d <= 0.0 || d.is_nan() || ((d - d0) / d0).abs() > 0.01 {
+                    moved[k] += 1;
+                }
+            }
+            let pct = |k: usize| 100.0 * moved[k] as f64 / total[k].max(1) as f64;
+            eprintln!(
+                "DEBUG view {view}: moved >1%: anchored {:.1}% of {}, others {:.1}% of {}",
+                pct(1),
+                total[1],
+                pct(0),
+                total[0]
+            );
+        }
         (planes, costs)
     }
 }

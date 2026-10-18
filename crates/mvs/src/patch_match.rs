@@ -1409,10 +1409,16 @@ impl<'a> Context<'a> {
         }
         if let Some(plain) = &plain {
             // A weak pixel keeps the plain cost, which its neighbours'
-            // sampling compares; the detail restorer, whose baseline the
-            // plain cost cannot beat in weak texture, does not hold it.
-            let cost = self.weighted_cost(plain, (x, y), ray, &best_plane, &weights, weight_sum);
-            return (best_plane, cost, views);
+            // sampling compares. Under the detail restorer, whose baseline
+            // the plain cost cannot beat in weak texture, it takes a new
+            // plane only if its deformable cost beats its start plane's by
+            // the margin (APD's first pass at a finer scale).
+            let plane = match &self.restore {
+                Some((_, margin)) if best_cost >= current_cost - margin => current,
+                _ => best_plane,
+            };
+            let cost = self.weighted_cost(plain, (x, y), ray, &plane, &weights, weight_sum);
+            return (plane, cost, views);
         }
         if let Some((baseline, margin)) = &self.restore {
             if best_cost >= baseline[i] - margin {

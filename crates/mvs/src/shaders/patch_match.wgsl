@@ -1281,7 +1281,11 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (weak) {
         // A weak pixel keeps the plain cost, which its neighbours' sampling
-        // compares; the detail restorer does not hold it.
+        // compares. Under the detail restorer it takes a new plane only if
+        // its deformable cost beats its start plane's by the margin.
+        if (params.restore != 0u && best_cost >= current_cost - params.restore_margin) {
+            best_plane = current;
+        }
         anchor_count = 0u;
         var sum = 0.0;
         for (var j = 0u; j < n; j++) {

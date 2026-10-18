@@ -1153,6 +1153,62 @@ VIO (30 iterations):
 
 The track mean moves by 0.4: within the spread of the flat directions.
 
+### Online mode
+
+`online` runs the solve as the data comes in. Every 60 keyframes (30 s) it
+solves the latest 480 (240 s) from the trajectory so far, with 10
+iterations, two rotation segments and the revisits inside the window, and
+carries the window's last correction to the frames after it. A match or a
+revisit between keyframes i < j uses the VIO poses of i and j only, so the
+batch matches and revisits are what a system running alongside the VIO
+would have found by the time of j, and no window sees data after its last
+keyframe. The window's first keyframe stays at its earlier estimate (the
+solve's gauge prior).
+
+Each window starts from the biases, velocities, camera rotations and focal
+lengths of the one before. From zero the gyro bias needs about 30
+iterations to settle in a 480-keyframe window (sequence_1_19), and with 10
+the windows let it wander and the heading drift: started fresh, the online
+sequence_1_19 scored 54.67 and its heading ran −1.9° … +2.9°; warm-started,
+it stays within ±0.65°.
+
+From the batch pipeline's VIO, with its matches and revisits, `--loops`,
+the keypoint-size noise and `--est-focal` (not on the moving platform); two
+sequences at a time on 4 cores, two threads each:
+
+| Sequence | Batch pipeline | Online | Pose recall @ 1 m, online | Online run / recording |
+|---|---:|---:|---:|---:|
+| sequence_1_19 | **88.16** | 75.73 | 86.9 % | 0.69 |
+| sequence_1_20 | 49.00 | **65.37** | 60.5 % | 0.76 |
+| sequence_2_11 | **85.46** | 83.12 | 100.0 % | 0.67 |
+| sequence_3_17 | **71.43** | 70.33 | 80.3 % | 0.73 |
+| sequence_3_18 | 36.13 | **57.87** | 51.2 % | 0.76 |
+| sequence_4_10 | 67.81 | **69.79** | 72.4 % | 0.40 |
+| sequence_4_11 | 56.49 | **61.03** | 55.0 % | 0.42 |
+| sequence_5_11 | **60.32** | 55.95 | – | 0.65 |
+| sequence_5_12 | **7.73** | 5.17 | – | 0.58 |
+
+The one-way routes gain the most. Against the pseudo-GT after the
+evaluator's Sim(3) fit, per 120 s window:
+
+| Sequence | Heading error, range: batch | online | Sim(3) scale: batch | online | Mean 2D error: batch | online |
+|---|---:|---:|---:|---:|---:|---:|
+| sequence_1_19 | 1.26° | 1.00° | 0.9973 | 0.9999 | 0.34 m | 0.55 m |
+| sequence_1_20 | 4.14° | 1.83° | 1.0056 | 1.0036 | 1.67 m | 0.90 m |
+| sequence_2_11 | 0.57° | 0.26° | 1.0061 | 1.0030 | 0.36 m | 0.39 m |
+| sequence_3_18 | 8.09° | 2.40° | 1.0210 | 1.0048 | 4.09 m | 1.48 m |
+
+The batch solve keeps the heading drift of its starting trajectory over the
+whole recording (see [The solution keeps its starting point's
+drift](#the-solution-keeps-its-starting-points-drift)); on sequence_3_18 it
+starts 6.3° off like the VIO. Online, the VIO's drift comes in 30 s at a
+time, and each window starts from a first keyframe at the earlier windows'
+estimate and from their gyro bias, so only a little of it stays. Where
+revisits tie the whole recording together (sequence_1_19, sequence_2_11),
+the batch solve is better: a window sees the revisits within its 240 s only.
+Low light gains too, as with fewer iterations (see
+[Iterations](#iterations)). The moving platform does not.
+
 ## Usage
 
 ```bash
@@ -1201,6 +1257,13 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   `--gyro-rw-scale` and `--accel-rw-scale` multiply the calibration's noise
   densities and bias random walks. `--kf-range START:END` solves a window of
   keyframes only.
+- **Online.** `online` takes the solve's options plus `--window` (480
+  keyframes) and `--step` (60): every 60 keyframes it solves the latest 480
+  (10 iterations and two rotation segments per window by default), each
+  window starting from the biases, velocities, camera rotations and focal
+  lengths of the one before, and writes the stitched trajectory to `--out`
+  (see [Online mode](#online-mode)). `BASALT_EUROC_WAIT_S=120` lets the VIO
+  demo wait for frames that a streaming reader has not written yet.
 - **Heading drift.** `--modes yaw` lets the solve correct a slow heading
   drift of its starting trajectory (see [Slow heading drift](#slow-heading-drift));
   `--modes yawN` splits it into N time pieces.

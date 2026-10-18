@@ -34,6 +34,9 @@ matches into PnP relative poses and closes them in a pose graph over a solved
 trajectory; a second solve started from the corrected trajectory then adds the
 revisit matches themselves.
 
+Online: online runs the solve causally, on windows of the most recent
+keyframes as the data arrives, each one starting from the one before.
+
 usage:
   lamaria_batch_ba.py features --mav0 DIR --vio TUM --work DIR [--kf-step 10]
   lamaria_batch_ba.py match --work DIR --vio TUM --calib JSON
@@ -43,6 +46,8 @@ with the revisits:
   lamaria_batch_ba.py solve ... --vio TUM --out BA1.tum --save-states
   lamaria_batch_ba.py loop-correct --work DIR --calib JSON --states BA1_states.npz --tum BA1.tum --out LC.tum
   lamaria_batch_ba.py solve ... --vio LC.tum --out TUM --loops
+online:
+  lamaria_batch_ba.py online ... --vio TUM --out TUM [--loops] [--window 480] [--step 60]
 """
 import argparse
 import json
@@ -957,12 +962,14 @@ class Reprojection:
 
 
 def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_rw_scale=1.0, gyro_rw_scale=1.0,
-               prior_rot_sigma=1e-4, omega_coriolis=None):
+               prior_rot_sigma=1e-4, omega_coriolis=None, init=None):
     """GTSAM values and factors for poses, velocities, biases, the IMU and the gauge priors.
 
     The first keyframe's position is pinned (1e-4 m); its rotation gets prior_rot_sigma (rad). Gravity
     makes roll and pitch observable, so a loose rotation prior lets the solve fix a tilt the VIO got
-    wrong at its start instead of pinning it there.
+    wrong at its start instead of pinning it there. Velocities start from the trajectory's finite
+    differences and biases from zero, or from init (kf_ns, vel, bias of an earlier solve) where it has the
+    keyframe; keyframes after its last one start from its last bias.
     """
     import gtsam
     from gtsam.symbol_shorthand import B, V, X
@@ -986,9 +993,15 @@ def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_r
         i = np.searchsorted(vio_ns, kf_ns[k])
         i0, i1 = max(i - 1, 0), min(i + 1, len(vio_ns) - 1)
         vel = (vio_p[i1] - vio_p[i0]) / ((vio_ns[i1] - vio_ns[i0]) * 1e-9)
+        bias0 = zero_bias
+        if init is not None and kf_ns[k] >= init["kf_ns"][0]:
+            j = min(np.searchsorted(init["kf_ns"], kf_ns[k]), len(init["kf_ns"]) - 1)
+            if init["kf_ns"][j] == kf_ns[k]:
+                vel = init["vel"][j]
+            bias0 = gtsam.imuBias.ConstantBias(init["bias"][j, 0:3], init["bias"][j, 3:6])
         values.insert(X(k), gtsam.Pose3(gtsam.Rot3(kf_r[k]), kf_p[k]))
         values.insert(V(k), vel)
-        values.insert(B(k), zero_bias)
+        values.insert(B(k), bias0)
         if k == 0:
             graph.add(gtsam.PriorFactorPose3(X(0), values.atPose3(X(0)), gtsam.noiseModel.Diagonal.Sigmas(
                 np.r_[np.full(3, prior_rot_sigma), np.full(3, 1e-4)])))
@@ -1177,7 +1190,8 @@ def cmd_solve(a):
                       obs_sigma, a.huber, a.band, est_focal=a.est_focal)
     omega = [float(v) for v in a.omega_coriolis.split(",")] if a.omega_coriolis else None
     graph, values, index, imu_factors = _imu_graph(kf_ns, kf_p, kf_r, vio, a.imu, noise, a.imu_noise_scale,
-                                                   a.accel_rw_scale, a.gyro_rw_scale, a.prior_rot_sigma, omega)
+                                                   a.accel_rw_scale, a.gyro_rw_scale, a.prior_rot_sigma, omega,
+                                                   getattr(a, "init_states", None))
     n = len(kf_ns)
     nb, ne, npar = n * DOF, rp.n_par * rp.n_ext, rp.n_par
     modes = expand_modes(a.modes)
@@ -1191,6 +1205,14 @@ def cmd_solve(a):
     print(f"  reduced system: {nb} banded dims (bandwidth {u}) + {ne} border dims, {time.time() - t0:.0f} s",
           flush=True)
     r_ic = np.array([c["R_ic"] for c in cams])
+    init = getattr(a, "init_states", None)
+    if init is not None:  # the estimated cameras start where the solve before ended (its last time segment)
+        for c_ in phys_est:
+            last = c_ * init["n_seg"] + init["n_seg"] - 1
+            r_ic[c_ * n_seg:(c_ + 1) * n_seg] = init["r_ic"][last]
+            if a.est_focal:
+                rp.foc[c_ * n_seg:(c_ + 1) * n_seg] = init["foc"][last]
+        rp.set_focal(rp.foc)
     t_ic = np.array([c["t_ic"] for c in cams])
     # consecutive time segments of a camera rotate alike, within --ext-seg-sigma
     seg_pairs = [(c * n_seg + s, c * n_seg + s + 1) for c in phys_est for s in range(n_seg - 1)]
@@ -1438,14 +1460,47 @@ def cmd_solve(a):
     with open(os.path.splitext(a.out)[0] + "_summary.json", "w") as f:
         json.dump(summary, f, indent=1)
     write_corrected(a.out, vio, kf_ns, kf_p, kf_r, t_wi, r_wi)
+    bias = np.array([np.r_[values.atConstantBias(B(k)).accelerometer(), values.atConstantBias(B(k)).gyroscope()]
+                     for k in range(n)])
+    vel = np.array([values.atVector(V(k)) for k in range(n)])
     if a.save_states:  # what loop-correct needs: keyframe poses, landmarks and their observations
         # r_ic per physical camera and time segment (camera c, segment s at c * ext_segments + s)
-        bias = np.array([np.r_[values.atConstantBias(B(k)).accelerometer(), values.atConstantBias(B(k)).gyroscope()]
-                         for k in range(n)])
         np.savez(os.path.splitext(a.out)[0] + "_states.npz", k0=k0, kf_ns=kf_ns, r_wi=r_wi, t_wi=t_wi, r_ic=r_ic,
                  ext_segments=n_seg, pts=pts, obs_kf=rp.kf, obs_cam=rp.cam // n_seg, obs_lm=rp.lm, obs_z=rp.z,
-                 active=rp.active, vel=np.array([values.atVector(V(k)) for k in range(n)]), bias=bias, foc=rp.foc,
-                 sigma=rp.sigma, huber=a.huber)
+                 active=rp.active, vel=vel, bias=bias, foc=rp.foc, sigma=rp.sigma, huber=a.huber)
+    return {"kf_ns": kf_ns, "vel": vel, "bias": bias, "r_ic": r_ic, "foc": rp.foc.copy(), "n_seg": n_seg}
+
+
+def cmd_online(a):
+    """Causal mode: every --step keyframes, solve the last --window keyframes (solve --kf-range) from the
+    trajectory so far, and carry the correction to the frames after them.
+
+    A window uses only the data up to its last keyframe (a match or a revisit between keyframes i < j needs the
+    VIO poses of i and j only), so the result is what a system running alongside the VIO would have had. The
+    window's first keyframe stays at its earlier estimate (the solve's gauge prior), which ties the windows,
+    and its biases, velocities, camera rotations and focal lengths start from the window before: the biases
+    take a solve many iterations to settle from zero (on sequence_1_19 a 480-keyframe window needs about 30).
+    """
+    import contextlib
+    import copy
+    import shutil
+    n = len(np.load(os.path.join(a.work, "features.npz"))["kf_ns"])
+    shutil.copy(a.vio, a.out)
+    base = os.path.splitext(a.out)[0]
+    t0 = time.time()
+    states = None  # each window starts from the biases and velocities of the one before
+    with open(base + "_windows.log", "w") as log:
+        for k1 in list(range(min(a.step, n), n, a.step)) + [n]:
+            w = copy.copy(a)
+            w.init_states = states
+            w.kf_range, w.vio, w.save_states = f"{max(0, k1 - a.window)}:{k1}", a.out, False
+            w.out = base + "_window.tum"
+            ti = time.time()
+            with contextlib.redirect_stdout(log):
+                states = cmd_solve(w)
+            os.replace(w.out, a.out)
+            print(f"window {w.kf_range}: {time.time() - ti:.1f} s, {time.time() - t0:.0f} s in all", flush=True)
+    os.remove(base + "_window_summary.json")
 
 
 def _tri_banded(cfac, b, trans="N"):
@@ -1767,67 +1822,74 @@ def main():
     lp.add_argument("--min-inliers", type=int, default=25, help="essential-matrix inliers to accept a pair")
     lp.add_argument("--max-rot", type=float, default=10.0, help="largest disagreement with the VIO rotation (deg)")
     lp.add_argument("--jobs", type=int, default=2)
-    s = sub.add_parser("solve", help="batch VI bundle adjustment")
-    s.add_argument("--work", required=True)
-    s.add_argument("--imu", required=True, help="IMU csv (ns, gyro, accel) as the VIO used it")
-    s.add_argument("--calib", required=True)
-    s.add_argument("--vio", required=True)
-    s.add_argument("--out", required=True, help="corrected trajectory (TUM)")
-    s.add_argument("--est-extrinsic", default="01", help="cameras whose IMU-camera rotation is estimated")
-    s.add_argument("--ext-segments", type=int, default=8,
-                   help="estimate each such rotation in this many equal time segments of the keyframes "
-                        "(1: one rotation per camera)")
-    s.add_argument("--ext-seg-sigma", type=float, default=0.05,
-                   help="prior on the rotation change between consecutive segments (deg)")
-    s.add_argument("--max-offset", type=int, default=256, help="use matches up to this keyframe offset")
-    s.add_argument("--band", type=int, default=64, help="landmark observations within this many keyframes")
-    s.add_argument("--max-reproj", type=float, default=4.0, help="triangulation inlier threshold (px)")
-    s.add_argument("--min-angle", type=float, default=1.0, help="minimum triangulation angle (deg)")
-    s.add_argument("--pixel-sigma", type=float, default=1.0)
-    s.add_argument("--sigma-size", type=float, default=0.0,
-                   help="keypoint size (px) up to which an observation has --pixel-sigma; a larger keypoint's "
-                   "sigma grows as (size / this) ** --sigma-size-pow (0: off)")
-    s.add_argument("--sigma-size-pow", type=float, default=1.0)
-    s.add_argument("--est-focal", action="store_true",
-                   help="also estimate each estimated camera's focal length scale, per time segment")
-    s.add_argument("--focal-seg-sigma", type=float, default=0.0005,
-                   help="prior on the focal length change between consecutive segments (relative)")
-    s.add_argument("--focal-sigma", type=float, default=0.01, help="prior on each focal length scale (relative)")
-    s.add_argument("--focal-mean-sigma", type=float, default=0.0,
-                   help="prior on the mean of each camera's focal length scales over the segments (0: none); "
-                   "a tight one keeps the calibration's focal length on average and lets only its course change")
-    s.add_argument("--pcg-tol", type=float, default=1e-4,
-                   help="relative residual at which conjugate gradients stop (with revisit matches)")
-    s.add_argument("--pcg-iters", type=int, default=200, help="most conjugate-gradient iterations per step")
-    s.add_argument("--huber", type=float, default=2.0, help="Huber threshold in sigmas")
-    s.add_argument("--iterations", type=int, default=60)
-    s.add_argument("--rel-tol", type=float, default=1e-7, help="stop once an iteration lowers the cost less")
-    s.add_argument("--lambda0", type=float, default=1e-4)
-    s.add_argument("--outlier-px", type=float, default=10.0,
-                   help="each iteration drops observations whose error exceeds this (0: keep all)")
-    s.add_argument("--outlier-px2", type=float, default=3.0,
-                   help="tighter threshold (px) from --outlier-start2 on, once the solution has settled (0: off)")
-    s.add_argument("--outlier-start2", type=int, default=8)
-    s.add_argument("--omega-coriolis", default="", help="x,y,z: Earth's rotation (rad/s) in the VIO's world frame, "
-                   "e.g. w_e (0, cos lat, sin lat) turned into it; needs the world frame's north")
-    s.add_argument("--prior-rot-sigma", type=float, default=1e-4,
-                   help="prior on the first keyframe's rotation (rad); its position stays pinned")
-    s.add_argument("--lm-damp-floor", type=float, default=0.01,
-                   help="landmark damping floor, relative to the landmark's largest diagonal entry")
-    s.add_argument("--kf-range", default="", help="START:END keyframe window (default: all)")
-    s.add_argument("--imu-noise-scale", type=float, default=1.0,
-                   help="multiplies the calibration's accelerometer and gyroscope noise densities")
-    s.add_argument("--accel-rw-scale", type=float, default=1.0, help="multiplies the accel bias random walk")
-    s.add_argument("--gyro-rw-scale", type=float, default=1.0, help="multiplies the gyro bias random walk")
-    s.add_argument("--loops", action="store_true", help="add the revisit matches of the loops stage")
-    s.add_argument("--modes", default="", help="undamped deformation modes of the whole solution: yaw, scale "
-                   "(comma-separated); they let LM move along slow drifts the damped steps cannot follow. "
-                   "yawN splits the heading drift into N time pieces")
-    s.add_argument("--modes-start", type=int, default=3, help="first iteration that uses the modes")
-    s.add_argument("--mode-cap-yaw", type=float, default=0.01, help="largest yaw-mode step per iteration (rad)")
-    s.add_argument("--mode-cap-scale", type=float, default=0.01, help="largest scale-mode step per iteration")
-    s.add_argument("--save-states", action="store_true",
-                   help="also write <out>_states.npz (keyframes, landmarks, observations) for loop-correct")
+    def solve_args(s):  # shared by solve and online
+        s.add_argument("--work", required=True)
+        s.add_argument("--imu", required=True, help="IMU csv (ns, gyro, accel) as the VIO used it")
+        s.add_argument("--calib", required=True)
+        s.add_argument("--vio", required=True)
+        s.add_argument("--out", required=True, help="corrected trajectory (TUM)")
+        s.add_argument("--est-extrinsic", default="01", help="cameras whose IMU-camera rotation is estimated")
+        s.add_argument("--ext-segments", type=int, default=8,
+                       help="estimate each such rotation in this many equal time segments of the keyframes "
+                            "(1: one rotation per camera)")
+        s.add_argument("--ext-seg-sigma", type=float, default=0.05,
+                       help="prior on the rotation change between consecutive segments (deg)")
+        s.add_argument("--max-offset", type=int, default=256, help="use matches up to this keyframe offset")
+        s.add_argument("--band", type=int, default=64, help="landmark observations within this many keyframes")
+        s.add_argument("--max-reproj", type=float, default=4.0, help="triangulation inlier threshold (px)")
+        s.add_argument("--min-angle", type=float, default=1.0, help="minimum triangulation angle (deg)")
+        s.add_argument("--pixel-sigma", type=float, default=1.0)
+        s.add_argument("--sigma-size", type=float, default=0.0,
+                       help="keypoint size (px) up to which an observation has --pixel-sigma; a larger keypoint's "
+                       "sigma grows as (size / this) ** --sigma-size-pow (0: off)")
+        s.add_argument("--sigma-size-pow", type=float, default=1.0)
+        s.add_argument("--est-focal", action="store_true",
+                       help="also estimate each estimated camera's focal length scale, per time segment")
+        s.add_argument("--focal-seg-sigma", type=float, default=0.0005,
+                       help="prior on the focal length change between consecutive segments (relative)")
+        s.add_argument("--focal-sigma", type=float, default=0.01, help="prior on each focal length scale (relative)")
+        s.add_argument("--focal-mean-sigma", type=float, default=0.0,
+                       help="prior on the mean of each camera's focal length scales over the segments (0: none); "
+                       "a tight one keeps the calibration's focal length on average and lets only its course change")
+        s.add_argument("--pcg-tol", type=float, default=1e-4,
+                       help="relative residual at which conjugate gradients stop (with revisit matches)")
+        s.add_argument("--pcg-iters", type=int, default=200, help="most conjugate-gradient iterations per step")
+        s.add_argument("--huber", type=float, default=2.0, help="Huber threshold in sigmas")
+        s.add_argument("--iterations", type=int, default=60)
+        s.add_argument("--rel-tol", type=float, default=1e-7, help="stop once an iteration lowers the cost less")
+        s.add_argument("--lambda0", type=float, default=1e-4)
+        s.add_argument("--outlier-px", type=float, default=10.0,
+                       help="each iteration drops observations whose error exceeds this (0: keep all)")
+        s.add_argument("--outlier-px2", type=float, default=3.0,
+                       help="tighter threshold (px) from --outlier-start2 on, once the solution has settled (0: off)")
+        s.add_argument("--outlier-start2", type=int, default=8)
+        s.add_argument("--omega-coriolis", default="", help="x,y,z: Earth's rotation (rad/s) in the VIO's world frame, "
+                       "e.g. w_e (0, cos lat, sin lat) turned into it; needs the world frame's north")
+        s.add_argument("--prior-rot-sigma", type=float, default=1e-4,
+                       help="prior on the first keyframe's rotation (rad); its position stays pinned")
+        s.add_argument("--lm-damp-floor", type=float, default=0.01,
+                       help="landmark damping floor, relative to the landmark's largest diagonal entry")
+        s.add_argument("--kf-range", default="", help="START:END keyframe window (default: all)")
+        s.add_argument("--imu-noise-scale", type=float, default=1.0,
+                       help="multiplies the calibration's accelerometer and gyroscope noise densities")
+        s.add_argument("--accel-rw-scale", type=float, default=1.0, help="multiplies the accel bias random walk")
+        s.add_argument("--gyro-rw-scale", type=float, default=1.0, help="multiplies the gyro bias random walk")
+        s.add_argument("--loops", action="store_true", help="add the revisit matches of the loops stage")
+        s.add_argument("--modes", default="", help="undamped deformation modes of the whole solution: yaw, scale "
+                       "(comma-separated); they let LM move along slow drifts the damped steps cannot follow. "
+                       "yawN splits the heading drift into N time pieces")
+        s.add_argument("--modes-start", type=int, default=3, help="first iteration that uses the modes")
+        s.add_argument("--mode-cap-yaw", type=float, default=0.01, help="largest yaw-mode step per iteration (rad)")
+        s.add_argument("--mode-cap-scale", type=float, default=0.01, help="largest scale-mode step per iteration")
+        s.add_argument("--save-states", action="store_true",
+                       help="also write <out>_states.npz (keyframes, landmarks, observations) for loop-correct")
+
+    solve_args(sub.add_parser("solve", help="batch VI bundle adjustment"))
+    o = sub.add_parser("online", help="causal mode: solve windows of the most recent keyframes as the data arrives")
+    solve_args(o)
+    o.add_argument("--window", type=int, default=480, help="keyframes per window (the most recent ones)")
+    o.add_argument("--step", type=int, default=60, help="keyframes between two windows")
+    o.set_defaults(iterations=10, ext_segments=2)  # per window
     c = sub.add_parser("loop-correct", help="close the revisits of a solve with a pose graph (after solve "
                        "--save-states and loops)")
     c.add_argument("--work", required=True)
@@ -1844,7 +1906,7 @@ def main():
     c.add_argument("--loop-rot-sigma", type=float, default=0.005, help="rad")
     c.add_argument("--loop-pos-sigma", type=float, default=0.1, help="m")
     a = p.parse_args()
-    {"features": cmd_features, "match": cmd_match, "loops": cmd_loops, "solve": cmd_solve,
+    {"features": cmd_features, "match": cmd_match, "loops": cmd_loops, "solve": cmd_solve, "online": cmd_online,
      "loop-correct": cmd_loop_correct}[a.cmd](a)
 
 

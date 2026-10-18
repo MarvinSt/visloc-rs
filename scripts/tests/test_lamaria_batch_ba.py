@@ -1,4 +1,5 @@
-"""Unit tests for scripts/lamaria_batch_ba.py (numpy parts, and the loop edge's PnP if opencv is there)."""
+"""Unit tests for scripts/lamaria_batch_ba.py (numpy parts, the loop edge's PnP if opencv is there and the IMU
+graph's warm start if gtsam is)."""
 import importlib.util
 import pathlib
 import unittest
@@ -10,6 +11,12 @@ try:
     HAVE_CV2 = True
 except ImportError:
     HAVE_CV2 = False
+
+try:
+    import gtsam  # noqa: F401
+    HAVE_GTSAM = True
+except ImportError:
+    HAVE_GTSAM = False
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "lamaria_batch_ba.py"
 spec = importlib.util.spec_from_file_location("lamaria_batch_ba", SCRIPT)
@@ -481,6 +488,32 @@ class LoopEdgeTest(unittest.TestCase):
         self.assertIsNotNone(got)
         self.assertLess(np.degrees(np.arccos(np.clip((np.trace(got[0].T @ r_wb) - 1) / 2, -1, 1))), 0.1)
         np.testing.assert_allclose(got[1], t_wb, atol=0.02)
+
+
+@unittest.skipUnless(HAVE_GTSAM, "gtsam not installed")
+class WarmStartTest(unittest.TestCase):
+    def test_states_of_an_earlier_solve_seed_the_window(self):
+        import tempfile
+
+        from gtsam.symbol_shorthand import B, V
+        kf_ns = np.arange(5, dtype=np.int64) * 500_000_000
+        kf_p = np.c_[np.arange(5) * 0.5, np.zeros((5, 2))]  # 1 m/s along x
+        kf_r = np.tile(np.eye(3), (5, 1, 1))
+        vio = (kf_ns, kf_p, kf_r)
+        imu_ns = np.arange(0, kf_ns[-1] + 1, 5_000_000)
+        noise = {"accel_noise_std": 0.01, "gyro_noise_std": 1e-3, "accel_bias_std": 1e-4, "gyro_bias_std": 1e-6}
+        # an earlier solve that ended at the third keyframe
+        init = {"kf_ns": kf_ns[:3], "vel": np.array([[1.1, 0, 0], [1.2, 0, 0], [1.3, 0, 0]]),
+                "bias": np.array([[0.01 * k, 0, 0, 1e-4 * k, 0, 0] for k in range(1, 4)])}
+        with tempfile.NamedTemporaryFile("w", suffix=".csv") as f:
+            np.savetxt(f, np.c_[imu_ns, np.zeros((len(imu_ns), 3)), np.tile([0, 0, 9.81], (len(imu_ns), 1))],
+                       delimiter=",", fmt="%.9g")
+            f.flush()
+            _, values, _, _ = lb._imu_graph(kf_ns, kf_p, kf_r, vio, f.name, noise, init=init)
+        np.testing.assert_allclose(values.atVector(V(1)), [1.2, 0, 0])
+        np.testing.assert_allclose(values.atVector(V(4)), [1.0, 0, 0])  # not in init: the trajectory's
+        np.testing.assert_allclose(values.atConstantBias(B(2)).gyroscope(), [3e-4, 0, 0])
+        np.testing.assert_allclose(values.atConstantBias(B(4)).accelerometer(), [0.03, 0, 0])  # init's last
 
 
 if __name__ == "__main__":

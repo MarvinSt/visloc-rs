@@ -8,8 +8,8 @@ use bytemuck::{Pod, Zeroable};
 use visloc_gsplat_render::{GpuContext, GpuError};
 
 use crate::patch_match::{
-    finish_depth_map, DepthMap, DetailRestorer, PatchMatchOptions, ViewSelection, MAX_COST,
-    MAX_SOURCES,
+    finish_depth_map, DepthMap, DetailRestorer, PatchMatchOptions, Sampling, ViewSelection,
+    MAX_COST, MAX_SOURCES,
 };
 use crate::planar_prior::{PlanarPrior, PlanarPriorOptions};
 use crate::workspace::{luma, Workspace};
@@ -222,6 +222,11 @@ impl GpuPatchMatch {
         planar: Option<(&PlanarPriorOptions, &PlanarPrior)>,
         restorer: DetailRestorer,
     ) -> (Vec<[f32; 4]>, Vec<f32>) {
+        assert_eq!(
+            options.sampling,
+            Sampling::Acmh,
+            "NESP sampling runs on the CPU only"
+        );
         let device = &self.ctx.device;
         let queue = &self.ctx.queue;
         let reference = &ws.views[view];

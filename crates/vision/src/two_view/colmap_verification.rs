@@ -689,7 +689,7 @@ fn essential_pose_and_angle(
 /// (`geometry/essential_matrix.cc:64-98`): decompose into the four (R, t)
 /// candidates and keep the one with the most positive-depth correspondences,
 /// returning those valid indices.
-fn pose_from_essential_matrix(
+pub(crate) fn pose_from_essential_matrix(
     essential: &Matrix3<f64>,
     rays1: &[Vector3<f64>],
     rays2: &[Vector3<f64>],

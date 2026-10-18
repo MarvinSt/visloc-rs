@@ -730,11 +730,13 @@ pub fn run(options: &PipelineOptions, db: &DatabaseCache) -> RunResult {
 mod tests {
     use super::*;
     use nalgebra::Point3;
+    use std::collections::BTreeMap;
     use visloc_core::geometry::SE3;
     use visloc_tracking::umeyama_similarity_transform;
 
     use crate::colmap_incremental::test_support::{
-        build_synthetic_rig_scene, build_three_view_scene,
+        build_synthetic_central_rig_scene, build_synthetic_rig_scene,
+        build_synthetic_spherical_scene, build_three_view_scene,
     };
 
     /// `complete_model` registers an image its model left out from 2D-2D
@@ -850,6 +852,98 @@ mod tests {
         assert!(
             max_err < 0.02,
             "max Umeyama-aligned frame-center error {max_err} too large"
+        );
+    }
+
+    /// A central rig (both cameras at one centre, e.g. two cube faces of a
+    /// panorama) initializes from its ordinary two-view geometry, where
+    /// GR6P is degenerate, and registers every frame with the cameras'
+    /// relative rotation kept exact.
+    #[test]
+    fn pipeline_reconstructs_a_central_rig() {
+        let scene = build_synthetic_central_rig_scene(12, 4);
+        let mut options = PipelineOptions::default();
+        // As in `pipeline_recovers_all_frames_and_metric_scale`.
+        options.mapper.init_min_num_inliers = 20;
+        options.mapper.init_min_tri_angle_deg = 1.0;
+
+        let result = run(&options, &scene.db);
+        assert!(!result.models.is_empty(), "expected a kept model");
+        let model = &result.models[0].reconstruction;
+        assert_eq!(model.num_reg_frames(), scene.images_per_frame.len());
+
+        // Up to scale (a central rig has none of its own): the frame
+        // centres after a similarity alignment, and the frames' rotations.
+        let mut source = Vec::new();
+        let mut target = Vec::new();
+        let mut worst_rotation = 0.0f64;
+        let first = |m: &BTreeMap<u64, SE3>| m.values().next().unwrap().rotation;
+        let got_poses: BTreeMap<u64, SE3> = scene
+            .ground_truth_rig_from_world
+            .keys()
+            .map(|&f| (f, model.frame(f).rig_from_world().clone()))
+            .collect();
+        for (&frame_id, gt) in &scene.ground_truth_rig_from_world {
+            let got = &got_poses[&frame_id];
+            source.push(Point3::from(got.inverse().translation));
+            target.push(Point3::from(gt.inverse().translation));
+            // Rotation relative to frame 0, free of the gauge.
+            let rel_got = got.rotation * first(&got_poses).inverse();
+            let rel_gt = gt.rotation * first(&scene.ground_truth_rig_from_world).inverse();
+            worst_rotation = worst_rotation.max(rel_got.angle_to(&rel_gt));
+        }
+        let transform = umeyama_similarity_transform(&source, &target, true)
+            .expect("Umeyama alignment must succeed on a full trajectory");
+        let max_err = source
+            .iter()
+            .zip(&target)
+            .map(|(s, t)| (transform.apply(s) - t).norm())
+            .fold(0.0, f64::max);
+        assert!(max_err < 0.02, "frame-centre error {max_err}");
+        assert!(worst_rotation < 1e-3, "rotation error {worst_rotation} rad");
+    }
+
+    /// An equirectangular camera among points all around it: every frame
+    /// registers, and the poses match the truth up to a similarity.
+    #[test]
+    fn pipeline_reconstructs_a_spherical_camera() {
+        let (db, truth) = build_synthetic_spherical_scene(10, 4);
+        let mut options = PipelineOptions::default();
+        // 120 points per image, as in the other synthetic scenes.
+        options.mapper.init_min_num_inliers = 40;
+        options.mapper.init_min_tri_angle_deg = 2.0;
+        options.mapper.abs_pose_min_num_inliers = 20;
+
+        let result = run(&options, &db);
+        assert!(!result.models.is_empty(), "expected a kept model");
+        let model = &result.models[0].reconstruction;
+        assert_eq!(model.num_reg_frames(), truth.len());
+        let (mut source, mut target) = (Vec::new(), Vec::new());
+        let mut worst_rotation = 0.0f64;
+        let first_got = model.frame(0).rig_from_world().rotation;
+        let first_gt = truth[&0].rotation;
+        for (&frame_id, gt) in &truth {
+            let got = model.frame(frame_id).rig_from_world();
+            source.push(Point3::from(got.inverse().translation));
+            target.push(Point3::from(gt.inverse().translation));
+            let rel_got = got.rotation * first_got.inverse();
+            let rel_gt = gt.rotation * first_gt.inverse();
+            worst_rotation = worst_rotation.max(rel_got.angle_to(&rel_gt));
+        }
+        let transform = umeyama_similarity_transform(&source, &target, true)
+            .expect("Umeyama alignment must succeed on a full trajectory");
+        let max_err = source
+            .iter()
+            .zip(&target)
+            .map(|(s, t)| (transform.apply(s) - t).norm())
+            .fold(0.0, f64::max);
+        assert!(max_err < 1e-3, "frame-centre error {max_err} m");
+        assert!(worst_rotation < 1e-4, "rotation error {worst_rotation} rad");
+        // Points behind the camera were triangulated and kept.
+        assert!(
+            model.num_points3d() > 100,
+            "{} points",
+            model.num_points3d()
         );
     }
 

@@ -419,6 +419,8 @@ struct ParsedRigManifest {
 /// frame_idx image_name sensor_index` frame-membership rows, exactly the
 /// contract `examples/generalized_rig_sfm.rs::parse_manifest` reads (see
 /// module doc for why that function itself can't be called from here).
+/// Not in that contract: a sensor row may end in a camera model name,
+/// `EQUIRECTANGULAR` for a 360° panorama of `width x height` px.
 fn parse_rig_manifest(path: &Path) -> Result<ParsedRigManifest, DatabaseCacheError> {
     let contents = fs::read_to_string(path).map_err(|source| DatabaseCacheError::Io {
         path: path.display().to_string(),
@@ -439,12 +441,21 @@ fn parse_rig_manifest(path: &Path) -> Result<ParsedRigManifest, DatabaseCacheErr
         };
         match tokens.first().copied() {
             Some("S") => {
-                if tokens.len() != 16 {
-                    return Err(err(format!(
-                        "sensor row requires 16 fields, found {}",
-                        tokens.len()
-                    )));
-                }
+                // An optional 17th field names the camera model: only
+                // `EQUIRECTANGULAR` (its intrinsics fields are ignored).
+                let spherical = match tokens.get(16).copied() {
+                    _ if tokens.len() > 17 || tokens.len() < 16 => {
+                        return Err(err(format!(
+                            "sensor row requires 16 or 17 fields, found {}",
+                            tokens.len()
+                        )));
+                    }
+                    None | Some("PINHOLE") => false,
+                    Some("EQUIRECTANGULAR") => true,
+                    Some(other) => {
+                        return Err(err(format!("unsupported sensor camera model {other:?}")));
+                    }
+                };
                 let index: usize = parse_field(&tokens, 1, &err)?;
                 let camera_id: CameraT = parse_field(&tokens, 2, &err)?;
                 let width: u32 = parse_field(&tokens, 3, &err)?;
@@ -467,7 +478,11 @@ fn parse_rig_manifest(path: &Path) -> Result<ParsedRigManifest, DatabaseCacheErr
                 sensors.push(ManifestSensor {
                     index,
                     camera_id,
-                    camera: Camera::pinhole(camera_id, width, height, fx, fy, cx, cy),
+                    camera: if spherical {
+                        Camera::equirectangular(camera_id, width, height)
+                    } else {
+                        Camera::pinhole(camera_id, width, height, fx, fy, cx, cy)
+                    },
                     sensor_from_rig: SE3::new(
                         UnitQuaternion::new_normalize(quaternion),
                         Vector3::new(tx, ty, tz),
@@ -754,6 +769,41 @@ mod tests {
         drop(file);
 
         (manifest_path, features_dir, pairs_path)
+    }
+
+    /// A sensor row may name its camera model: `EQUIRECTANGULAR` makes an
+    /// equirectangular camera of the row's size; others are rejected.
+    #[test]
+    fn manifest_sensor_rows_take_an_optional_camera_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "colmap_incremental_manifest_model_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("manifest.txt");
+        fs::write(
+            &path,
+            "S 0 1 2048 1024 0 0 0 0 1 0 0 0 0 0 0 EQUIRECTANGULAR\n\
+             S 1 2 640 480 500 500 320 240 1 0 0 0 0 0 0 PINHOLE\n\
+             F 0 a.png 0\n",
+        )
+        .unwrap();
+        let manifest = parse_rig_manifest(&path).unwrap();
+        assert_eq!(
+            manifest.sensors[0].camera,
+            Camera::equirectangular(1, 2048, 1024)
+        );
+        assert_eq!(
+            manifest.sensors[1].camera,
+            Camera::pinhole(2, 640, 480, 500.0, 500.0, 320.0, 240.0)
+        );
+        fs::write(
+            &path,
+            "S 0 1 640 480 500 500 320 240 1 0 0 0 0 0 0 OPENCV\n",
+        )
+        .unwrap();
+        assert!(parse_rig_manifest(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

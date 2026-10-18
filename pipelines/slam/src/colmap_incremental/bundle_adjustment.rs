@@ -826,7 +826,7 @@ fn solve_native(
         }
         let image_id = image_id as ImageT;
         let image = recon.image(image_id);
-        let Some(intrinsics) = recon.camera(image.camera_id).intrinsics() else {
+        let Some(intrinsics) = solver_intrinsics(recon.camera(image.camera_id)) else {
             return false;
         };
         let rig_id = recon.frame(image.frame_id).rig_id();
@@ -989,10 +989,22 @@ pub fn solve(
     }
     let accelerate = options.loss_function == LossFunction::Trivial
         && std::env::var_os("VISLOC_PORT_GPU_BA").is_some();
-    if options.backend == BaBackend::Native && !accelerate {
+    // The legacy and GPU paths project pinholes only.
+    if (options.backend == BaBackend::Native && !accelerate) || recon.has_spherical_camera() {
         return solve_native(options, config, recon);
     }
     solve_legacy(options, config, recon, accelerate)
+}
+
+/// The native solver's `(fx, fy, cx, cy)` for `camera`: its pinhole
+/// intrinsics, or an equirectangular panorama's marker tuple
+/// ([`super::rig_ba_solver::equirectangular_intrinsics`]).
+fn solver_intrinsics(camera: &visloc_core::types::Camera) -> Option<(f64, f64, f64, f64)> {
+    if camera.model == visloc_core::types::CameraModel::Equirectangular {
+        let (&w, &h) = (camera.params.first()?, camera.params.get(1)?);
+        return Some(super::rig_ba_solver::equirectangular_intrinsics(w, h));
+    }
+    camera.intrinsics()
 }
 
 /// [`solve`] through a [`BundleAdjustment`] problem: the `Legacy` backend and

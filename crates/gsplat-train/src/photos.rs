@@ -18,7 +18,11 @@
 //! Equirectangular (360°) panoramas break the pinhole model of every stage:
 //! they are reported in the log. With [`PhotoSfmConfig::equirect`] each one
 //! is cut into its six 90° cube faces ([`crate::equirect`]) first, and the
-//! faces go through the stages above as pinhole images of known intrinsics.
+//! faces go through the stages above as pinhole images of known intrinsics,
+//! the six of a panorama as one rig ([`PhotoSfmConfig::equirect_rig`]).
+//! [`PhotoSfmConfig::equirect_native`] instead runs the stages on the
+//! panoramas themselves as equirectangular cameras and poses the faces
+//! from them. Either way training sees the faces that see SfM points.
 
 use std::path::{Path, PathBuf};
 
@@ -105,9 +109,19 @@ pub struct PhotoSfmConfig {
     /// the exact focal length `size / 2` held fixed (no `focal_px`, no
     /// intrinsics refinement). Faces of one panorama are never matched with
     /// each other (they do not overlap), and `window` counts panoramas.
-    /// Each face is still its own camera: nothing ties the six to one
-    /// centre, and the log reports how far apart they land.
+    /// The log reports how far apart each panorama's face centres land.
     pub equirect: bool,
+    /// With `equirect`, solve each panorama's six faces as one rig: one
+    /// pose per panorama, the faces at its centre with their fixed
+    /// rotations. Off: every face is its own camera.
+    pub equirect_rig: bool,
+    /// With `equirect`, run SfM on the panoramas themselves, as
+    /// equirectangular cameras (COLMAP's `EQUIRECTANGULAR`): SIFT on the
+    /// whole panorama, so features across the face seams count, and one
+    /// pose per panorama. The cube faces, posed from it, are still what
+    /// training sees. The panoramas SfM sees are at most `2 max_size` wide.
+    /// Overrides `equirect_rig`.
+    pub equirect_native: bool,
 }
 
 impl Default for PhotoSfmConfig {
@@ -135,6 +149,8 @@ impl Default for PhotoSfmConfig {
             gpu_sift: true,
             complete_model: true,
             equirect: false,
+            equirect_rig: true,
+            equirect_native: false,
         }
     }
 }
@@ -554,7 +570,7 @@ pub fn build_photo_dataset(
     // Each panorama -> its six cube faces, consecutive, in panorama order:
     // image `i` comes from source image `i / per_source`.
     let per_source = if cfg.equirect { 6 } else { 1 };
-    let (labels, decoded, width, height) = if cfg.equirect {
+    let (labels, decoded, width, height, panoramas) = if cfg.equirect {
         if width.abs_diff(2 * height) as f64 > 0.01 * width as f64 {
             return Err(EurocError::Sfm(format!(
                 "equirect: the panoramas are {width}x{height}, not 2:1"
@@ -587,13 +603,28 @@ pub fn build_photo_dataset(
             "equirect: {} cube faces of {size}x{size} px",
             decoded.len()
         ));
-        (labels, decoded, size, size)
+        // SfM on the panoramas: at most `2 max_size` wide (COLMAP's 3200 px
+        // SIFT cap at the default), half the faces' angular resolution; a
+        // full-size panorama's SIFT pyramid takes gigabytes.
+        let panoramas = cfg.equirect_native.then(|| {
+            let w = width.min(2 * cfg.max_size).max(2);
+            let h = w / 2;
+            let scaled: Vec<(image::RgbImage, Option<f64>)> = if w == width {
+                panoramas
+            } else {
+                panoramas
+                    .into_par_iter()
+                    .map(|(pano, f)| (resize_triangle(&pano, w, h), f))
+                    .collect()
+            };
+            (scaled, w, h)
+        });
+        (labels, decoded, size, size, panoramas)
     } else {
         let labels = files.iter().map(|f| f.display().to_string()).collect();
-        (labels, decoded, width, height)
+        (labels, decoded, width, height, None)
     };
     let n = decoded.len();
-    let source = |i: usize| i / per_source;
     let long = width.max(height) as f64;
     let mut f35s: Vec<f64> = decoded.iter().filter_map(|d| d.1).collect();
     f35s.sort_by(f64::total_cmp);
@@ -642,6 +673,25 @@ pub fn build_photo_dataset(
         .map(|(n, l)| format!("{n} {l}\n"))
         .collect();
     let _ = std::fs::write(out_dir.join("image_names.txt"), listing);
+
+    // With `equirect_native` SfM runs on the panoramas, one equirectangular
+    // camera; the faces written above (`faces`: their names, size and
+    // pinhole camera) are posed from the panoramas afterwards.
+    let (decoded, n, per_source, width, height, camera, names, faces) = match panoramas {
+        Some((panoramas, w, h)) => {
+            log(&format!(
+                "equirect: SfM on the {} panoramas ({w}x{h} px, equirectangular camera)",
+                panoramas.len()
+            ));
+            let n = panoramas.len();
+            let pano_names = (0..n).map(|i| format!("panorama_{i:05}")).collect();
+            let camera_360 = Camera::equirectangular(1, w, h);
+            let faces = Some((names, width, camera));
+            (panoramas, n, 1, w, h, camera_360, pano_names, faces)
+        }
+        None => (decoded, n, per_source, width, height, camera, names, None),
+    };
+    let source = |i: usize| i / per_source;
 
     // SIFT: COLMAP's VLFeat detector (subpixel localization) and descriptor.
     // The default detector reports integer pixel positions: on ETH3D
@@ -1033,6 +1083,14 @@ pub fn build_photo_dataset(
     if cfg.complete_model {
         port_overrides.push("complete_largest_model=1".into());
     }
+    // Face `k`'s `sensor_from_rig`: the panorama (rig) frame to the face's.
+    let rig: Option<Vec<nalgebra::Matrix3<f64>>> =
+        (cfg.equirect && cfg.equirect_rig && faces.is_none()).then(|| {
+            equirect::cube_face_rotations()
+                .iter()
+                .map(|(_, r)| r.transpose())
+                .collect()
+        });
     let models = run_colmap_port(
         out_dir,
         &camera,
@@ -1040,6 +1098,7 @@ pub fn build_photo_dataset(
         height,
         &features,
         &pairwise,
+        rig.as_deref(),
         &port_overrides,
         log,
     )?;
@@ -1093,14 +1152,113 @@ pub fn build_photo_dataset(
         }
     }
     let registered = poses.iter().filter(|p| p.is_some()).count();
-    let focal = cam.params[0];
+    // The training cameras' focal length (the cube faces' with
+    // `equirect_native`).
+    let focal = match &faces {
+        Some((_, size, _)) => *size as f64 / 2.0,
+        None => cam.params[0],
+    };
     log(&format!(
         "sfm: {registered}/{n} registered, {} points, {reproj:.3} px, focal {focal:.1} px ({:.1} s)",
         tracks.len(),
         t0.elapsed().as_secs_f64()
     ));
-    if cfg.equirect {
+    if cfg.equirect && faces.is_none() {
         log(&face_centre_spread(&poses, per_source));
+    }
+
+    let points: Vec<ColoredPoint> = tracks
+        .iter()
+        .filter_map(|t| {
+            let &(img, _, px) = t.observations.first()?;
+            let (x, y) = (px.x.round(), px.y.round());
+            let rgb = if x >= 0.0 && y >= 0.0 && x < width as f64 && y < height as f64 {
+                decoded[img].0.get_pixel(x as u32, y as u32).0
+            } else {
+                [128; 3]
+            };
+            Some(ColoredPoint {
+                position: Vector3::new(
+                    t.position.x as f32,
+                    t.position.y as f32,
+                    t.position.z as f32,
+                ),
+                rgb,
+            })
+        })
+        .collect();
+    // SfM points seen per cube face (image `6 i + k`), with a rig or
+    // `equirect_native`, where every face of a registered panorama has a
+    // pose whether or not anything in it was matched.
+    let face_support: Option<Vec<usize>> = if faces.is_some() {
+        let axes: Vec<Vector3<f64>> = equirect::cube_face_rotations()
+            .iter()
+            .map(|(_, r)| r.column(2).into_owned())
+            .collect();
+        let mut counts = vec![0usize; 6 * n];
+        for &(pano, _, px) in tracks.iter().flat_map(|t| &t.observations) {
+            if let Some(ray) = camera.unit_ray_from_pixel(&px) {
+                let face = (0..6)
+                    .max_by(|&a, &b| ray.dot(&axes[a]).total_cmp(&ray.dot(&axes[b])))
+                    .expect("six faces");
+                counts[6 * pano + face] += 1;
+            }
+        }
+        Some(counts)
+    } else if rig.is_some() {
+        let mut counts = vec![0usize; n];
+        for &(image, _, _) in tracks.iter().flat_map(|t| &t.observations) {
+            counts[image] += 1;
+        }
+        Some(counts)
+    } else {
+        None
+    };
+    // Each registered panorama -> its six cube faces, posed by the face's
+    // fixed rotation behind the panorama's pose (face `k` of panorama `i`
+    // is image `6 i + k`, as written above).
+    let (poses, names, cam, width, height, per_source) = match faces {
+        Some((face_names, size, face_camera)) => {
+            let rotations = equirect::cube_face_rotations();
+            let face_poses: Vec<Option<visloc_core::geometry::Pose>> = poses
+                .iter()
+                .flat_map(|pose| {
+                    rotations.iter().map(move |(_, r)| {
+                        pose.as_ref().map(|pose| {
+                            let face_from_pano = nalgebra::UnitQuaternion::from_rotation_matrix(
+                                &nalgebra::Rotation3::from_matrix_unchecked(r.transpose()),
+                            );
+                            let w2c = &pose.world_to_camera;
+                            visloc_core::geometry::Pose::from_world_to_camera(
+                                face_from_pano * w2c.rotation,
+                                face_from_pano * w2c.translation,
+                            )
+                        })
+                    })
+                })
+                .collect();
+            (face_poses, face_names, face_camera, size, size, 6)
+        }
+        None => (poses, names, cam, width, height, per_source),
+    };
+    let source = |i: usize| i / per_source;
+    // Faces that see fewer than `min_matches` SfM points (sky, or a camera
+    // mount or selfie stick that moves with the camera) are left out of
+    // training.
+    let mut poses = poses;
+    if let Some(counts) = face_support {
+        let posed = poses.iter().filter(|p| p.is_some()).count();
+        for (pose, &count) in poses.iter_mut().zip(&counts) {
+            if count < cfg.min_matches {
+                *pose = None;
+            }
+        }
+        let kept = poses.iter().filter(|p| p.is_some()).count();
+        log(&format!(
+            "equirect: {kept} of {posed} posed faces see at least {} SfM points and are kept \
+             for training",
+            cfg.min_matches
+        ));
     }
 
     let mut train = Vec::new();
@@ -1129,26 +1287,6 @@ pub fn build_photo_dataset(
             train.push(view);
         }
     }
-    let points: Vec<ColoredPoint> = tracks
-        .iter()
-        .filter_map(|t| {
-            let &(img, _, px) = t.observations.first()?;
-            let (x, y) = (px.x.round(), px.y.round());
-            let rgb = if x >= 0.0 && y >= 0.0 && x < width as f64 && y < height as f64 {
-                decoded[img].0.get_pixel(x as u32, y as u32).0
-            } else {
-                [128; 3]
-            };
-            Some(ColoredPoint {
-                position: Vector3::new(
-                    t.position.x as f32,
-                    t.position.y as f32,
-                    t.position.z as f32,
-                ),
-                rgb,
-            })
-        })
-        .collect();
     // COLMAP text model next to the images, so other tools (brush, Inria
     // 3DGS, gsplat_train / gsplat_mesh --data) can use the reconstruction.
     let sparse = out_dir.join("sparse").join("0");
@@ -1303,6 +1441,7 @@ mod tests {
     use super::exif_focal_35mm;
     use super::resize_triangle;
     use super::unit_scale_descriptors;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn resize_triangle_matches_the_image_crate_byte_for_byte() {
@@ -1570,18 +1709,11 @@ mod tests {
         })
     }
 
-    /// Panoramas of a synthetic room through the whole CPU pipeline: the
-    /// pinhole path warns, the cube-face path registers the faces and puts
-    /// each panorama's faces at one centre.
-    /// `cargo test --release -p visloc-gsplat-train --features euroc --lib
-    /// equirect_end_to_end -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn equirect_end_to_end() {
-        let root = std::env::temp_dir().join(format!("visloc_equirect_{}", std::process::id()));
+    /// Five panoramas of the synthetic room in `root/in`, and the `(centre,
+    /// yaw)` each was taken at.
+    fn room_panoramas(root: &Path) -> (PathBuf, Vec<(nalgebra::Vector3<f64>, f64)>) {
         let images = root.join("in");
         std::fs::create_dir_all(&images).unwrap();
-        // (centre, yaw) of each panorama.
         let truth: Vec<(nalgebra::Vector3<f64>, f64)> = (0..5)
             .map(|k| {
                 let c = nalgebra::Vector3::new(
@@ -1597,6 +1729,93 @@ mod tests {
                 .save(images.join(format!("pano_{k}.png")))
                 .unwrap();
         }
+        (images, truth)
+    }
+
+    /// The cube-face poses of `sparse/0/images.txt` under `out` against
+    /// [`room_panoramas`]' truth, free of the gauge: how many there are, the
+    /// worst error of a relative rotation between two faces (degrees) and
+    /// of a distance between two panoramas' mean face centres (metres,
+    /// after the least-squares scale).
+    fn face_pose_errors(out: &Path, truth: &[(nalgebra::Vector3<f64>, f64)]) -> (usize, f64, f64) {
+        // Face k of panorama i looks along yaw_i * R_k (camera to world).
+        let faces = crate::equirect::cube_face_rotations();
+        let true_rotation = |i: usize| {
+            let (_, yaw) = truth[i / 6];
+            nalgebra::Rotation3::from_axis_angle(&nalgebra::Vector3::y_axis(), yaw).matrix()
+                * faces[i % 6].1
+        };
+        // Recovered world-to-camera rotations and centres, by image index.
+        let text = std::fs::read_to_string(out.join("sparse/0/images.txt")).unwrap();
+        let mut est: Vec<(usize, nalgebra::Matrix3<f64>, nalgebra::Vector3<f64>)> = Vec::new();
+        for line in text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let t: Vec<&str> = line.split_whitespace().collect();
+            let v: Vec<f64> = t[1..8].iter().map(|x| x.parse().unwrap()).collect();
+            let q = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+                v[0], v[1], v[2], v[3],
+            ));
+            let r = *q.to_rotation_matrix().matrix();
+            let centre = -r.transpose() * nalgebra::Vector3::new(v[4], v[5], v[6]);
+            let i: usize = t[9][6..11].parse().unwrap();
+            est.push((i, r, centre));
+        }
+        // Relative rotation of every pair of faces, recovered vs true.
+        let mut worst_deg = 0.0f64;
+        for (a, ra, _) in &est {
+            for (b, rb, _) in &est {
+                let recovered = ra * rb.transpose();
+                let truth = true_rotation(*a).transpose() * true_rotation(*b);
+                let angle =
+                    nalgebra::Rotation3::from_matrix_unchecked(recovered.transpose() * truth)
+                        .angle();
+                worst_deg = worst_deg.max(angle.to_degrees());
+            }
+        }
+        // Distances between the panoramas' mean face centres, recovered vs
+        // true, after the least-squares scale.
+        let mean_centre = |p: usize| {
+            let c: Vec<_> = est.iter().filter(|e| e.0 / 6 == p).map(|e| e.2).collect();
+            c.iter().sum::<nalgebra::Vector3<f64>>() / c.len() as f64
+        };
+        let panoramas: Vec<usize> = (0..truth.len())
+            .filter(|&p| est.iter().any(|e| e.0 / 6 == p))
+            .collect();
+        let (mut dt, mut de) = (Vec::new(), Vec::new());
+        for (k, &p) in panoramas.iter().enumerate() {
+            for &q in &panoramas[k + 1..] {
+                dt.push((truth[p].0 - truth[q].0).norm());
+                de.push((mean_centre(p) - mean_centre(q)).norm());
+            }
+        }
+        let scale = dt.iter().zip(&de).map(|(t, e)| t * e).sum::<f64>()
+            / de.iter().map(|e| e * e).sum::<f64>();
+        let worst_m = dt
+            .iter()
+            .zip(&de)
+            .map(|(t, e)| (scale * e - t).abs())
+            .fold(0.0, f64::max);
+        println!(
+            "vs truth: {} faces, worst relative rotation {worst_deg:.3} deg, worst panorama \
+             distance error {:.1} mm (spacing 0.58 m)",
+            est.len(),
+            1000.0 * worst_m
+        );
+        (est.len(), worst_deg, worst_m)
+    }
+
+    /// Panoramas of a synthetic room through the whole CPU pipeline: the
+    /// pinhole path warns, the cube-face path registers the faces as one
+    /// rig per panorama.
+    /// `cargo test --release -p visloc-gsplat-train --features euroc --lib
+    /// equirect_end_to_end -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn equirect_end_to_end() {
+        let root = std::env::temp_dir().join(format!("visloc_equirect_{}", std::process::id()));
+        let (images, truth) = room_panoramas(&root);
         let mut cfg = super::PhotoSfmConfig {
             gpu: false,
             gpu_sift: false,
@@ -1620,9 +1839,12 @@ mod tests {
             })
             .unwrap();
         assert!(!logs.iter().any(|m| m.starts_with("warning")));
+        // One rig per panorama: its faces share a centre exactly.
+        assert!(logs.iter().any(|m| m.contains("lie a median 0.0000 from")));
         assert_eq!((report.images, report.width, report.height), (30, 256, 256));
         assert_eq!(report.focal, 128.0);
         assert!(report.registered >= 24, "{} registered", report.registered);
+        // Every face of the room sees SfM points: all are kept for training.
         assert_eq!(dataset.train.len(), report.registered);
         // Held out by panorama: every 2nd one's faces.
         cfg.eval_every = 2;
@@ -1634,71 +1856,50 @@ mod tests {
         assert!(dataset.train.iter().all(|v| panorama(v) % 2 == 1));
         assert_eq!(dataset.eval.len() + dataset.train.len(), report.registered);
 
-        // Against the truth, free of the gauge: face k of panorama i looks
-        // along yaw_i * R_k (camera to world) from centre_i.
-        let faces = crate::equirect::cube_face_rotations();
-        let true_rotation = |i: usize| {
-            let (_, yaw) = truth[i / 6];
-            nalgebra::Rotation3::from_axis_angle(&nalgebra::Vector3::y_axis(), yaw).matrix()
-                * faces[i % 6].1
+        let (faces, worst_deg, worst_m) = face_pose_errors(&root.join("faces"), &truth);
+        assert_eq!(faces, report.registered);
+        assert!(worst_deg < 0.05, "{worst_deg} deg");
+        assert!(worst_m < 0.005, "{worst_m} m");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same room with `equirect_native`: SfM on the panoramas as
+    /// equirectangular cameras registers all five, and the cube faces posed
+    /// from them match the truth.
+    /// `cargo test --release -p visloc-gsplat-train --features euroc --lib
+    /// equirect_native_end_to_end -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn equirect_native_end_to_end() {
+        let root = std::env::temp_dir().join(format!("visloc_native_{}", std::process::id()));
+        let (images, truth) = room_panoramas(&root);
+        let cfg = super::PhotoSfmConfig {
+            gpu: false,
+            gpu_sift: false,
+            eval_every: 0,
+            equirect: true,
+            equirect_native: true,
+            ..Default::default()
         };
-        // Recovered world-to-camera rotations and centres, by image index.
-        let text = std::fs::read_to_string(root.join("faces/sparse/0/images.txt")).unwrap();
-        let mut est: Vec<(usize, nalgebra::Matrix3<f64>, nalgebra::Vector3<f64>)> = Vec::new();
-        for line in text
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.is_empty())
-        {
-            let t: Vec<&str> = line.split_whitespace().collect();
-            let v: Vec<f64> = t[1..8].iter().map(|x| x.parse().unwrap()).collect();
-            let q = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
-                v[0], v[1], v[2], v[3],
-            ));
-            let r = *q.to_rotation_matrix().matrix();
-            let centre = -r.transpose() * nalgebra::Vector3::new(v[4], v[5], v[6]);
-            let i: usize = t[9][6..11].parse().unwrap();
-            est.push((i, r, centre));
-        }
-        assert_eq!(est.len(), report.registered);
-        // Relative rotation of every pair of faces, recovered vs true.
-        let mut worst_deg = 0.0f64;
-        for (a, ra, _) in &est {
-            for (b, rb, _) in &est {
-                let recovered = ra * rb.transpose();
-                let truth = true_rotation(*a).transpose() * true_rotation(*b);
-                let angle =
-                    nalgebra::Rotation3::from_matrix_unchecked(recovered.transpose() * truth)
-                        .angle();
-                worst_deg = worst_deg.max(angle.to_degrees());
-            }
-        }
-        // Distances between the panoramas' mean face centres, recovered vs
-        // true, after the least-squares scale.
-        let mean_centre = |p: usize| {
-            let c: Vec<_> = est.iter().filter(|e| e.0 / 6 == p).map(|e| e.2).collect();
-            c.iter().sum::<nalgebra::Vector3<f64>>() / c.len() as f64
-        };
-        let (mut dt, mut de) = (Vec::new(), Vec::new());
-        for p in 0..5 {
-            for q in p + 1..5 {
-                dt.push((truth[p].0 - truth[q].0).norm());
-                de.push((mean_centre(p) - mean_centre(q)).norm());
-            }
-        }
-        let scale = dt.iter().zip(&de).map(|(t, e)| t * e).sum::<f64>()
-            / de.iter().map(|e| e * e).sum::<f64>();
-        let worst_m = dt
+        let mut logs = Vec::new();
+        let (dataset, points, report) =
+            super::build_photo_dataset(&images, &root.join("native"), &cfg, &mut |m: &str| {
+                println!("{m}");
+                logs.push(m.to_string())
+            })
+            .unwrap();
+        assert!(logs
             .iter()
-            .zip(&de)
-            .map(|(t, e)| (scale * e - t).abs())
-            .fold(0.0, f64::max);
-        println!(
-            "vs truth: worst relative rotation {worst_deg:.3} deg, worst panorama distance \
-             error {:.1} mm (spacing 0.58 m)",
-            1000.0 * worst_m
-        );
-        assert!(worst_deg < 0.5, "{worst_deg} deg");
-        assert!(worst_m < 0.02, "{worst_m} m");
+            .any(|m| m.contains("SfM on the 5 panoramas (1024x512")));
+        assert_eq!((report.images, report.registered), (5, 5));
+        assert_eq!(report.focal, 128.0);
+        // Training sees the cube faces, posed from their panoramas.
+        assert_eq!(dataset.train.len(), 30);
+        assert!(points.len() > 1000, "{} points", points.len());
+        let (faces, worst_deg, worst_m) = face_pose_errors(&root.join("native"), &truth);
+        assert_eq!(faces, 30);
+        assert!(worst_deg < 0.05, "{worst_deg} deg");
+        assert!(worst_m < 0.005, "{worst_m} m");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

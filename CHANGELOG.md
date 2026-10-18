@@ -11,9 +11,10 @@ All notable changes to `visloc-rs` will be documented here.
   six 90° cube faces (`visloc_gsplat_train::equirect`), at most `max_size`
   square, before SfM and training. Their focal length `size / 2` is exact
   and stays fixed. Faces of one panorama are not matched with each other,
-  and the window counts panoramas. The faces are still separate cameras.
-  The log reports how far apart each panorama's face centres land. Off by
-  default.
+  and the window counts panoramas. The log reports how far apart each
+  panorama's face centres land. Off by default. The numbers below solve
+  each face as its own camera, now `--equirect-independent-faces` (the
+  six-face rig below is the default).
   - Five synthetic room panoramas (`equirect_end_to_end`, an ignored
     test): all 30 faces register. Relative rotations are within 0.13° of
     the truth, and panorama distances within 0.4 mm over 0.58 m spacing.
@@ -35,6 +36,58 @@ All notable changes to `visloc-rs` will be documented here.
     registered face would have held out the same face of every
     panorama: on ScanVan it took 3 of the 5 front faces, which left the
     view ahead with two training images.
+- **`--equirect`: the six cube faces of a panorama as one rig** (#301).
+  `PhotoSfmConfig::equirect_rig`, on by default: the mapper solves one pose
+  per panorama, its faces at the panorama's centre with their fixed
+  rotations, instead of six independent cameras
+  (`--equirect-independent-faces` restores those). The COLMAP-port mapper
+  initializes a central rig (every `sensor_from_rig` translation zero) from
+  the pair's ordinary two-view geometry: its generalized relative pose
+  solver (GR6P) is degenerate when every ray passes through one centre.
+  - Synthetic room (`equirect_end_to_end`): relative rotations within
+    0.006° of the truth (independent faces: 0.13°), panorama distances
+    within 0.2 mm (0.4 mm).
+  - Twelve synthetic panoramas 5 cm apart: both register all 72 faces;
+    independent faces spread their centres by 16.7% of the step, the rig
+    by none, in half the SfM time. 2 cm apart (22 cm in all, 4 m from the
+    walls) neither reconstructs: a rig does not add parallax.
+  - ScanVan: every panorama registers with all six faces posed
+    (independent: the 20 side faces); distances match ScanVan's
+    trajectory within 0.26% (0.33%).
+  - With a rig every face of a registered panorama has a pose. Faces that
+    see fewer than `min_matches` SfM points are left out of training: sky,
+    or a camera mount or selfie stick that moves with the camera. On
+    ScanVan that drops the five down faces (the mount) and keeps the up
+    faces (trees and buildings).
+- **`--equirect-native`: SfM on the panoramas as equirectangular cameras**
+  (#301). `PhotoSfmConfig::equirect_native`: SIFT runs on the whole
+  panorama, at most `2 max_size` wide (COLMAP's 3200 px cap at the
+  default), and the mapper solves `CameraModel::Equirectangular`, COLMAP
+  4.1's `EQUIRECTANGULAR` (parameters `w, h`). The cube faces are then
+  posed from each panorama for training, with the same face filter.
+  - `visloc_core`: `CameraModel::Equirectangular` (projection, rays over
+    the whole sphere, analytic Jacobian), COLMAP model id 17 in the text
+    and binary readers and writers.
+  - Two-view verification on unit rays
+    (`visloc_vision::two_view::spherical`): five-point essential-matrix
+    RANSAC scored by the angle between a ray and its epipolar plane.
+  - The COLMAP-port mapper on unit rays where a pinhole uses the `z = 1`
+    plane: P3P bearings, DLT triangulation rows, cheirality, angular
+    errors, the native bundle adjustment's residual and Jacobians (the
+    panorama's left and right edges are one meridian: residuals wrap).
+    Its initial pair gates the triangulation angle per cube-face
+    direction, as a pinhole camera looking that way would be gated: a
+    panorama always shows the epipoles of the motion, where nothing has
+    parallax, and the median over the whole sphere fell to 1-3° on
+    ScanVan.
+  - Synthetic room (`equirect_native_end_to_end`): 5/5 panoramas,
+    relative face rotations within 0.010° of the truth, panorama
+    distances within 0.05 mm.
+  - ScanVan (CPU): 5/5 panoramas, distances within 0.29% of ScanVan's
+    trajectory, in 22 s against the rig's 163 s (SIFT on 3200 x 1600
+    panoramas instead of thirty 1504 px faces), with 2,052 SfM points
+    against 4,893. As COLMAP notes for its own model, faster but coarser
+    than perspective views; the rig stays the default.
 - **A warning for panoramas fed as pinhole photos.** When at least half the
   images look equirectangular, `build_photo_dataset` logs a warning that
   points to `--equirect`. An image counts when it is 2:1 with left and

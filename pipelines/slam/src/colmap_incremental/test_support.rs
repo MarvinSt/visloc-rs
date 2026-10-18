@@ -33,10 +33,6 @@ pub(crate) struct SyntheticScene {
 /// same-frame stereo pair) is ingested into the correspondence graph with
 /// full point-index correspondences.
 pub(crate) fn build_synthetic_rig_scene(num_frames: usize, window: usize) -> SyntheticScene {
-    let mut rigs = BTreeMap::new();
-    let mut rig = Rig::new();
-    rig.set_rig_id(0);
-    rig.add_ref_sensor(SensorT::camera(1));
     // A wider synthetic baseline than the real OpenLORIS ~6cm rig (and
     // closer points below) than a real short-baseline stereo pair would
     // use, chosen deliberately so every same-frame stereo pair alone
@@ -47,6 +43,34 @@ pub(crate) fn build_synthetic_rig_scene(num_frames: usize, window: usize) -> Syn
         UnitQuaternion::from_euler_angles(0.0, 0.02, 0.0),
         Vector3::new(-0.15, 0.0, 0.0),
     );
+    build_rig_scene(num_frames, window, cam2_from_rig, true)
+}
+
+/// [`build_synthetic_rig_scene`]'s sequence with a central rig: camera 2
+/// only turned (yaw `0.15` rad) from camera 1, at the same centre, like two
+/// cube faces of one panorama. The two cameras of a frame are not matched
+/// (no parallax between them).
+pub(crate) fn build_synthetic_central_rig_scene(
+    num_frames: usize,
+    window: usize,
+) -> SyntheticScene {
+    let cam2_from_rig = SE3::new(
+        UnitQuaternion::from_euler_angles(0.0, 0.15, 0.0),
+        Vector3::zeros(),
+    );
+    build_rig_scene(num_frames, window, cam2_from_rig, false)
+}
+
+fn build_rig_scene(
+    num_frames: usize,
+    window: usize,
+    cam2_from_rig: SE3,
+    match_within_frame: bool,
+) -> SyntheticScene {
+    let mut rigs = BTreeMap::new();
+    let mut rig = Rig::new();
+    rig.set_rig_id(0);
+    rig.add_ref_sensor(SensorT::camera(1));
     rig.add_sensor(SensorT::camera(2), Some(cam2_from_rig.clone()));
     rigs.insert(0, rig);
 
@@ -139,7 +163,11 @@ pub(crate) fn build_synthetic_rig_scene(num_frames: usize, window: usize) -> Syn
             }
             let (j1, j2) = images_per_frame[k2];
             let pairs: Vec<(ImageT, ImageT)> = if dk == 0 {
-                vec![(i1, i2)]
+                if match_within_frame {
+                    vec![(i1, i2)]
+                } else {
+                    Vec::new()
+                }
             } else {
                 vec![(i1, j1), (i1, j2), (i2, j1), (i2, j2)]
             };
@@ -175,6 +203,80 @@ pub(crate) fn build_synthetic_rig_scene(num_frames: usize, window: usize) -> Syn
 #[allow(dead_code)]
 pub(crate) fn point2_dist(a: Point2<f64>, b: Point2<f64>) -> f64 {
     (a - b).norm()
+}
+
+/// `num_frames` single-camera frames of one equirectangular camera
+/// (2048 x 1024) moving 0.3 m a frame along a gently curving path and
+/// turning about the vertical, among 120 points scattered all around it
+/// (3 to 7 m away, so most lie behind or beside any one view direction).
+/// Every point is seen by every frame; frames up to `window` apart are
+/// matched point for point. The database and each frame's true
+/// `rig_from_world`.
+pub(crate) fn build_synthetic_spherical_scene(
+    num_frames: usize,
+    window: usize,
+) -> (DatabaseCache, BTreeMap<FrameT, SE3>) {
+    let mut rig = Rig::new();
+    rig.set_rig_id(0);
+    rig.add_ref_sensor(SensorT::camera(1));
+    let camera = Camera::equirectangular(1, 2048, 1024);
+    let points: Vec<Point3<f64>> = (0..120)
+        .map(|i| {
+            let i = i as f64;
+            // A golden-angle spiral over the sphere, radius 3-7 m.
+            let z = 1.0 - 2.0 * (i + 0.5) / 120.0;
+            let azimuth = i * 2.399_963;
+            let r = 3.0 + 4.0 * (0.5 + 0.5 * (i * 1.7).sin());
+            let ring = (1.0 - z * z).sqrt();
+            Point3::new(
+                r * ring * azimuth.cos(),
+                0.6 * r * z,
+                r * ring * azimuth.sin(),
+            )
+        })
+        .collect();
+    let mut frames = BTreeMap::new();
+    let mut images = BTreeMap::new();
+    let mut truth = BTreeMap::new();
+    for k in 0..num_frames {
+        let id = k as ImageT;
+        let t = k as f64;
+        let centre = Vector3::new(0.3 * t - 1.0, 0.02 * (t * 0.9).sin(), 0.1 * (t * 0.5).sin());
+        let rotation = UnitQuaternion::from_euler_angles(0.0, 0.7 * t, 0.0);
+        // rig_from_world maps X to R (X - c).
+        let pose = SE3::new(rotation, -(rotation * centre));
+        let mut frame = Frame::new(id, 0);
+        frame.add_data_id(DataT::camera(1, id));
+        frames.insert(id, frame);
+        let mut image = Image::new(id, 1, id, format!("{k}.png"));
+        image.points2d = points
+            .iter()
+            .map(|p| Point2D::new(camera.project(&pose.transform_point(p)).unwrap()))
+            .collect();
+        images.insert(id, image);
+        truth.insert(id, pose);
+    }
+    let mut graph = CorrespondenceGraph::new();
+    for id in 0..num_frames {
+        graph.add_image(id, points.len());
+    }
+    let matches: Vec<(usize, usize)> = (0..points.len()).map(|j| (j, j)).collect();
+    for a in 0..num_frames {
+        for b in a + 1..num_frames.min(a + window + 1) {
+            graph
+                .add_two_view_geometry(a, b, &matches, ConfigurationType::Calibrated)
+                .unwrap();
+        }
+    }
+    graph.finalize();
+    let mut cameras = BTreeMap::new();
+    cameras.insert(1, camera);
+    let mut rigs = BTreeMap::new();
+    rigs.insert(0, rig);
+    (
+        DatabaseCache::from_parts(rigs, cameras, frames, images, graph),
+        truth,
+    )
 }
 
 /// Three single-camera frames seeing the same 60 points, every pair matched

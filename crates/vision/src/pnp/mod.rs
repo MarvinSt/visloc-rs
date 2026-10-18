@@ -296,8 +296,9 @@ fn reprojection_residual(
     for (index, correspondence) in correspondences.iter().enumerate() {
         let projected = camera.project(&pose.transform_world_point(&correspondence.point3d))?;
         let offset = index * 2;
-        residual[offset] = projected.x - correspondence.point2d.x;
-        residual[offset + 1] = projected.y - correspondence.point2d.y;
+        let r = camera.pixel_residual(&projected, &correspondence.point2d);
+        residual[offset] = r.x;
+        residual[offset + 1] = r.y;
     }
     Some(residual)
 }

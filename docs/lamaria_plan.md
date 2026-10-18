@@ -290,7 +290,14 @@ before/after on training sequences.
    configuration the whole chain (VIO, SIFT, matching, revisits at stride
    4, windows) takes about 3.9 cores: sequence_2_11 scores 72.48 that way,
    against 83.12 from the big-window VIO, which runs at 0.42 times real time
-   ([Online mode](lamaria_batch_ba.md#online-mode)).
+   ([Online mode](lamaria_batch_ba.md#online-mode)). The batch steps run
+   once more after the recording from the online trajectory keep its
+   heading and add the revisits: sequence_1_20 73.03, sequence_3_18 67.39,
+   sequence_3_17 75.57. In low light that pass drifts again (4_10: 69.79 →
+   51.44), so low light keeps the online result; chosen by track, the mean
+   over the ten sequences is **59.70** (Short 76.12, Medium 51.06, Long
+   71.48, Low light 65.41, Moving platform 34.41;
+   [Online, then one batch pass](lamaria_batch_ba.md#online-then-one-batch-pass)).
 
 ## 5. Test-set operational pipeline
 

@@ -15,7 +15,10 @@ sequence. It uses no ground truth.
 The sections below follow the development in order. The current pipeline and
 its results on ten training sequences are in [Two sequences per
 track](#two-sequences-per-track) (mean 74.64 over the five sequences it was
-developed on, 54.34 over all ten), the commands in [Usage](#usage).
+developed on, 54.34 over all ten), the commands in [Usage](#usage). Run on
+windows of the latest 240 s as the data comes in, then once more over the
+whole recording, it reaches 59.70 (see [Online, then one batch
+pass](#online-then-one-batch-pass)).
 
 ## Method
 
@@ -1225,6 +1228,44 @@ window sees the revisits within its 240 s only. Low light gains too, as
 with fewer iterations (see [Iterations](#iterations)). The moving platform
 does not.
 
+### Online, then one batch pass
+
+After the recording, the batch pipeline's steps (`solve --save-states`,
+`loop-correct`, `solve --loops`, the same options and iterations) can start
+from the online trajectory instead of the VIO:
+
+| Sequence | Batch pipeline | Online | Online + batch pass (pose recall @ 1 m) |
+|---|---:|---:|---:|
+| sequence_1_19 | **88.16** | 75.73 | 79.20 (89.4 %) |
+| sequence_1_20 | 49.00 | 65.37 | **73.03** (90.2 %) |
+| sequence_2_11 | 85.46 | 83.12 | **85.55** (100.0 %) |
+| sequence_2_12 | **20.82** | 19.87 | 16.57 (0.0 %) |
+| sequence_3_17 | 71.43 | 70.33 | **75.57** (79.4 %) |
+| sequence_3_18 | 36.13 | 57.87 | **67.39** (68.2 %) |
+| sequence_4_10 | 67.81 | **69.79** | 51.44 (22.1 %) |
+| sequence_4_11 | 56.49 | **61.03** | 52.33 (39.1 %) |
+| sequence_5_11 | 60.32 | 55.95 | **61.16** |
+| sequence_5_12 | **7.73** | 5.17 | 7.66 |
+| **Mean** | 54.34 | 56.42 | 56.99 |
+
+By day the pass keeps the online heading and adds the revisits across the
+whole recording: after its first solve the heading error of sequence_3_18
+spans 2.13° per 120 s window (online 2.40°, batch 8.09°) and the mean 2D
+error falls to 0.88 m (1.48 m, 4.09 m); on sequence_1_20, 1.23° and 0.59 m.
+In low light it drifts again, as with more iterations: sequence_4_10's
+heading error runs −1.6° … +2.4° after its first solve, against −1.2° …
++0.6° online. The online result in low light and the pass elsewhere,
+chosen by track and not by sequence, average **59.70**:
+
+| Track | Batch pipeline | Online, then the pass (low light: online) |
+|---|---:|---:|
+| Short | 68.58 | **76.12** |
+| Medium | **53.14** | 51.06 |
+| Long | 53.78 | **71.48** |
+| Low light | 62.15 | **65.41** |
+| Moving platform | 34.03 | **34.41** |
+| **Mean** | 54.34 | **59.70** |
+
 ### Real time
 
 A window finished within the 30 s of data the next one waits for (12–23 s
@@ -1310,8 +1351,12 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   (10 iterations and two rotation segments per window by default), each
   window starting from the biases, velocities, camera rotations and focal
   lengths of the one before, and writes the stitched trajectory to `--out`
-  (see [Online mode](#online-mode)). `BASALT_EUROC_WAIT_S=120` lets the VIO
-  demo wait for frames that a streaming reader has not written yet.
+  (see [Online mode](#online-mode)). By day (not in low light), the batch
+  steps with the revisits from that trajectory, `solve --vio online.tum
+  --save-states`, `loop-correct` and `solve --loops`, improve it after the
+  recording (see [Online, then one batch pass](#online-then-one-batch-pass)).
+  `BASALT_EUROC_WAIT_S=120` lets the VIO demo wait for frames that a
+  streaming reader has not written yet.
 - **Heading drift.** `--modes yaw` lets the solve correct a slow heading
   drift of its starting trajectory (see [Slow heading drift](#slow-heading-drift));
   `--modes yawN` splits it into N time pieces.

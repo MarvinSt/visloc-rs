@@ -168,6 +168,10 @@ All notable changes to `visloc-rs` will be documented here.
     facade (76 images at 3200 px, an L4), peak memory falls from 24.2 to
     12.0 GiB with one scale and from 28.7 to 12.4 GiB with three;
     `fused.ply` is byte-identical on pipes (CPU and GPU).
+  - **Mesh:** `--mesh` fuses the depths that source views agree with into
+    a TSDF and writes `mesh.ply` (surface nets); on pipes at 1600 px F1
+    68.1% at 2 cm against the cloud's 74.8%. The TSDF moved from
+    `visloc-gsplat-train` to `visloc-gsplat-core` (feature `mesh`).
   - **Run it:** `cargo run --release -p visloc-mvs --features gpu
     --example mvs -- --sparse <model> --images <dir> --out <dir> --gpu`.
 

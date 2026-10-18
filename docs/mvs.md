@@ -10,8 +10,8 @@ cargo run --release -p visloc-mvs --features gpu --example mvs -- \
     --sparse <dir with cameras.txt, images.txt, points3D.txt> \
     --images <image dir> --out <dir> --gpu \
     [--max-image-size 3200] [--sources 10] [--iterations 3] \
-    [--geom-passes 2] [--scales 3] [--no-planar-prior] \
-    [--view-selection confidence|sampled]
+    [--geom-passes 2] [--geom-iterations 3] [--scales 3] [--no-planar-prior] \
+    [--view-selection confidence|sampled] [--mesh]
 ```
 
 The image names in `images.txt` are relative to `--images`. The cameras must
@@ -96,7 +96,11 @@ from the paper:
   average (`--min-mean-consistency 0.3`) and keeps the reference pixel's
   point instead of the average (`--no-average`). On pipes and meadow
   pre-resized to 800 px the first costs about 10 points of F1 and the
-  second changes it by 0.1 point, so both are off by default.
+  second changes it by 0.1 point, so both are off by default. The checks
+  against the source maps run in parallel first; the raster-order pass
+  that builds the points re-checks only the sources that agreed, so the
+  cloud is a sequential fusion's (byte-identical on pipes at 1600 px, in
+  2.7 s instead of 5.1 s on four threads).
 
 The GPU path runs the same per-pixel update as compute shaders, with the
 same sampling regions, view selection and random numbers. The source images
@@ -127,6 +131,39 @@ are within 0.03 points of the earlier runs' (64.96% and 62.06%). The
 shaders did not change, but that pod had another NVIDIA driver (580.178
 instead of 595.91), and the clouds differ slightly: 77.75 million fused
 points instead of 77.66 million with one scale.
+
+## Mesh
+
+`--mesh` also writes `mesh.ply`. Each view's depths that a source view
+agrees with (fusion's check, whether or not the agreeing pixel went into
+a point) are fused into a truncated signed distance field on a sparse
+grid, after the last view that reads the view, and the zero level set is
+extracted with surface nets (the TSDF of `gsplat_photos`' mesh, now in
+`visloc-gsplat-core`). The voxel is one pixel's footprint at the median
+depth (`--mesh-voxel`, `--mesh-voxel-pixels`); pixels without such a
+depth are unknown rather than empty, a cell whose corners are not all
+known still gets a vertex from its known edges (`--mesh-full-cells`
+requires all eight), and components under 50 triangles are dropped
+(`--mesh-min-component`).
+
+On pipes at 1600 px (the saved depth maps of an earlier run; F1 at 2 cm,
+accuracy / completeness):
+
+| Output | F1 | Accuracy | Completeness |
+|---|---|---|---|
+| `fused.ply` | 74.8% | 95.6% | 61.5% |
+| `mesh.ply`, defaults | 68.1% | 94.7% | 53.2% |
+| all eight corners known (2-pixel voxel, 2 views per voxel) | 36.7% | 99.3% | 22.5% |
+| components of 10 triangles kept | 70.6% | 93.0% | 56.9% |
+
+Requiring every corner loses most of the surface: a pixel whose agreeing
+source pixel already went into a point fails fusion's check, so the
+depth maps have holes a pixel wide, and one unknown corner drops a cell.
+Thin structures (pipes' pipes) and far surfaces, whose depth noise
+exceeds the voxel, stay fragmented. Coarser TSDF levels for far pixels
+(`--mesh-levels`) did not help on pipes, whose surfaces are mostly within
+2 m of a camera. The mesh adds 1.5 s of fusion and 6.6 s of extraction
+there, and 1.0 GiB of peak memory (5.3 million triangles, 118 MB).
 
 ## ETH3D high-resolution benchmark
 

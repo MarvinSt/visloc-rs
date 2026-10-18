@@ -67,7 +67,32 @@ pub struct FusedPoint {
 /// Per view, the depth checks against the source maps run in parallel
 /// first; the raster-order pass that builds the points then re-checks only
 /// the sources that agreed, so the points are those of a sequential fusion.
-pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) -> Vec<FusedPoint> {
+pub fn fuse(ws: &Workspace, maps: Vec<DepthMap>, options: &FusionOptions) -> Vec<FusedPoint> {
+    fuse_inner(ws, maps, options, None)
+}
+
+/// Receives a view's index and depths from [`fuse_with`].
+pub type Released<'a> = dyn FnMut(usize, &[f32]) + 'a;
+
+/// [`fuse`], handing each view's depths that enough source views agree
+/// with (or that are in points; 0 elsewhere) to `released` once no later
+/// point can use its pixels, just before its map is dropped (e.g. to
+/// [`crate::mesh::TsdfMesher`]). The points are [`fuse`]'s.
+pub fn fuse_with(
+    ws: &Workspace,
+    maps: Vec<DepthMap>,
+    options: &FusionOptions,
+    released: &mut Released<'_>,
+) -> Vec<FusedPoint> {
+    fuse_inner(ws, maps, options, Some(released))
+}
+
+fn fuse_inner(
+    ws: &Workspace,
+    mut maps: Vec<DepthMap>,
+    options: &FusionOptions,
+    mut released: Option<&mut Released<'_>>,
+) -> Vec<FusedPoint> {
     let cos_max_angle = options.max_normal_angle_deg.to_radians().cos();
     let last_read_by = ws.last_read_by();
     for map in &mut maps {
@@ -78,6 +103,12 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
         .iter()
         .map(|m| vec![0; m.depth.len().div_ceil(64)])
         .collect();
+    // For `released`, per view, a bit per pixel: its depth agrees with
+    // enough source views, whether or not their pixels are in points (the
+    // pixels in points alone leave holes where a lower-resolution source
+    // pixel went to a neighbour).
+    let masks = released.is_some();
+    let mut consistent: Vec<Vec<u64>> = if masks { used.clone() } else { Vec::new() };
     let mut points = Vec::new();
     let mut agreeing: Vec<(usize, usize)> = Vec::new();
     let mut candidates: Vec<u64> = Vec::new();
@@ -93,9 +124,11 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
         };
         // Per pixel, bit `k` set when source `k` agrees (sources past the
         // 64th are always re-checked). Bits are only ever set in `used`, so
-        // a source pixel in a point now is still in one later. On one
-        // thread every source is checked once, in the raster-order pass.
-        let parallel = rayon::current_num_threads() > 1;
+        // a source pixel in a point now is still in one later; for the
+        // consistency masks, source pixels in points count too. On one
+        // thread (and no masks) every source is checked once, in the
+        // raster-order pass.
+        let parallel = rayon::current_num_threads() > 1 || masks;
         candidates.clear();
         candidates.resize(map.depth.len(), if parallel { 0 } else { u64::MAX });
         candidates
@@ -110,7 +143,8 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
                     }
                     let pixel = check.pixel(x, y);
                     for (k, &j) in view.sources.iter().enumerate().take(64) {
-                        if check.source(&pixel, j, &used[j]).is_some() {
+                        let in_points = (!masks).then_some(used[j].as_slice());
+                        if check.source(&pixel, j, in_points).is_some() {
                             *bits |= 1 << k;
                         }
                     }
@@ -121,6 +155,14 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
             for x in 0..map.width {
                 let p = y * map.width + x;
                 let bits = candidates[p];
+                if masks
+                    && map.depth[p] > 0.0
+                    && (is_set(&used[i], p)
+                        || (bits.count_ones() as usize + unchecked)
+                            >= options.min_consistent_views.max(1))
+                {
+                    set(&mut consistent[i], p);
+                }
                 if is_set(&used[i], p)
                     || map.depth[p] <= 0.0
                     || (bits.count_ones() as usize + unchecked) < options.min_consistent_views
@@ -137,7 +179,7 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
                     if k < 64 && bits >> k & 1 == 0 {
                         continue;
                     }
-                    let Some(a) = check.source(&pixel, j, &used[j]) else {
+                    let Some(a) = check.source(&pixel, j, Some(&used[j])) else {
                         continue;
                     };
                     agreeing.push((j, a.q));
@@ -174,6 +216,22 @@ pub fn fuse(ws: &Workspace, mut maps: Vec<DepthMap>, options: &FusionOptions) ->
             }
         }
         for &s in &last_read_by[i] {
+            if let Some(released) = released.as_mut() {
+                let agreed: Vec<f32> = maps[s]
+                    .depth
+                    .iter()
+                    .enumerate()
+                    .map(|(p, &d)| {
+                        if is_set(&used[s], p) || is_set(&consistent[s], p) {
+                            d
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                released(s, &agreed);
+                consistent[s] = Vec::new();
+            }
             maps[s].depth = Vec::new();
             maps[s].normal = Vec::new();
             used[s] = Vec::new();
@@ -230,10 +288,11 @@ impl Check<'_> {
         }
     }
 
-    /// The pixel of source view `j` that `pixel` projects into, when it is
-    /// in no point yet (`used`, view `j`'s bits) and its depth agrees.
+    /// The pixel of source view `j` that `pixel` projects into, when its
+    /// depth agrees and it is in no point yet (`used`, view `j`'s bits, if
+    /// given).
     #[inline(always)]
-    fn source(&self, pixel: &Pixel, j: usize, used: &[u64]) -> Option<Agreement> {
+    fn source(&self, pixel: &Pixel, j: usize, used: Option<&[u64]>) -> Option<Agreement> {
         let view = &self.ws.views[self.view];
         let source = &self.ws.views[j];
         let source_map = &self.maps[j];
@@ -247,7 +306,7 @@ impl Check<'_> {
         }
         let q = sy * source_map.width + sx;
         let source_depth = f64::from(source_map.depth[q]);
-        if is_set(used, q) || source_depth <= 0.0 {
+        if used.is_some_and(|used| is_set(used, q)) || source_depth <= 0.0 {
             return None;
         }
         let source_point = source.unproject(sx as f64 + 0.5, sy as f64 + 0.5, source_depth);

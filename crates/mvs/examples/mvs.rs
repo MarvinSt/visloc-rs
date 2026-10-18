@@ -12,22 +12,25 @@
 //!     [--restorer infinity|start|off] [--detail-threshold 0.1] [--no-planar-prior] \
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 10] \
-//!     [--min-mean-consistency 0] [--no-average]
+//!     [--min-mean-consistency 0] [--no-average] \
+//!     [--mesh] [--mesh-voxel <world units>] [--mesh-voxel-pixels 2] [--mesh-min-weight 2]
 //! ```
 //!
 //! Three scales in ACMMP's order by default: at every scale a photometric
 //! pass, ACMP's planar prior pass (`--no-planar-prior` leaves it out) and
 //! the geometric passes; `--scales 1` runs one. `--gpu` (a `--features gpu`
-//! build) runs PatchMatch on the GPU.
+//! build) runs PatchMatch on the GPU. `--mesh` also writes `mesh.ply`: the
+//! fused points' depths in a TSDF (voxels of two pixels' footprint by
+//! default), extracted with surface nets.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use visloc_mvs::{
-    estimate, estimate_from, estimate_with_prior, fuse, geometric_pass, multi_scale_depth_maps,
-    planar_prior_pass, read_text_model, write_ply, DepthMap, DetailRestorer, Estimator,
-    FusionOptions, MultiScaleOptions, PatchMatchOptions, PlanarPrior, PlanarPriorOptions,
-    ViewSelection, Workspace, WorkspaceOptions,
+    estimate, estimate_from, estimate_with_prior, fuse, fuse_with, geometric_pass,
+    multi_scale_depth_maps, planar_prior_pass, read_text_model, write_ply, DepthMap,
+    DetailRestorer, Estimator, FusionOptions, MeshOptions, MultiScaleOptions, PatchMatchOptions,
+    PlanarPrior, PlanarPriorOptions, TsdfMesher, ViewSelection, Workspace, WorkspaceOptions,
 };
 
 fn main() {
@@ -37,6 +40,7 @@ fn main() {
     let mut ws_options = WorkspaceOptions::default();
     let mut pm_options = PatchMatchOptions::default();
     let fusion_options = FusionOptions::default();
+    let mut mesh_options: Option<MeshOptions> = None;
     let mut geom_passes = 2usize;
     let mut geom_iterations = None;
     let mut scales = 3usize;
@@ -86,6 +90,47 @@ fn main() {
                 fusion_options.min_mean_consistency = value().parse().unwrap()
             }
             "--no-average" => fusion_options.average = false,
+            "--mesh" => {
+                mesh_options.get_or_insert_with(MeshOptions::default);
+            }
+            "--mesh-voxel" => {
+                mesh_options.get_or_insert_with(MeshOptions::default).voxel =
+                    Some(value().parse().unwrap())
+            }
+            "--mesh-voxel-pixels" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .voxel_pixels = value().parse().unwrap()
+            }
+            "--mesh-no-free-space" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .free_space = false;
+            }
+            "--mesh-min-component" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .min_component = value().parse().unwrap()
+            }
+            "--mesh-full-cells" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .partial_cells = false;
+            }
+            "--mesh-levels" => {
+                mesh_options.get_or_insert_with(MeshOptions::default).levels =
+                    value().parse().unwrap()
+            }
+            "--mesh-trunc" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .trunc_voxels = value().parse().unwrap()
+            }
+            "--mesh-min-weight" => {
+                mesh_options
+                    .get_or_insert_with(MeshOptions::default)
+                    .min_weight = value().parse().unwrap()
+            }
             other => panic!("unknown argument {other}"),
         }
     }
@@ -263,7 +308,13 @@ fn main() {
     }
 
     let t = Instant::now();
-    let points = fuse(&ws, maps, &fusion_options);
+    let mut mesher = mesh_options.as_ref().map(|o| TsdfMesher::new(&ws, o));
+    let points = match mesher.as_mut() {
+        Some(mesher) => fuse_with(&ws, maps, &fusion_options, &mut |v, depth| {
+            mesher.integrate(&ws.views[v], depth)
+        }),
+        None => fuse(&ws, maps, &fusion_options),
+    };
     eprintln!(
         "fusion: {} points in {:.1} s",
         points.len(),
@@ -271,6 +322,17 @@ fn main() {
     );
     let ply = out.join("fused.ply");
     write_ply(&ply, &points).expect("writing fused.ply");
+    if let Some(mesher) = mesher {
+        let t = Instant::now();
+        let (mesh, summary) = mesher.finish();
+        let path = out.join("mesh.ply");
+        mesh.write_ply(&path).expect("writing mesh.ply");
+        eprintln!(
+            "{summary} (extracted in {:.1} s) -> {}",
+            t.elapsed().as_secs_f64(),
+            path.display()
+        );
+    }
     eprintln!(
         "wrote {} in {:.1} s total",
         ply.display(),

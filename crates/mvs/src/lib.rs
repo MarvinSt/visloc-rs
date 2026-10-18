@@ -24,7 +24,7 @@ pub use gpu::GpuPatchMatch;
 pub use model::{read_text_model, SparseModel};
 pub use patch_match::{
     estimate, estimate_from, estimate_with_prior, photometric_score, DepthMap, DetailRestorer,
-    PatchMatchOptions, Sampling, ViewSelection,
+    PatchMatchOptions, ViewSelection,
 };
 pub use pipeline::{
     geometric_pass, multi_scale_depth_maps, planar_prior_pass, Estimator, MultiScaleOptions,

@@ -65,22 +65,6 @@ pub enum ViewSelection {
     Sampled,
 }
 
-/// Where a pixel samples its candidate planes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sampling {
-    /// ACMH's adaptive checkerboard sampling: the lowest-cost pixel of each
-    /// of four V shapes of 7 pixels and four strips of 11 next to the pixel.
-    Acmh,
-    /// HPM-MVS's non-local extensible sampling pattern (Ren et al., ICCV
-    /// 2023): four staircases of 8 pixels starting 5 to 6 pixels out on the
-    /// diagonals and four strips of 5 starting 5 pixels out on the axes.
-    /// A region whose candidate has no good view cost or more than two bad
-    /// ones extends outwards, up to twice (by 8 pixels on the diagonals,
-    /// 10 on the axes), and takes the farther region's lowest-cost pixel
-    /// if that costs less.
-    Nesp,
-}
-
 /// ACMH/ACMM parameters (the paper's values by default).
 #[derive(Debug, Clone)]
 pub struct PatchMatchOptions {
@@ -116,8 +100,6 @@ pub struct PatchMatchOptions {
     pub normal_perturbation: f32,
     /// A 5×5 median filter over the final depths (ACMH).
     pub median_filter: bool,
-    /// The candidates' sampling regions.
-    pub sampling: Sampling,
     pub seed: u32,
 }
 
@@ -142,7 +124,6 @@ impl Default for PatchMatchOptions {
             depth_perturbation: 0.02,
             normal_perturbation: 0.02,
             median_filter: true,
-            sampling: Sampling::Acmh,
             seed: 0,
         }
     }
@@ -1022,12 +1003,12 @@ impl<'a> Context<'a> {
         let ray = self.ray(x, y);
         let patch = self.ref_patch(x, y);
 
-        // Adaptive checkerboard sampling: the lowest-cost pixel of each of
+        // Adaptive checkerboard sampling: the lowest-cost plane of each of
         // the eight regions (other colour, inside the image).
-        let opt = self.options;
-        let lowest = |offsets: &mut dyn Iterator<Item = (i32, i32)>| -> Option<usize> {
+        let mut candidates: [Option<Plane>; 8] = [None; 8];
+        for (region, offsets) in sampling_regions().iter().enumerate() {
             let mut best: Option<(f32, usize)> = None;
-            for (dx, dy) in offsets {
+            for &(dx, dy) in offsets.iter() {
                 let (sx, sy) = (x as i32 + dx, y as i32 + dy);
                 if sx < 0 || sy < 0 || sx >= w as i32 || sy >= h as i32 {
                     continue;
@@ -1037,16 +1018,8 @@ impl<'a> Context<'a> {
                     best = Some((state.cost[j], j));
                 }
             }
-            best.map(|(_, j)| j)
-        };
-        let mut positions: [Option<usize>; 8] = [None; 8];
-        for (region, position) in positions.iter_mut().enumerate() {
-            *position = match opt.sampling {
-                Sampling::Acmh => lowest(&mut sampling_regions()[region].iter().copied()),
-                Sampling::Nesp => lowest(&mut nesp_region(region, 0)),
-            };
+            candidates[region] = best.map(|(_, j)| state.plane[j]);
         }
-        let mut candidates: [Option<Plane>; 8] = positions.map(|p| p.map(|j| state.plane[j]));
 
         // Per-view costs of the candidates.
         let mut photo: CostRows = [[MAX_COST; MAX_SOURCES]; 8];
@@ -1056,45 +1029,11 @@ impl<'a> Context<'a> {
                 self.view_costs(&patch, (x, y), ray, plane, (&mut photo[row], &mut geo[row]));
             }
         }
-        let t = iteration as f32;
-        if opt.sampling == Sampling::Nesp {
-            // HPM-MVS's extension, three rounds with a good-cost threshold
-            // that loosens each round. A region stops extending once its
-            // candidate has a good view cost and at most two bad ones; the
-            // first round only decides that (HPM's re-reads the base region).
-            let mut extending = [true; 8];
-            for round in 0..3 {
-                let good_cost = opt.tau0 * (-t * t * (3 - round) as f32 / opt.alpha).exp();
-                for region in 0..8 {
-                    let Some(position) = positions[region].filter(|_| extending[region]) else {
-                        extending[region] = false;
-                        continue;
-                    };
-                    let costs = &photo[region][..n];
-                    let good = costs.iter().filter(|&&c| c < good_cost).count();
-                    let bad = costs.iter().filter(|&&c| c > opt.tau1).count();
-                    if good >= 1 && bad <= 2 {
-                        extending[region] = false;
-                        continue;
-                    }
-                    if round == 0 {
-                        continue;
-                    }
-                    let Some(j) = lowest(&mut nesp_region(region, round)) else {
-                        continue;
-                    };
-                    if state.cost[j] < state.cost[position] {
-                        positions[region] = Some(j);
-                        candidates[region] = Some(state.plane[j]);
-                        let rows = (&mut photo[region], &mut geo[region]);
-                        self.view_costs(&patch, (x, y), ray, &state.plane[j], rows);
-                    }
-                }
-            }
-        }
         let current = state.plane[i];
 
         // Multi-hypothesis joint view selection over the candidates.
+        let opt = self.options;
+        let t = iteration as f32;
         let tau = opt.tau0 * (-t * t / opt.alpha).exp();
         // A view's votes: the candidates' good and bad costs in it, and the
         // confidence of the good ones.
@@ -1366,52 +1305,6 @@ fn sampling_regions() -> &'static [Vec<(i32, i32)>; 8] {
             left(&strip_up),
             right(&strip_up),
         ]
-    })
-}
-
-/// NESP's sampling region `region` in extension round `round` (0 for the
-/// base regions): staircases on the diagonals (up-left, up-right,
-/// down-right, down-left), 8 pixels moving 2 pixels out alternately along
-/// each axis, then strips on the axes (up, down, left, right), 5 pixels 2
-/// apart. Each round moves a region 8 pixels out per axis on the diagonals,
-/// 10 on the axes. Every offset has odd `dx + dy` (the other colour).
-fn nesp_region(region: usize, round: i32) -> impl Iterator<Item = (i32, i32)> {
-    // Up-left, then mirrored: (sign x, sign y, x first) per diagonal; the
-    // up-right and down-left staircases start one pixel further along x.
-    let (sx, sy) = [
-        (-1, -1),
-        (1, -1),
-        (1, 1),
-        (-1, 1),
-        (0, -1),
-        (0, 1),
-        (-1, 0),
-        (1, 0),
-    ][region];
-    let diagonal = region < 4;
-    let count = if diagonal { 8 } else { 5 };
-    (0..count).map(move |k: i32| {
-        if diagonal {
-            // Up-left and down-right start (5, 6) out and step x first;
-            // up-right and down-left start (6, 5) out and step y first.
-            let (x_first, start) = if region.is_multiple_of(2) {
-                (true, (5, 6))
-            } else {
-                (false, (6, 5))
-            };
-            let (steps_x, steps_y) = if x_first {
-                ((k + 1) / 2, k / 2)
-            } else {
-                (k / 2, (k + 1) / 2)
-            };
-            (
-                sx * (start.0 + 2 * steps_x + 8 * round),
-                sy * (start.1 + 2 * steps_y + 8 * round),
-            )
-        } else {
-            let d = 5 + 2 * k + 10 * round;
-            (sx * d, sy * d)
-        }
     })
 }
 
@@ -1710,52 +1603,6 @@ mod tests {
         let truth = plane_scene_truth(&ws, 0);
         let scores = photometric_score(&ws, 0, &PatchMatchOptions::default(), &truth);
         assert_eq!(scores[y * 64 + x], MAX_COST);
-    }
-
-    #[test]
-    fn nesp_regions_follow_hpm_mvs() {
-        let region = |r, round| nesp_region(r, round).collect::<Vec<_>>();
-        assert_eq!(
-            region(0, 0),
-            [
-                (-5, -6),
-                (-7, -6),
-                (-7, -8),
-                (-9, -8),
-                (-9, -10),
-                (-11, -10),
-                (-11, -12),
-                (-13, -12)
-            ]
-        );
-        assert_eq!(
-            region(1, 0),
-            [
-                (6, -5),
-                (6, -7),
-                (8, -7),
-                (8, -9),
-                (10, -9),
-                (10, -11),
-                (12, -11),
-                (12, -13)
-            ]
-        );
-        assert_eq!(region(2, 0)[..2], [(5, 6), (7, 6)]);
-        assert_eq!(region(3, 0)[..3], [(-6, 5), (-6, 7), (-8, 7)]);
-        assert_eq!(
-            region(4, 0),
-            [(0, -5), (0, -7), (0, -9), (0, -11), (0, -13)]
-        );
-        assert_eq!(region(7, 2)[0], (25, 0));
-        assert_eq!(region(0, 1)[0], (-13, -14));
-        for r in 0..8 {
-            for round in 0..3 {
-                for (dx, dy) in nesp_region(r, round) {
-                    assert_eq!((dx + dy).rem_euclid(2), 1, "offset ({dx}, {dy})");
-                }
-            }
-        }
     }
 
     #[test]

@@ -32,8 +32,6 @@ pub struct PlanarPriorOptions {
     pub depth_bandwidth: f32,
     /// The normal bandwidth σθ, degrees.
     pub angle_bandwidth_deg: f32,
-    /// HPM-MVS's KNN supplement for the pixels outside the triangulation.
-    pub knn_supplement: bool,
 }
 
 impl Default for PlanarPriorOptions {
@@ -45,7 +43,6 @@ impl Default for PlanarPriorOptions {
             gamma: 0.5,
             depth_bandwidth: 1.0 / 64.0,
             angle_bandwidth_deg: 5.0,
-            knn_supplement: false,
         }
     }
 }
@@ -109,8 +106,6 @@ pub fn planar_prior(view: &View, map: &DepthMap, options: &PlanarPriorOptions) -
     }
 
     let mut planes = vec![[0.0f32; 4]; w * h];
-    // Pixels inside a triangle, whether or not its plane is kept there.
-    let mut inside_any = vec![false; w * h];
     let points: Vec<Point> = corners
         .iter()
         .map(|&(x, y)| Point {
@@ -123,17 +118,15 @@ pub fn planar_prior(view: &View, map: &DepthMap, options: &PlanarPriorOptions) -
         0.6 * f64::from(view.depth_range.0),
         1.2 * f64::from(view.depth_range.1),
     );
-    // The plane through three credible pixels, `(n, rho)` with `n` facing
-    // the camera, if they span one.
-    let plane_through = |k: [usize; 3]| -> Option<[f64; 4]> {
+    for t in triangles.chunks_exact(3) {
         // The corners in the camera frame.
-        let corner = |c: usize| -> [f64; 3] {
-            let (x, y) = corners[c];
+        let corner = |k: usize| -> [f64; 3] {
+            let (x, y) = corners[t[k]];
             let d = f64::from(map.depth[y * w + x]);
             let r = ray(x as f64 + 0.5, y as f64 + 0.5);
             [r[0] * d, r[1] * d, d]
         };
-        let (a, b, c) = (corner(k[0]), corner(k[1]), corner(k[2]));
+        let (a, b, c) = (corner(0), corner(1), corner(2));
         let (u, v) = (sub(b, a), sub(c, a));
         let mut n = [
             u[1] * v[2] - u[2] * v[1],
@@ -143,26 +136,15 @@ pub fn planar_prior(view: &View, map: &DepthMap, options: &PlanarPriorOptions) -
         let norm = dot(n, n).sqrt();
         // Degenerate (or not finite): no plane.
         if norm.is_nan() || norm <= 1e-12 {
-            return None;
+            continue;
         }
         n = n.map(|v| v / norm);
         // Facing the camera: the normal points back along the rays.
         if dot(n, a) > 0.0 {
             n = n.map(|v| -v);
         }
-        Some([n[0], n[1], n[2], dot(n, a)])
-    };
-    // The plane's depth on pixel `(x, y)`'s ray.
-    let depth_at = |p: [f64; 4], x: usize, y: usize| -> Option<f64> {
-        let denom = dot([p[0], p[1], p[2]], ray(x as f64 + 0.5, y as f64 + 0.5));
-        (denom < -1e-6).then(|| p[3] / denom)
-    };
-    let as_f32 = |p: [f64; 4]| p.map(|v| v as f32);
-    for t in triangles.chunks_exact(3) {
-        let Some(through) = plane_through([t[0], t[1], t[2]]) else {
-            continue;
-        };
-        let plane = as_f32(through);
+        let rho = dot(n, a);
+        let plane = [n[0] as f32, n[1] as f32, n[2] as f32, rho as f32];
 
         // The pixels whose centres fall inside the triangle.
         let p: [(f64, f64); 3] = [0, 1, 2].map(|k| (points[t[k]].x, points[t[k]].y));
@@ -208,107 +190,14 @@ pub fn planar_prior(view: &View, map: &DepthMap, options: &PlanarPriorOptions) -
                 if !inside {
                     continue;
                 }
-                inside_any[y * w + x] = true;
-                if depth_at(through, x, y).is_some_and(|d| (depth_lo..=depth_hi).contains(&d)) {
+                let r = ray(q.0, q.1);
+                let denom = dot(n, r);
+                if denom >= -1e-6 {
+                    continue;
+                }
+                let depth = rho / denom;
+                if (depth_lo..=depth_hi).contains(&depth) {
                     planes[y * w + x] = plane;
-                }
-            }
-        }
-    }
-
-    // HPM-MVS's KNN supplement: a pixel outside every triangle takes the
-    // plane of the first three of its six nearest credible pixels (the
-    // nearest first) that are not collinear, if its depth there is within
-    // the view's depth range.
-    if options.knn_supplement && corners.len() >= 3 {
-        let (bw, bh) = (w.div_ceil(block), h.div_ceil(block));
-        // The credible pixel of each block, if any.
-        let mut grid = vec![usize::MAX; bw * bh];
-        for (k, &(x, y)) in corners.iter().enumerate() {
-            grid[(y / block) * bw + x / block] = k;
-        }
-        let range = (f64::from(view.depth_range.0), f64::from(view.depth_range.1));
-        const TRIPLES: [[usize; 3]; 20] = [
-            [0, 1, 2],
-            [0, 1, 3],
-            [0, 1, 4],
-            [0, 2, 3],
-            [0, 2, 4],
-            [0, 3, 4],
-            [1, 2, 3],
-            [1, 2, 4],
-            [1, 3, 4],
-            [2, 3, 4],
-            [0, 1, 5],
-            [0, 2, 5],
-            [0, 3, 5],
-            [0, 4, 5],
-            [1, 2, 5],
-            [1, 3, 5],
-            [1, 4, 5],
-            [2, 3, 5],
-            [2, 4, 5],
-            [3, 4, 5],
-        ];
-        let mut near: Vec<(f64, usize)> = Vec::with_capacity(64);
-        for y in 0..h {
-            for x in 0..w {
-                if inside_any[y * w + x] {
-                    continue;
-                }
-                // Rings of blocks around the pixel's, until the six nearest
-                // are known: a credible pixel in ring r is at least
-                // (r - 1) blocks away.
-                near.clear();
-                let (cx, cy) = ((x / block) as i64, (y / block) as i64);
-                let q = (x as f64 + 0.5, y as f64 + 0.5);
-                for r in 0i64.. {
-                    if near.len() >= 6 {
-                        near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                        let reach = ((r - 1).max(0) * block as i64) as f64;
-                        if near[5].0 <= reach * reach {
-                            break;
-                        }
-                    }
-                    if r > bw.max(bh) as i64 {
-                        break;
-                    }
-                    for gy in (cy - r)..=(cy + r) {
-                        for gx in (cx - r)..=(cx + r) {
-                            let on_ring = (gy - cy).abs() == r || (gx - cx).abs() == r;
-                            if !on_ring || gx < 0 || gy < 0 || gx >= bw as i64 || gy >= bh as i64 {
-                                continue;
-                            }
-                            let k = grid[gy as usize * bw + gx as usize];
-                            if k == usize::MAX {
-                                continue;
-                            }
-                            let pk = &points[k];
-                            let d2 = (pk.x - q.0).powi(2) + (pk.y - q.1).powi(2);
-                            near.push((d2, k));
-                        }
-                    }
-                }
-                near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                if near.len() < 3 {
-                    continue;
-                }
-                let found = near.len().min(6);
-                let collinear = |t: [usize; 3]| {
-                    let p = t.map(|i| (points[near[i].1].x, points[near[i].1].y));
-                    edge(p[0], p[1], p[2]) == 0.0
-                };
-                let Some(t) = TRIPLES
-                    .iter()
-                    .find(|t| t.iter().all(|&i| i < found) && !collinear(**t))
-                else {
-                    continue;
-                };
-                let Some(p) = plane_through(t.map(|i| near[i].1)) else {
-                    continue;
-                };
-                if depth_at(p, x, y).is_some_and(|d| (range.0..=range.1).contains(&d)) {
-                    planes[y * w + x] = as_f32(p);
                 }
             }
         }
@@ -394,28 +283,6 @@ mod tests {
                     "({x}, {y}): {depth} vs {}",
                     truth.depth[i]
                 );
-            }
-        }
-        // With HPM-MVS's KNN supplement the pixels outside the hull (the
-        // last columns and rows) get the plane too.
-        let knn = PlanarPriorOptions {
-            knn_supplement: true,
-            ..PlanarPriorOptions::default()
-        };
-        let supplemented = planar_prior(view, &truth, &knn);
-        assert_eq!(supplemented.covered(), w * h);
-        for i in 0..w * h {
-            let (x, y) = (i % w, i / w);
-            let p = supplemented.plane(i).unwrap();
-            let ray = [
-                (x as f32 + 0.5 - view.cx as f32) / view.fx as f32,
-                (y as f32 + 0.5 - view.cy as f32) / view.fy as f32,
-                1.0,
-            ];
-            let depth = p[3] / (p[0] * ray[0] + p[1] * ray[1] + p[2] * ray[2]);
-            assert!((depth - truth.depth[i]).abs() < 1e-3 * truth.depth[i]);
-            if prior.plane(i).is_some() {
-                assert_eq!(supplemented.planes[i], prior.planes[i]);
             }
         }
         // No credible pixel, no prior.

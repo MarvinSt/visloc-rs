@@ -270,6 +270,31 @@ without the prior, with the same fusion.
 - **Time:** 76 minutes, 1.2 times the single-scale run. Peak memory
   28.7 GiB (facade), 12.4 GiB since the maps are released as they go.
 
+### Tried and not adopted: HPM-MVS's sampling and KNN prior
+
+Two parts of HPM-MVS (C. Ren et al., ICCV 2023), each added alone to the
+default pipeline, on pipes and meadow pre-resized to 800 px (CPU, F1 at
+2 cm):
+
+| Run | pipes | meadow |
+|---|---|---|
+| One scale | 59.0% | 52.3% |
+| One scale, NESP sampling | 61.5% | 49.1% |
+| Three scales (the default) | 61.5% | 61.0% |
+| Three scales, NESP sampling | 62.0% | 49.0% |
+| Three scales, KNN prior supplement | 61.5% | 59.3% |
+
+- **NESP** (non-local extensible sampling): candidates from staircases and
+  strips starting 5 pixels out, extended outwards where a candidate
+  matches badly. It helps pipes and costs meadow up to 12 points of
+  completeness-driven F1: no candidate comes from the nearest pixels.
+- **KNN prior supplement:** pixels outside the triangulation take a plane
+  through three of their six nearest credible pixels. It covers 1 to 2%
+  more pixels, mostly with planes that are wrong there.
+
+HPM-MVS pairs them with priors built at three scales in a single-scale
+estimation; neither part alone pays here.
+
 ### Fusion settings
 
 The same depth maps fused with different rules (CPU runs with one

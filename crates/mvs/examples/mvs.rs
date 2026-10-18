@@ -7,8 +7,8 @@
 //!     --sparse <dir with cameras.txt/images.txt/points3D.txt> \
 //!     --images <image dir> --out <dir> [--max-image-size 3200] \
 //!     [--sources 10] [--iterations 3] [--geom-passes 2] [--scales 3] [--gpu] \
-//!     [--view-selection confidence|sampled] [--init-top-k 3] [--sampling acmh|nesp] \
-//!     [--restorer infinity|start|off] [--detail-threshold 0.1] [--no-planar-prior] [--knn-prior] \
+//!     [--view-selection confidence|sampled] [--init-top-k 3] \
+//!     [--restorer infinity|start|off] [--detail-threshold 0.1] [--no-planar-prior] \
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 10] \
 //!     [--min-mean-consistency 0] [--no-average]
@@ -25,7 +25,7 @@ use std::time::Instant;
 use visloc_mvs::{
     estimate, estimate_from, estimate_with_prior, fuse, geometric_pass, multi_scale_depth_maps,
     planar_prior_pass, read_text_model, write_ply, DepthMap, DetailRestorer, Estimator,
-    FusionOptions, MultiScaleOptions, PatchMatchOptions, PlanarPrior, PlanarPriorOptions, Sampling,
+    FusionOptions, MultiScaleOptions, PatchMatchOptions, PlanarPrior, PlanarPriorOptions,
     ViewSelection, Workspace, WorkspaceOptions,
 };
 
@@ -45,7 +45,7 @@ fn main() {
     let mut save_maps = false;
     let mut load_maps = false;
     let mut planar_prior = None;
-    let mut prior_options = PlanarPriorOptions::default();
+    let prior_options = PlanarPriorOptions::default();
     let mut fusion_options = fusion_options;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -65,13 +65,6 @@ fn main() {
                 }
             }
             "--init-top-k" => pm_options.init_top_k = value().parse().unwrap(),
-            "--sampling" => {
-                pm_options.sampling = match value().as_str() {
-                    "acmh" => Sampling::Acmh,
-                    "nesp" => Sampling::Nesp,
-                    other => panic!("--sampling: acmh or nesp, not {other}"),
-                }
-            }
             "--geom-passes" => geom_passes = value().parse().unwrap(),
             "--scales" => scales = value().parse().unwrap(),
             "--restorer" => restorer = value(),
@@ -79,7 +72,6 @@ fn main() {
             "--gpu" => use_gpu = true,
             "--planar-prior" => planar_prior = Some(true),
             "--no-planar-prior" => planar_prior = Some(false),
-            "--knn-prior" => prior_options.knn_supplement = true,
             "--save-depth" => save_depth = true,
             "--save-maps" => save_maps = true,
             "--load-maps" => load_maps = true,

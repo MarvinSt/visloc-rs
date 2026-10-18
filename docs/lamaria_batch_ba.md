@@ -54,6 +54,10 @@ sequence. It uses no ground truth.
    observation still 3 px off is almost always a wrong match. Huber alone
    lets each such observation pull like a 2 px residual; the 1–2 % of them
    bend the trajectory against the IMU (see [Results](#results)).
+
+   A solve runs at most 60 iterations (`--iterations`) and stops earlier
+   once an iteration lowers the cost by less than 1e-7 of it (`--rel-tol`);
+   see [Iterations](#iterations).
 6. **Output.** The VIO's per-frame trajectory, each frame moved by the
    correction of the surrounding keyframes (interpolated).
 7. **Revisits (optional).** `loops` matches places visited again, and
@@ -695,12 +699,16 @@ platform). Final CP Score (pose recall at 1 m):
 
 | Track | Sequence | VIO | Batch BA | Sequence | VIO | Batch BA | Mean |
 |---|---|---:|---:|---|---:|---:|---:|
-| Short | sequence_1_19 | 71.96 | 83.15 (93.4 %) | sequence_1_20 | 38.32 | 46.31 (22.2 %) | 64.73 |
-| Medium | sequence_2_11 | 49.68 | 83.83 (99.3 %) | sequence_2_12 | 18.03 | 20.81 (0.0 %) | 52.32 |
-| Long | sequence_3_17 | 50.06 | 65.41 (61.7 %) | sequence_3_18 | 34.68 | 34.75 (8.7 %) | 50.08 |
-| Low light | sequence_4_10 | 38.99 | 67.81 (68.4 %) | sequence_4_11 | 36.37 | 56.49 (37.6 %) | 62.15 |
-| Moving platform | sequence_5_11 | 43.14 | 57.17 | sequence_5_12 | 4.98 | 6.37 | 31.77 |
-| **Mean** | | | **71.47** | | | 32.95 | **52.21** |
+| Short | sequence_1_19 | 71.96 | 88.16 (95.8 %) | sequence_1_20 | 38.32 | 49.00 (27.8 %) | 68.58 |
+| Medium | sequence_2_11 | 49.68 | 85.46 (99.5 %) | sequence_2_12 | 18.03 | 20.81 (0.0 %)¹ | 53.14 |
+| Long | sequence_3_17 | 50.06 | 71.43 (72.3 %) | sequence_3_18 | 34.68 | 36.13 (8.5 %) | 53.78 |
+| Low light | sequence_4_10 | 38.99 | 67.81 (68.4 %)² | sequence_4_11 | 36.37 | 56.49 (37.6 %)² | 62.15 |
+| Moving platform | sequence_5_11 | 43.14 | 60.32 | sequence_5_12 | 4.98 | 7.73 | 34.03 |
+| **Mean** | | | **74.64** | | | 34.03 | **54.34** |
+
+¹ 30 iterations per solve (its features are no longer on disk). ² 30
+iterations per solve, as recommended in low light (see
+[Iterations](#iterations)).
 
 The first sequence of each track is the one the method was developed on.
 On the second ones the BA gains far less. sequence_2_12, 3_18 and 1_20 keep
@@ -715,6 +723,49 @@ line, while the solve rises 9.6 m and runs 128 m. After that, its
 control-point-to-control-point distances agree to 0–6 % for 15 minutes. The
 first control point is 153 m off after the Sim(3) fit and the others 2–36 m,
 until the last four minutes, where the solve runs 22–51 % too far.
+
+The platform is a tram. From 75 s to 165 s the walking signature leaves the
+accelerometer (the standard deviation of its norm falls from 1–4 to
+0.13–0.34 m/s²), and the images show a tram's windows, ceiling and seats.
+There, the solve's speed falls from 2.4 m/s to 1.2 m/s. Unguided matches
+between consecutive keyframes split cleanly. On cam1, 100–224 of 300–500 are
+explained by the gyroscope's rotation alone within 2 px: the cabin. An
+essential matrix on the rest points the outside motion within 2–10° of the
+solve's direction, so the direction holds and the speed does not. Starts
+whose ride is 1.5, 2 and 2.5 times as fast end 2,000–3,200 lower in cost
+than the VIO start (first solve), but score 5.21, 4.44 and 3.67 against
+6.53. The first control point comes closer (153 → 102 m at twice the speed),
+while the others drift too.
+
+### Iterations
+
+The solves used to stop at 30 iterations, most of them while the cost still
+fell by 20–150 per iteration. At 60 (and `--rel-tol 1e-7`), in both solves
+of the pipeline, final CP Score (pose recall at 1 m):
+
+| Sequence | 30 iterations | 60 iterations |
+|---|---:|---:|
+| sequence_1_19 | 83.15 (93.4 %) | **88.16** (**95.8 %**) |
+| sequence_1_20 | 46.31 (22.2 %) | **49.00** (**27.8 %**) |
+| sequence_2_11 | 83.83 (99.3 %) | **85.46** (**99.5 %**) |
+| sequence_3_17 | 65.41 (61.7 %) | **71.43** (**72.3 %**) |
+| sequence_3_18 | 34.75 (8.7 %) | **36.13** (8.5 %) |
+| sequence_4_10 | **67.81** (**68.4 %**) | 58.90 (43.1 %) |
+| sequence_4_11 | **56.49** (**37.6 %**) | 52.27 (30.9 %) |
+| sequence_5_11 | 57.17 | **60.32** |
+| sequence_5_12 | 6.37 | **7.73** |
+
+The extra iterations lower the cost by a few hundred at most (sequence_4_10,
+first solve: 69,862 → 69,717, with 40 observations fewer), and yet move the
+score by up to 9 points. They move the solution along the nearly flat
+directions of a slow heading and scale drift. On sequence_4_10 the heading
+error of the last 300 s grows from +1.1° to +1.8°. The seven day and
+moving-platform sequences gain 1.4–6.0 points, the two low-light ones lose
+4.2 and 8.9, where vision holds those directions least. 60 iterations are
+the default; in low light the pipeline keeps 30 (`--iterations 30 --rel-tol
+1e-5`). The second solve alone at 60 iterations, from the first solve's
+30, scored 70.08 on sequence_4_10, so the first solve is where the extra
+iterations hurt there.
 
 ### What is left on sequence_3_17
 
@@ -1053,13 +1104,15 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
 - **Recommended.** The [table above](#with-the-focal-lengths-the-keypoint-sizes-and-denoising)
   uses `--est-focal --sigma-size 2.7 --sigma-size-pow 0.35` in both solves,
   `features --clahe --denoise 7` in low light, and no `--est-focal` on the
-  moving platform.
+  moving platform. In low light, both solves also take `--iterations 30
+  --rel-tol 1e-5` (see [Iterations](#iterations)).
 - **Cost.** On this 4-core container, a 15-minute sequence takes about
   15 min for the features (2 processes; non-local means adds about as much)
   and 2–7 min for the matching (with numba). The solve uses
   `NUMBA_NUM_THREADS` threads for the reprojection terms and the BLAS
   threads for the banded factor: on the 20-minute sequence_2_11 the first
   solve takes 269 s on one thread and 181 s on four (the same result), the
-  second solve with the revisits 483 s on four. `loops` takes 3–6 min with
+  second solve with the revisits 483 s on four, at 30 iterations; the
+  default 60 take up to twice as long. `loops` takes 3–6 min with
   four processes and `loop-correct` a minute. sequence_3_17's solves need
   about 6.5 GB of memory.

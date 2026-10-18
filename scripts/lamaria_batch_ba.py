@@ -1869,8 +1869,8 @@ def main():
     s.add_argument("--max-size-ratio", type=float, default=0.0,
                    help="drop matches whose keypoint sizes differ by more than this factor (0: keep all)")
     s.add_argument("--huber", type=float, default=2.0, help="Huber threshold in sigmas")
-    s.add_argument("--iterations", type=int, default=30)
-    s.add_argument("--rel-tol", type=float, default=1e-5)
+    s.add_argument("--iterations", type=int, default=60)
+    s.add_argument("--rel-tol", type=float, default=1e-7, help="stop once an iteration lowers the cost less")
     s.add_argument("--lambda0", type=float, default=1e-4)
     s.add_argument("--outlier-px", type=float, default=10.0,
                    help="each iteration drops observations whose error exceeds this (0: keep all)")

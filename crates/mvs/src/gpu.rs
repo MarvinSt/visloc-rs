@@ -8,7 +8,8 @@ use bytemuck::{Pod, Zeroable};
 use visloc_gsplat_render::{GpuContext, GpuError};
 
 use crate::patch_match::{
-    finish_depth_map, DepthMap, PatchMatchOptions, ViewSelection, MAX_COST, MAX_SOURCES,
+    finish_depth_map, DepthMap, DetailRestorer, PatchMatchOptions, ViewSelection, MAX_COST,
+    MAX_SOURCES,
 };
 use crate::planar_prior::{PlanarPrior, PlanarPriorOptions};
 use crate::workspace::{luma, Workspace};
@@ -49,12 +50,20 @@ struct Params {
     view_selection: u32,
     inv_texture_width: f32,
     inv_texture_height: f32,
-    /// 1 in the planar prior pass, with its posterior's terms.
+    /// 1 in the planar prior pass, with its posterior's terms and its
+    /// bandwidths.
     planar_prior: u32,
     prior_inv_alpha: f32,
     prior_gamma: f32,
     prior_depth_weight: f32,
     prior_angle_weight: f32,
+    prior_depth_sigma: f32,
+    prior_angle_sigma: f32,
+    /// The detail restorer: 0 [`DetailRestorer::Off`], 1
+    /// [`DetailRestorer::Start`], 2 [`DetailRestorer::Infinity`]; its
+    /// margin.
+    restore: u32,
+    restore_margin: f32,
 }
 
 /// A source view as the shader reads it (`Source`).
@@ -127,7 +136,20 @@ impl GpuPatchMatch {
         prior: Option<&[DepthMap]>,
     ) -> DepthMap {
         let start = prior.map(|maps| &maps[view]);
-        let (planes, costs) = self.run(ws, view, options, prior, start, None);
+        let (planes, costs) = self.run(ws, view, options, prior, start, None, DetailRestorer::Off);
+        finish_depth_map(&ws.views[view], &planes, costs, options)
+    }
+
+    /// [`crate::patch_match::estimate_from`] on the GPU.
+    pub fn estimate_from(
+        &self,
+        ws: &Workspace,
+        view: usize,
+        options: &PatchMatchOptions,
+        start: &DepthMap,
+        restorer: DetailRestorer,
+    ) -> DepthMap {
+        let (planes, costs) = self.run(ws, view, options, None, Some(start), None, restorer);
         finish_depth_map(&ws.views[view], &planes, costs, options)
     }
 
@@ -148,6 +170,7 @@ impl GpuPatchMatch {
             None,
             Some(start),
             Some((prior_options, prior)),
+            DetailRestorer::Off,
         );
         finish_depth_map(&ws.views[view], &planes, costs, options)
     }
@@ -165,7 +188,15 @@ impl GpuPatchMatch {
             iterations: 0,
             ..options.clone()
         };
-        let (_, mut costs) = self.run(ws, view, &first_pass, None, Some(map), None);
+        let (_, mut costs) = self.run(
+            ws,
+            view,
+            &first_pass,
+            None,
+            Some(map),
+            None,
+            DetailRestorer::Off,
+        );
         for (cost, &depth) in costs.iter_mut().zip(&map.depth) {
             if depth <= 0.0 {
                 *cost = MAX_COST;
@@ -178,7 +209,9 @@ impl GpuPatchMatch {
     /// iterations, starting from `start`'s planes (random ones where it
     /// has no depth, or everywhere without it), with geometric consistency
     /// against `prior`, or as the planar prior pass with `planar`'s prior
-    /// (where `start`'s cost is not credible, from the prior's plane).
+    /// (where `start`'s cost is not credible, from the prior's plane), and
+    /// `restorer` deciding which pixels may leave their start plane.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         ws: &Workspace,
@@ -187,6 +220,7 @@ impl GpuPatchMatch {
         prior: Option<&[DepthMap]>,
         start: Option<&DepthMap>,
         planar: Option<(&PlanarPriorOptions, &PlanarPrior)>,
+        restorer: DetailRestorer,
     ) -> (Vec<[f32; 4]>, Vec<f32>) {
         let device = &self.ctx.device;
         let queue = &self.ctx.queue;
@@ -352,6 +386,19 @@ impl GpuPatchMatch {
                 let sigma = o.angle_bandwidth_deg.to_radians();
                 1.0 / (2.0 * sigma * sigma)
             }),
+            prior_depth_sigma: planar.map_or(0.0, |(o, _)| {
+                o.depth_bandwidth * (reference.depth_range.1 - reference.depth_range.0)
+            }),
+            prior_angle_sigma: planar.map_or(0.0, |(o, _)| o.angle_bandwidth_deg.to_radians()),
+            restore: match restorer {
+                DetailRestorer::Off => 0,
+                DetailRestorer::Start(_) => 1,
+                DetailRestorer::Infinity(_) => 2,
+            },
+            restore_margin: match restorer {
+                DetailRestorer::Off => 0.0,
+                DetailRestorer::Start(margin) | DetailRestorer::Infinity(margin) => margin,
+            },
         };
         // Slot 0 for `init`, then one per (iteration, colour).
         let slots = 1 + 2 * options.iterations;
@@ -421,6 +468,10 @@ impl GpuPatchMatch {
         let prior_planes_buf = match planar {
             Some((_, planar)) => storage("mvs-prior-planes", bytemuck::cast_slice(&planar.planes)),
             None => zeroed("mvs-prior-planes", 16),
+        };
+        let pre_costs_buf = match restorer {
+            DetailRestorer::Off => zeroed("mvs-pre-costs", 16),
+            _ => zeroed("mvs-pre-costs", w * h * 4),
         };
         let texture_size = wgpu::Extent3d {
             width: texture_width as u32,
@@ -501,6 +552,7 @@ impl GpuPatchMatch {
                     binding: 9,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
+                entry(11, &pre_costs_buf),
             ],
         });
         let propagate_groups: Vec<wgpu::BindGroup> = (1..slots)
@@ -525,6 +577,7 @@ impl GpuPatchMatch {
                             resource: wgpu::BindingResource::Sampler(&sampler),
                         },
                         entry(10, &prior_planes_buf),
+                        entry(11, &pre_costs_buf),
                     ],
                 })
             })
@@ -680,6 +733,34 @@ mod tests {
             };
             check(&gpu, &ws, &options);
         }
+    }
+
+    /// The detail restorer on the GPU as on the CPU (`patch_match`'s test):
+    /// from a start 2% too deep, the restorer against the start's cost keeps
+    /// it, the one against the plane at infinity re-estimates.
+    #[test]
+    fn gpu_restorer_matches_the_cpu() {
+        let Some(ctx) = visloc_gsplat_render::try_context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let gpu = GpuPatchMatch::with_context(ctx);
+        let ws = plane_scene();
+        let truth = plane_scene_truth(&ws, 0);
+        let mut start = truth.clone();
+        start.depth.iter_mut().for_each(|d| *d *= 1.02);
+        let options = PatchMatchOptions::default();
+        let inside: Vec<usize> = (8..40)
+            .flat_map(|y| (12..52).map(move |x| y * 64 + x))
+            .collect();
+        let error = |restorer| {
+            let map = gpu.estimate_from(&ws, 0, &options, &start, restorer);
+            mean_relative_error(&map, &truth, &inside)
+        };
+        let kept = error(DetailRestorer::Start(0.1));
+        assert!(kept > 0.015, "against the start: {kept}");
+        let error = error(DetailRestorer::Infinity(0.1));
+        assert!(error < 0.002, "against infinity: {error}");
     }
 
     #[test]

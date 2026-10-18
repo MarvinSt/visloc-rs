@@ -48,12 +48,19 @@ struct Params {
     inv_texture_width: f32,
     inv_texture_height: f32,
     // 1: ACMP's planar prior pass (`prior_planes`); its posterior's terms:
-    // 1 / alpha, gamma, 1 / (2 sigma_depth^2), 1 / (2 sigma_angle^2).
+    // 1 / alpha, gamma, 1 / (2 sigma_depth^2), 1 / (2 sigma_angle^2), and
+    // sigma_depth and sigma_angle (radians) for the refinement's draws.
     planar_prior: u32,
     prior_inv_alpha: f32,
     prior_gamma: f32,
     prior_depth_weight: f32,
     prior_angle_weight: f32,
+    prior_depth_sigma: f32,
+    prior_angle_sigma: f32,
+    // The detail restorer: 0 off; 1 against the start plane's cost; 2
+    // against the plane at infinity's (`pre_costs`), with this margin.
+    restore: u32,
+    restore_margin: f32,
 }
 
 // Reference camera frame to source camera frame: rows of R with t in w.
@@ -87,6 +94,9 @@ struct Source {
 // `propagate` in the planar prior pass: per pixel, the prior plane
 // `(n.xyz, rho)`, all zeros for none.
 @group(0) @binding(10) var<storage, read> prior_planes: array<vec4<f32>>;
+// The detail restorer's baseline costs, from `init`: a pixel takes a new
+// plane only if its cost is below its baseline by `restore_margin`.
+@group(0) @binding(11) var<storage, read_write> pre_costs: array<f32>;
 
 // The reference window of the current pixel, row by row.
 var<private> patch_values: array<f32, 64>;
@@ -397,6 +407,12 @@ fn init(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         best_views[i] = NO_VIEW;
     }
+    if (params.restore == 1u) {
+        pre_costs[i] = costs[i];
+    } else if (params.restore == 2u) {
+        // With no normal, a plane's homography is the rotation's.
+        pre_costs[i] = top_k_cost(x, y, ray, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+    }
 }
 
 // Hypotheses rank by cost, or by ACMP's posterior where the planar prior
@@ -660,6 +676,7 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         best_cost = agg_w[8] / weight_sum;
     }
+    let current_cost = best_cost;
     var best_score = hypothesis_score(best_cost, best_plane, ray, prior_plane, prior_depth);
     var adopted = false;
     for (var r = 0u; r < 8u; r++) {
@@ -681,15 +698,23 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Refinement.
+    // Refinement; with a prior, the random depth and normal are drawn
+    // around it.
     rng_init(x, y, params.iteration * 2u + params.color);
     var depth_now = plane_depth(best_plane, ray);
     if (depth_now <= 0.0) {
         depth_now = 0.5 * (params.depth_min + params.depth_max);
     }
     let normal_now = best_plane.xyz;
-    let depth_random = params.depth_min + uniform01() * (params.depth_max - params.depth_min);
-    let normal_random = random_normal(ray);
+    var depth_random: f32;
+    var normal_random: vec3<f32>;
+    if (prior_depth > 0.0) {
+        depth_random = prior_depth + (uniform01() - 0.5) * 6.0 * params.prior_depth_sigma;
+        normal_random = perturb_normal(prior_plane.xyz, ray, params.prior_angle_sigma);
+    } else {
+        depth_random = params.depth_min + uniform01() * (params.depth_max - params.depth_min);
+        normal_random = random_normal(ray);
+    }
     let depth_perturbed = depth_now * (1.0 + (uniform01() - 0.5) * params.depth_perturbation);
     let normal_perturbed = perturb_normal(normal_now, ray, params.normal_perturbation);
     for (var hyp = 0u; hyp < 6u; hyp++) {
@@ -722,6 +747,10 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
             best_score = s;
             best_plane = plane;
         }
+    }
+    if (params.restore != 0u && best_cost >= pre_costs[i] - params.restore_margin) {
+        best_plane = current;
+        best_cost = current_cost;
     }
     planes[i] = best_plane;
     costs[i] = best_cost;

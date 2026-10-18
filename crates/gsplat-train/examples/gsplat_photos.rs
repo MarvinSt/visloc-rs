@@ -3,6 +3,7 @@
 //! ```text
 //! cargo run --release -p visloc-gsplat-train --features gpu,euroc --example gsplat_photos -- \
 //!     --images <folder> --out <work dir> [--steps 30000] [--max-size 1600] [--focal PX] \
+//!     [--principal-point CX,CY] \
 //!     [--no-mesh] [--normal-weight 0.005] [--appearance] [--exhaustive-max 300] [--window 20]
 //!     [--retrieval 30] [--max-keypoints 8192] [--sift-opt key=value ...] [--match-f32] [--mask-black 12]
 //!     [--cpu] [--cpu-sift] [--no-complete-model] [--gpu-ba]
@@ -49,6 +50,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--steps" => steps = next()?.parse()?,
             "--max-size" => sfm.max_size = next()?.parse()?,
             "--focal" => sfm.focal_px = Some(next()?.parse()?),
+            "--principal-point" => {
+                let value = next()?;
+                let (x, y) = value
+                    .split_once(',')
+                    .ok_or("--principal-point takes CX,CY")?;
+                sfm.principal_point = Some((x.trim().parse()?, y.trim().parse()?));
+            }
             "--no-refine-intrinsics" => sfm.refine_intrinsics = false,
             // Skip the final intrinsics refinement above this many
             // registered photos (default: never).

@@ -320,13 +320,89 @@ alignment (visloc-rs / COLMAP), and the SfM + MVS times:
 - **Meadow** defeats both SfMs: visloc-rs registers all 15 images but
   triangulates 850 points and leaves a 2.7 cm median centre error (one
   image 9 cm off); COLMAP registers 14, one 23 cm off. With 16384
-  keypoints instead of 8192 visloc-rs keeps a 25 cm outlier.
+  keypoints instead of 8192 visloc-rs keeps a 25 cm outlier. Its sparse
+  points lie in a band along the barrack's wall (none on the grass, roof
+  or trees), which leaves the relative rotations about 0.09° off the
+  ground truth (pipes: 0.04°). DSC_6541, looking along the wall, comes
+  out 1.15° off in both SfMs: its posts and gutter repeat bay after bay,
+  and matches one bay apart agree with a slightly wrong pose (82 of its
+  268 matches with DSC_6540). The 26.0% above is also one unlucky run.
+  The same command on a software Vulkan device instead of the L4 (852
+  points against 850) gave a 1.3 cm median centre error, and r46
+  (`65ad452`, an L4) fused that model at 3200 px:
+
+  | Poses | Camera-centre Sim(3) | Then ICP onto the scan |
+  |---|---|---|
+  | Ground truth | 75.2% | 74.4% |
+  | visloc-rs SfM (that run) | 58.8% | 70.3% |
+  | pycolmap 4.2.1 SfM (CPU SIFT, 14 images) | 68.6% | 71.4% |
+
+  Fusion's reprojection limit does not matter: 3, 4 or 8 px instead of
+  2 px change F1 by less than 0.2 point for every pose set. The camera
+  centres, almost in one horizontal plane with one 22 cm outlier, fix the
+  alignment's tilt poorly. ICP moves the visloc-rs cloud by 0.13° and
+  3.1 cm (COLMAP's by 0.07° and 1.2 cm, the ground truth's by 0.02° and
+  3 mm). Aligned by the scan, the SfM poses lose about 4 to 5 points to
+  the ground truth on meadow.
 - **Tools for a next run:** `scripts/eth3d_one_camera.py` resamples a
   scene's images onto its most used camera (`K K_i^-1`, exact for pinhole
   images: patches at the moved observations match with NCC 0.997), and
   `scripts/eth3d_icp_align.py` refines the alignment by ICP against the
   scan; on pipes the latter moves a ground-truth-pose cloud by 1.8 mm
   (F1 74.8% → 74.4% at 1600 px), so it measures little beyond noise there.
+
+### End to end again: one camera per scene, and ICP
+
+r47 (L4, commit `9f2b115`) repeated r39a's run on all 13 scenes with two
+changes. Scenes with several cameras were first resampled onto their
+most used camera (`scripts/eth3d_one_camera.py`). Every cloud was scored
+both as aligned by the camera centres and after ICP onto the scan
+(`scripts/eth3d_icp_align.py`), the way Tanks and Temples refines its
+alignment. The table gives F1 at 2 cm with visloc-mvs's defaults; r39a's
+column is its own run.
+
+| Scene | Cameras (images resampled) | Ground-truth poses | r39a | r47 | r47, ICP | ICP's move | Centre error median / max |
+|---|---|---|---|---|---|---|---|
+| pipes | 1 | 84.1% | 89.3% | 88.5% | 88.6% | 0.06°, 1.3 mm | 0.11 / 0.4 cm |
+| meadow | 1 | 75.2% | 26.0% | 25.5% | 47.2% | 1.09°, 98 mm | 2.70 / 9.5 cm |
+| terrace | 4 (15) | 91.2% | 90.0% | 91.2% | 90.4% | 0.07°, 5.3 mm | 0.19 / 0.5 cm |
+| office | 1 | 80.2% | 76.5% | 78.1% | 78.4% | 0.17°, 6.3 mm | 0.18 / 0.8 cm |
+| kicker | 1 | 83.8% | 80.3% | 81.8% | 82.0% | 0.10°, 6.0 mm | 0.32 / 132 cm |
+| relief | 1 | 88.2% | 85.1% | 85.4% | 86.0% | 0.02°, 1.4 mm | 0.11 / 0.3 cm |
+| relief 2 | 1 | 87.0% | 83.7% | 84.3% | – | – | 0.10 / 0.2 cm |
+| courtyard | 4 (15) | 90.2% | 85.0% | 90.1% | 89.3% | 0.03°, 4.6 mm | 0.40 / 1.7 cm |
+| playground | 5 (27) | 69.5% | 60.4% | 61.2% | 62.3% | 0.04°, 1.7 mm | 0.16 / 0.4 cm |
+| terrains | 2 (18) | 91.4% | 86.6% | 90.8% | 91.3% | 0.02°, 0.4 mm | 0.11 / 0.2 cm |
+| delivery area | 1 | 90.3% | 83.9% | 84.2% | 86.6% | 0.02°, 5.8 mm | 0.30 / 0.5 cm |
+| electro | 6 (29) | 89.5% | 80.5% | 75.4% | 77.0% | 0.02°, 2.5 mm | 0.15 / 5.8 cm |
+| facade | 5 (27) | 67.3% | 61.0% | 49.0% | 64.2% | 0.04°, 12.2 mm | 1.34 / 4.6 cm |
+
+- **Means:**
+  - over the 13 scenes, 75.8% against the ground-truth poses' 83.7%;
+  - over the 12 with an ICP score (relief 2's scan holds non-finite
+    points, which r47's script did not skip), 75.1% and 78.6% after ICP.
+- **The SfM is deterministic on one GPU.** Fused with r39a's rule (no
+  mean-consistency check), the seven one-camera scenes give r39a's F1 to
+  the tenth.
+- **One camera per scene helps four of the six multi-camera scenes and
+  hurts two.** With r39a's rule:
+  - helped: courtyard 85.0% → 90.2%, terrains 86.6% → 90.5%, terrace
+    90.0% → 91.1%, playground 60.4% → 60.7%;
+  - hurt: electro 80.5% → 75.2% (four images 1.6 to 5.8 cm and 0.2 to
+    0.3° off) and facade 61.0% → 49.2% (median centre error 1.34 cm
+    against 0.98).
+  - The change of images changes the SfM run. Its gain on the camera
+    model is lost in the run-to-run spread on these two.
+- **ICP moves most clouds by millimetres and a few hundredths of a
+  degree.** Where it moves more, the camera-centre Sim(3) is the
+  weakness:
+  - meadow (above) moves 1.09°. The cameras' orientations put the
+    centres' fit 1.05° off (`align_colmap_model.py --rotations`).
+  - facade moves 12 mm and gains 15 points.
+- **kicker registers its last image 66° and 1.3 m off**, and stays 2
+  points under its ground-truth-pose F1. The structure-less registration
+  is now checked against the tracks it continues, which refuses that
+  image ([eth3d_auc_benchmark.md](eth3d_auc_benchmark.md#checking-structure-less-registrations)).
 
 ### Against ACMMP on the same GPU
 

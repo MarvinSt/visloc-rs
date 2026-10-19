@@ -121,6 +121,20 @@ All notable changes to `visloc-rs` will be documented here.
     2.93 against a rig scale of 3.57, so object captures keep their
     defaults.
 
+- **COLMAP-port mapper: structure-less registrations far off.** One whose
+  matches nearly all go to one registered image fixes the pose poorly.
+  GR6P RANSAC can then settle on a rival pose almost as well supported:
+  on an L4, ETH3D kicker's DSC_6487 came out 66° and 1.3 m off (r47), and
+  electro's images up to 3.2 m off on COLMAP's matches.
+  `MapperOptions::structure_less_min_verified` (0 by default; the photo
+  and EuRoC pipelines set 10) refuses the registration unless that many
+  of the tracks its inliers continue reproject within
+  `abs_pose_max_error`, and at least 70% of them. Over the 13 scenes'
+  replays only kicker, electro and meadow change. Their largest camera
+  errors fall from 1.5 m, 3.2 m and 26 cm to 1.0 cm, 5.5 cm and 15 cm,
+  for one to five fewer images. The `REGISTER path=SL` log line now gives
+  the inliers per registered image and the tracks verified.
+
 - **COLMAP-port mapper: structure-less registration triangulated with no
   error bound.** Its new tracks use the angular residual, in radians, but
   were bounded by `abs_pose_max_error` (12 px), so every ray passed.
@@ -299,6 +313,15 @@ All notable changes to `visloc-rs` will be documented here.
     `stereo_fusion`) over the 10 ETH3D scenes both finished on an L4, in
     58 minutes against 372; 76.0% over all 13 against 83.5% with the
     ground-truth poses.
+  - **End to end again (r47):** the multi-camera scenes resampled onto
+    one camera, every cloud also scored after ICP onto the scan. Over
+    the 13 scenes F1 is 75.8% against 83.7% with the ground-truth poses.
+    Over the 12 with an ICP score it is 75.1%, and 78.6% after ICP.
+    One camera lifts courtyard by 5.2 points and terrains by 3.9, but
+    electro and facade lose 5.3 and 11.8 to a different SfM run.
+    `scripts/align_colmap_model.py --rotations` takes the alignment's
+    rotation from the cameras' orientations: on meadow the centres' fit
+    is 1.05° off. `scripts/eth3d_icp_align.py` skips non-finite points.
   - **Against ACMMP's released code on the same L4:** F1 83.4% against
     83.2% at 2 cm over six scenes (the pod was lost after them), in 27.5
     minutes against 110. ACMMP leads on office by 5.3 points, all of it

@@ -57,7 +57,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use nalgebra::{Point2, Vector3};
+use nalgebra::{Point2, Point3, Vector3};
 use visloc_core::geometry::{reproject, SE3};
 use visloc_vision::pnp::{
     estimate_gr6p_ransac_with_config, Correspondence2D3D, GaussNewtonPoseRefiner,
@@ -126,7 +126,20 @@ pub struct Options {
     /// ([`IncrementalMapper::register_next_structure_less_image`]). Off by
     /// default here (the port's controls predate it); COLMAP 4 enables it.
     pub structure_less_registration_fallback: bool,
+    /// Not in COLMAP: a structure-less registration's inlier matches that
+    /// continue triangulated tracks must number at least this many, and
+    /// the new pose must reproject at least [`STRUCTURE_LESS_MIN_VERIFIED_RATIO`]
+    /// of their 3D points within `abs_pose_max_error`. 0 (the default)
+    /// leaves the check out. Matches that nearly all go to one registered
+    /// image fix the pose poorly, and RANSAC can settle on a rival pose
+    /// almost as well supported. On an L4, ETH3D kicker's DSC_6487 came
+    /// out 66° off that way, its 175 matches all but 17 to one image and 3
+    /// continuing tracks.
+    pub structure_less_min_verified: usize,
 }
+
+/// See [`Options::structure_less_min_verified`].
+pub const STRUCTURE_LESS_MIN_VERIFIED_RATIO: f64 = 0.7;
 
 impl Default for Options {
     fn default() -> Self {
@@ -150,6 +163,7 @@ impl Default for Options {
             max_extra_param: 1.0,
             random_seed: 0, // control override (§0.1)
             structure_less_registration_fallback: false,
+            structure_less_min_verified: 0,
         }
     }
 }
@@ -183,6 +197,9 @@ impl Options {
             "max_reg_trials" => self.max_reg_trials = num()? as usize,
             "structure_less_registration_fallback" => {
                 self.structure_less_registration_fallback = num()? != 0.0;
+            }
+            "structure_less_min_verified" => {
+                self.structure_less_min_verified = num()? as usize;
             }
             _ => return Err(format!("unknown key {key}")),
         }
@@ -627,8 +644,64 @@ impl IncrementalMapper {
         if report.inliers.len() < min_num_inliers {
             return false;
         }
+        // Inliers per registered image, most first, and those that continue
+        // a triangulated track (diagnostics for the log line below).
+        let mut per_world: BTreeMap<ImageT, usize> = BTreeMap::new();
+        let mut continuing = 0;
+        for &i in &report.inliers {
+            let (_, world_id, world_idx) = corrs[i];
+            *per_world.entry(world_id).or_insert(0) += 1;
+            if recon.image(world_id).points2d[world_idx]
+                .point3d_id
+                .is_some()
+            {
+                continuing += 1;
+            }
+        }
+        let mut per_world: Vec<usize> = per_world.into_values().collect();
+        per_world.sort_unstable_by(|a, b| b.cmp(a));
 
         let cam_from_world = SE3::new(report.pose.rotation, report.pose.translation);
+        // Inlier 2D points whose match continues a triangulated track, and
+        // those of them whose 3D point the new pose reprojects within
+        // `abs_pose_max_error` (an independent check of the pose).
+        let mut checked: BTreeSet<usize> = BTreeSet::new();
+        let mut verified = 0;
+        for &i in &report.inliers {
+            let (idx, world_id, world_idx) = corrs[i];
+            let Some(point3d_id) = recon.image(world_id).points2d[world_idx].point3d_id else {
+                continue;
+            };
+            if !checked.insert(idx) {
+                continue;
+            }
+            let xyz = recon.point3d(point3d_id).xyz;
+            let in_cam = cam_from_world.rotation * xyz.coords + cam_from_world.translation;
+            if in_cam.z <= 0.0 {
+                continue;
+            }
+            if let Some(uv) = camera.project(&Point3::from(in_cam)) {
+                if (uv - recon.image(image_id).points2d[idx].xy).norm()
+                    <= options.abs_pose_max_error
+                {
+                    verified += 1;
+                }
+            }
+        }
+        if options.structure_less_min_verified > 0
+            && (verified < options.structure_less_min_verified
+                || (verified as f64) < STRUCTURE_LESS_MIN_VERIFIED_RATIO * checked.len() as f64)
+        {
+            self.log_event(format!(
+                "REJECT path=SL image={} inliers={} inliers_per_image={:?} verified={}/{}",
+                image_id,
+                report.inliers.len(),
+                &per_world[..per_world.len().min(4)],
+                verified,
+                checked.len()
+            ));
+            return false;
+        }
         let camera_id = recon.image(image_id).camera_id;
         let rig = recon.rig(recon.frame(frame_id).rig_id()).clone();
         recon
@@ -637,13 +710,17 @@ impl IncrementalMapper {
         self.obs.register_frame(recon, graph, frame_id);
         self.register_frame_event(recon, frame_id);
         self.log_event(format!(
-            "REGISTER path=SL frame={} image={} inliers={} correspondences={} num_reg_frames={} num_points3d={}",
+            "REGISTER path=SL frame={} image={} inliers={} correspondences={} num_reg_frames={} num_points3d={} inliers_per_image={:?} continuing={} verified={}/{}",
             frame_id,
             image_id,
             report.inliers.len(),
             corrs.len(),
             recon.num_reg_frames(),
-            recon.num_points3d()
+            recon.num_points3d(),
+            &per_world[..per_world.len().min(4)],
+            continuing,
+            verified,
+            checked.len()
         ));
 
         // Inlier correspondences per 2D point, in COLMAP's order.
@@ -1634,6 +1711,34 @@ mod tests {
         assert_eq!(recon.num_points3d(), num_points);
     }
 
+    /// With `structure_less_min_verified`, a structure-less registration
+    /// whose matches continue too few triangulated tracks is refused: the
+    /// same scene, with no 3D point at all, leaves image 2 unregistered.
+    #[test]
+    fn structure_less_registration_needs_verified_tracks_when_asked() {
+        let (db, poses, _) = build_three_view_scene();
+        let mut recon = reconstruction_from_cache(&db);
+        for (k, pose) in poses.iter().take(2).enumerate() {
+            recon.frame_mut(k as u64).set_rig_from_world(pose.clone());
+            recon.register_frame(k as u64);
+        }
+        let mut mapper = IncrementalMapper::new();
+        mapper.begin_reconstruction(&recon, db.correspondence_graph());
+        let options = Options {
+            abs_pose_min_num_inliers: 20,
+            structure_less_min_verified: 10,
+            ..Options::default()
+        };
+        assert!(!mapper.register_next_structure_less_image(
+            &options,
+            &mut recon,
+            db.correspondence_graph(),
+            2
+        ));
+        assert!(!recon.is_image_registered(2));
+        assert_eq!(recon.num_points3d(), 0);
+    }
+
     #[test]
     fn options_apply_overrides_by_key() {
         let mut options = Options::default();
@@ -1645,6 +1750,10 @@ mod tests {
             .unwrap();
         assert_eq!(options.abs_pose_min_num_inliers, 30);
         assert_eq!(options.filter_max_reproj_error, 2.5);
+        options
+            .apply_override("structure_less_min_verified=10")
+            .unwrap();
+        assert_eq!(options.structure_less_min_verified, 10);
         assert!(options.apply_override("no_such_key=1").is_err());
         assert!(options.apply_override("max_reg_trials").is_err());
         assert!(options.apply_override("max_reg_trials=x").is_err());

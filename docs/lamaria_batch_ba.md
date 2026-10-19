@@ -1295,8 +1295,51 @@ and of the 1,579 verified revisits of sequence_2_11 all but one are within
 480 keyframes, so both can run on each new keyframe as it arrives. The
 search window 11 is as accurate on two 200 s windows of sequence_4_10
 (Sim(3) RMSE 0.352 m and 0.516 m, against 0.389 m and 0.486 m with h = 7
-and window 21; window 7: 0.835 m), but the low-light VIO configuration has
-not been run at real-time pace.
+and window 21; window 7: 0.835 m).
+
+### The real-time chain on all ten sequences
+
+Basalt's `euroc_config` (in low light `euroc_config_lowlight`, the same with
+the 0.5 px KLT threshold), fed from the remote zip as the frames arrive;
+matching and revisits (`loops --step 4`) guided by it, the batch features,
+then `online`, and by day the batch pass after the recording. In brackets
+the same steps from the big-window VIO; the last column is the default
+VIO's CPU seconds per second of recording:
+
+| Sequence | VIO | Online | Online + pass | VIO cores |
+|---|---:|---:|---:|---:|
+| sequence_1_19 | 63.44 (71.96) | 78.20 (75.73) | 79.78 (79.20) | 1.30 |
+| sequence_1_20 | 33.55 (38.32) | 56.92 (65.37) | 69.13 (73.03) | 1.34 |
+| sequence_2_11 | 29.67 (49.68) | 72.48 (83.12) | 86.50 (85.55) | 1.47 |
+| sequence_2_12 | 31.45 (18.03) | **56.41** (19.87) | 47.45 (16.57) | 1.43 |
+| sequence_3_17 | 11.20 (50.06) | 37.58 (70.33) | 43.55 (75.57) | 1.57 |
+| sequence_3_18 | 19.94 (34.68) | 43.61 (57.87) | 51.33 (67.39) | 1.41 |
+| sequence_4_10 | 35.66 (38.99) | 63.58 (69.79) | | 1.49 |
+| sequence_4_11 | 41.95 (36.37) | 53.58 (61.03) | | 1.48 |
+| sequence_5_11 | 38.55 (43.14) | 52.68 (55.95) | 50.97 (61.16) | 1.37 |
+| sequence_5_12 | 10.76 (4.98) | 6.89 (5.17) | 7.54 (7.66) | 2.20 |
+| **Mean** | 31.62 (38.62) | **52.19** (56.42) | 55.34 (59.70)¹ | |
+
+¹ Low light: the online result.
+
+On 4 cores and causal, the chain scores 52.19 on average, against 54.34
+for the batch pipeline from the big-window VIO after the recording. The
+default VIO keeps its heading better on sequence_2_12 (within −1.4° …
++1.1° per 120 s window for the first 22 minutes, against −4.1° in the first
+window for the big window), so there the online result is the best of all (56.41,
+pose recall 38.8 %) and the batch pass loses 9 points of it; on
+sequence_3_17 the default VIO fails (11.20). On the tram of sequence_5_12
+it needs 2.2 cores.
+
+Averaging the two chains' results, the second turned onto the first by a
+rigid fit, positions averaged and rotations met halfway, beats both where
+they agree: sequence_2_11 91.52, sequence_1_19 81.38, sequence_1_20 73.73
+(rigid fit residual 0.6–0.9 m). Where one fails the average lands between
+them (sequence_2_12 27.77, sequence_3_17 63.36, sequence_3_18 57.23,
+sequence_5_11 58.99; residual 2.2–5.2 m); in low light the averaged online
+results stay slightly below the big window's (69.43 and 59.26; 1.2–1.3 m).
+Averaging below a residual of 2 m and keeping the big-window result above
+it gives 60.37 against 59.70, with the 2 m chosen on these sequences.
 
 ## Usage
 

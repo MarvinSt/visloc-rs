@@ -298,6 +298,15 @@ before/after on training sequences.
    over the ten sequences is **59.70** (Short 76.12, Medium 51.06, Long
    71.48, Low light 65.41, Moving platform 34.41;
    [Online, then one batch pass](lamaria_batch_ba.md#online-then-one-batch-pass)).
+   The whole chain from Basalt's default VIO (`euroc_config`, in low light
+   `euroc_config_lowlight`), causal and within 4 cores, averages **52.19**
+   over the ten sequences (2026-10-19), against 54.34 for the batch pipeline
+   after the recording; with the pass after the recording 55.34. That VIO
+   keeps sequence_2_12's heading (online 56.41, against 19.87 from the big
+   window) but fails on sequence_3_17 (11.20). Averaging the two chains'
+   results helps where they agree (sequence_2_11 91.52) and lands between
+   them where one fails ([the real-time chain on all ten
+   sequences](lamaria_batch_ba.md#the-real-time-chain-on-all-ten-sequences)).
 
 ## 5. Test-set operational pipeline
 

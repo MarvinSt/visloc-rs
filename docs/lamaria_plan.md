@@ -305,7 +305,8 @@ before/after on training sequences.
    keeps sequence_2_12's heading (online 56.41, against 19.87 from the big
    window) but fails on sequence_3_17 (11.20). Averaging the two chains'
    results helps where they agree (sequence_2_11 91.52) and lands between
-   them where one fails ([the real-time chain on all ten
+   them where one fails, but needs both chains and is not used ([the
+   real-time chain on all ten
    sequences](lamaria_batch_ba.md#the-real-time-chain-on-all-ten-sequences)).
 
 ## 5. Test-set operational pipeline

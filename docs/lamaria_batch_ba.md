@@ -1339,7 +1339,9 @@ them (sequence_2_12 27.77, sequence_3_17 63.36, sequence_3_18 57.23,
 sequence_5_11 58.99; residual 2.2–5.2 m); in low light the averaged online
 results stay slightly below the big window's (69.43 and 59.26; 1.2–1.3 m).
 Averaging below a residual of 2 m and keeping the big-window result above
-it gives 60.37 against 59.70, with the 2 m chosen on these sequences.
+it gives 60.37 against 59.70, with the 2 m chosen on these sequences. It
+needs both chains, twice the VIO and the solves, so it is not part of the
+pipeline.
 
 ## Usage
 

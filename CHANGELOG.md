@@ -299,6 +299,15 @@ All notable changes to `visloc-rs` will be documented here.
     `stereo_fusion`) over the 10 ETH3D scenes both finished on an L4, in
     58 minutes against 372; 76.0% over all 13 against 83.5% with the
     ground-truth poses.
+  - **End to end again (r47):** the multi-camera scenes resampled onto
+    one camera, every cloud also scored after ICP onto the scan. Over
+    the 13 scenes F1 is 75.8% against 83.7% with the ground-truth poses.
+    Over the 12 with an ICP score it is 75.1%, and 78.6% after ICP.
+    One camera lifts courtyard by 5.2 points and terrains by 3.9, but
+    electro and facade lose 5.3 and 11.8 to a different SfM run.
+    `scripts/align_colmap_model.py --rotations` takes the alignment's
+    rotation from the cameras' orientations: on meadow the centres' fit
+    is 1.05° off. `scripts/eth3d_icp_align.py` skips non-finite points.
   - **Against ACMMP's released code on the same L4:** F1 83.4% against
     83.2% at 2 cm over six scenes (the pod was lost after them), in 27.5
     minutes against 110. ACMMP leads on office by 5.3 points, all of it

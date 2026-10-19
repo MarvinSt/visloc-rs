@@ -2,6 +2,7 @@
 """Move a COLMAP text model into a reference model's frame.
 
     align_colmap_model.py EST_DIR REF_IMAGES_TXT OUT_DIR [--names IMAGE_NAMES_TXT]
+                          [--rotations]
 
 Fits the Sim(3) taking EST_DIR's camera centres onto those of the
 reference images with the same file names (compared without directories),
@@ -11,8 +12,15 @@ OUT_DIR. Observations and tracks are kept as they are, so a dense
 reconstruction from OUT_DIR lands in the reference frame (ETH3D's laser
 scans, for example). With ``--names`` (a ``gsplat_photos`` run's
 ``image_names.txt``: working name, original path), images are matched and
-written under their original file names. Prints the fit: matched cameras, scale and centre
-errors in reference units. Needs numpy.
+written under their original file names. With ``--rotations`` the
+rotation comes from the cameras' orientations instead (the chordal mean of
+R_ref^T R_est over the cameras kept by the centre fit, refitted once
+without those more than three times the median angle off), and the scale
+and translation from the centres under it: centres nearly in one plane,
+as on ETH3D's meadow, fix the tilt poorly, and one camera a few
+centimetres off can tilt the cloud by a degree. Prints the fit: matched
+cameras, scale and centre errors in reference units (and the rotation's
+change). Needs numpy.
 """
 from __future__ import annotations
 
@@ -78,8 +86,21 @@ def sim3(ref, est):
     return scale, rot, mr - scale * rot @ me
 
 
+def mean_rotation(rs):
+    """The rotation nearest the mean of `rs` (chordal L2 mean)."""
+    u, _, vt = np.linalg.svd(sum(rs))
+    return u @ np.diag([1.0, 1.0, np.linalg.det(u @ vt)]) @ vt
+
+
+def angle_deg(r):
+    return np.degrees(np.arccos(np.clip((np.trace(r) - 1) / 2, -1.0, 1.0)))
+
+
 def main():
     args = sys.argv[1:]
+    rotations = "--rotations" in args
+    if rotations:
+        args.remove("--rotations")
     original = {}
     if "--names" in args:
         k = args.index("--names")
@@ -96,7 +117,9 @@ def main():
     for tokens, _ in est:
         name = " ".join(tokens[9:])
         tokens[9:] = [original.get(name, name)]
-    ref = {os.path.basename(" ".join(t[9:])): centre(t) for t, _ in read_images(ref_path)}
+    ref_images = read_images(ref_path)
+    ref = {os.path.basename(" ".join(t[9:])): centre(t) for t, _ in ref_images}
+    ref_rot = {os.path.basename(" ".join(t[9:])): quat_to_r(*map(float, t[1:5])) for t, _ in ref_images}
     names = [os.path.basename(" ".join(t[9:])) for t, _ in est]
     common = [k for k, n in enumerate(names) if n in ref]
     if len(common) < 3:
@@ -109,6 +132,24 @@ def main():
     if not keep.all() and keep.sum() >= 3:
         s, rot, t = sim3(a[keep], b[keep])
         err = np.linalg.norm(a - (s * b @ rot.T + t), axis=1)
+    note = ""
+    if rotations:
+        # Camera k: R_ref = R_est rot^T, so rot = R_ref^T R_est.
+        rs = [ref_rot[names[k]].T @ quat_to_r(*map(float, est[k][0][1:5])) for k in common]
+        used = [i for i in range(len(common)) if keep[i]]
+        mean = mean_rotation([rs[i] for i in used])
+        off = np.array([angle_deg(rs[i] @ mean.T) for i in used])
+        if (off > 3 * np.median(off) + 1e-9).any():
+            used = [i for i, o in zip(used, off) if o <= 3 * np.median(off) + 1e-9]
+            mean = mean_rotation([rs[i] for i in used])
+        change = angle_deg(mean @ rot.T)
+        rot = mean
+        ma, mb = a[keep].mean(0), b[keep].mean(0)
+        rb = (b[keep] - mb) @ rot.T
+        s = ((a[keep] - ma) * rb).sum() / (rb**2).sum()
+        t = ma - s * rot @ mb
+        err = np.linalg.norm(a - (s * b @ rot.T + t), axis=1)
+        note = f"; rotation from {len(used)} cameras' orientations, {change:.3f} deg from the centres' fit"
 
     os.makedirs(out_dir, exist_ok=True)
     shutil.copy(os.path.join(est_dir, "cameras.txt"), os.path.join(out_dir, "cameras.txt"))
@@ -132,7 +173,7 @@ def main():
             f.write(" ".join([tokens[0], *(f"{v:.17g}" for v in x), *tokens[4:]]) + "\n")
     print(f"aligned {len(common)} of {len(est)} images to the reference ({len(ref)}): "
           f"scale {s:.6g}, centre error median {np.median(err):.4f}, max {err.max():.4f} "
-          f"({int((~keep).sum())} left out of the fit)")
+          f"({int((~keep).sum())} left out of the fit){note}")
 
 
 if __name__ == "__main__":

@@ -303,6 +303,15 @@ All notable changes to `visloc-rs` will be documented here.
     83.2% at 2 cm over six scenes (the pod was lost after them), in 27.5
     minutes against 110. ACMMP leads on office by 5.3 points, all of it
     accuracy.
+  - **Fusion:** the agreeing views must also agree well on average, as in
+    ACMMP's code (`--min-mean-consistency`, 0.15 against ACMMP's 0.3).
+    Over the 13 ETH3D scenes at 3200 px F1 at 2 cm goes from 83.46% to
+    83.69% (office +1.8, kicker +1.5 points).
+  - **Mesh voxel:** the footprint at the views' median sparse depth (it
+    was the depth ranges' midpoints, which reach far behind meadow), with
+    a second level four times coarser for pixels twice as far. Over the 13
+    scenes the mesh scores 79.3% at 2 cm; on meadow 68.9% instead of
+    42.2%.
   - **Mesh:** `--mesh` fuses the depths that source views agree with into
     a TSDF and writes `mesh.ply` (surface nets); on pipes at 1600 px F1
     68.1% at 2 cm against the cloud's 74.8%. The TSDF moved from

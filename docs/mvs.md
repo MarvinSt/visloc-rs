@@ -92,11 +92,15 @@ from the paper:
   angle; the agreeing pixels are averaged into one point and not used
   again. ACMM's and ACMP's code ask for two agreeing views: with these
   depth maps one view scores higher (below), and `--min-consistent 2`
-  restores two. ACMMP's code also asks the agreeing views to agree well on
-  average (`--min-mean-consistency 0.3`) and keeps the reference pixel's
-  point instead of the average (`--no-average`). On pipes and meadow
-  pre-resized to 800 px the first costs about 10 points of F1 and the
-  second changes it by 0.1 point, so both are off by default. The checks
+  restores two. As in ACMMP's code, the agreeing views must also agree
+  well on average: the mean of `exp(-(e + 200 d + 10 a))` over them must
+  reach 0.15, with `e` the reprojection error in pixels, `d` the relative
+  depth difference and `a` the normal angle in radians
+  (`--min-mean-consistency`). ACMMP uses 0.3. On the 13 scenes at 3200 px
+  0.15 adds 0.23 point of F1 and 0.3 loses 0.38 (Fusion settings).
+  ACMMP's code also keeps the reference pixel's point instead of the
+  average (`--no-average`); that changes F1 by 0.1 point or less, so it
+  stays off. The checks
   against the source maps run in parallel first; the raster-order pass
   that builds the points re-checks only the sources that agreed, so the
   cloud is a sequential fusion's (byte-identical on pipes at 1600 px, in
@@ -163,8 +167,10 @@ Requiring every corner loses most of the surface: a pixel whose agreeing
 source pixel already went into a point fails fusion's check, so the
 depth maps have holes a pixel wide, and one unknown corner drops a cell.
 Thin structures (pipes' pipes) and far surfaces, whose depth noise
-exceeds the voxel, stay fragmented. The coarser level changes nothing on
-pipes, whose surfaces are mostly within 2 m of a camera.
+exceeds the voxel, stay fragmented. A coarser level for far pixels did
+not help on pipes, whose surfaces are mostly within 2 m of a camera. On
+pipes the mesh adds 1.5 s of fusion and 6.6 s of extraction, and 1.0 GiB
+of peak memory (5.3 million triangles, 118 MB).
 
 The voxel used to be the footprint at the median of the views'
 depth-range midpoints. Those ranges reach the far 99% quantile plus 25%.
@@ -181,8 +187,22 @@ meshed with two-pixel voxels (F1 at 2 cm; the cloud scores 67.5%):
 | median depth, three levels | 58.1% | 73.7% | 47.9% | 25,342 | 567 MiB |
 
 On office's 800 px maps the second level changes F1 by less than 0.01
-point (51.8%) and saves 4% of the memory. The mesh adds 1.5 s of fusion and 6.6 s of extraction
-there, and 1.0 GiB of peak memory (5.3 million triangles, 118 MB).
+point (51.8%) and saves 4% of the memory.
+
+On all 13 scenes at 3200 px (r45, L4, commit `023e741`,
+`--mesh-voxel-pixels 2`) the mesh scores F1 79.3% at 2 cm (accuracy
+88.5%, completeness 72.5%) against the cloud's 83.5%. On the six scenes
+r40 meshed with the old voxel it rises from 72.6% to 78.8%:
+
+- meadow 42.2% → 68.9%;
+- terrace 83.2% → 90.1%;
+- pipes 79.2% → 81.0%;
+- office 66.2% → 68.2%;
+- kicker 80.1% → 80.6%;
+- relief 84.5% → 83.7%.
+
+The finer voxel costs memory: peak 6.1 GiB on pipes against 3.8 GiB,
+15.3 GiB on facade.
 
 ## ETH3D high-resolution benchmark
 
@@ -222,7 +242,9 @@ the same GPU type and driver, after its upload failed.)
 | facade | 76 | 67.5% | 74.4% | 61.7% | 65.4% | 67.3% | 13:46 | 11:53 |
 
 - **Mean over the 13 scenes:** F1 83.5%, accuracy 86.6%, completeness
-  81.0%, against 81.4% (87.6%, 76.8%) with one scale. Over the same
+  81.0%, against 81.4% (87.6%, 76.8%) with one scale. With the fusion's
+  mean-consistency check, on since (Fusion settings), the same maps
+  score 83.7% (88.7%, 79.5%). Over the same
   scenes at 2 cm, ACMMP reports F1 83.42%, HPM-MVS 84.58%, ACMP 79.79%,
   ACMM 78.86% (accuracy 90.67%, completeness 70.42%) and COLMAP 67.66%
   (91.85%, 55.13%) (arXiv 2303.09758, 2210.07582); later methods reach
@@ -518,7 +540,32 @@ commit `1cbf908`; F1 at 2 cm, accuracy / completeness):
 The rule trades completeness for accuracy. It pays on the indoor scenes,
 whose wrong depths agree loosely between views (office +1.8, kicker +2.4
 points), and costs pipes up to 1.3. On 800 px maps it cost about
-10 points. It stays off until all 13 scenes are scored.
+10 points.
+
+On all 13 scenes (r45, L4, commit `023e741`, the default maps fused three
+ways; F1 at 2 cm):
+
+| Scene | Rule off | 0.15 (the default) | 0.3 |
+|---|---|---|---|
+| pipes | **84.4%** | 84.1% | 83.1% |
+| meadow | **76.2%** | 75.2% | 72.4% |
+| terrace | 91.1% | **91.2%** | 91.1% |
+| office | 78.4% | **80.2%** | 80.1% |
+| kicker | 82.3% | 83.8% | **84.7%** |
+| relief | 87.8% | **88.2%** | 87.5% |
+| relief 2 | 86.6% | **87.0%** | 86.9% |
+| courtyard | **90.4%** | 90.2% | 89.0% |
+| playground | **69.8%** | 69.5% | 68.2% |
+| terrains | 91.2% | 91.4% | **91.8%** |
+| delivery area | 90.0% | **90.3%** | **90.3%** |
+| electro | 89.4% | **89.5%** | 88.7% |
+| facade | **67.5%** | 67.3% | 66.1% |
+| **Mean** | 83.46% (86.6 / 80.9) | **83.69%** (88.7 / 79.5) | 83.08% (91.9 / 76.3) |
+
+At 0.15 the rule is ahead at every tolerance: 73.27% against 73.11% at
+1 cm and 91.89% against 91.67% at 5 cm. It gains on eight scenes and
+loses at most 1.0 point (meadow) on the others, so it is on by default.
+At 0.3 it costs too much completeness on the outdoor scenes.
 
 ### Local runs on pipes (CPU)
 

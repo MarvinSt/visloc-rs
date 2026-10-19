@@ -26,11 +26,11 @@ pub struct FusionOptions {
     pub max_normal_angle_deg: f64,
     /// Source views that must agree.
     pub min_consistent_views: usize,
-    /// ACMMP's released code also asks the agreeing views to agree well on
-    /// average: the mean over them of `exp(-(e + 200 d + 10 a))`, `e` the
-    /// reprojection error in pixels, `d` the relative depth difference and
-    /// `a` the normal angle in radians, must exceed this (0.3 there); 0
-    /// leaves it out.
+    /// The agreeing views must also agree well on average, as in ACMMP's
+    /// released code: the mean over them of `exp(-(e + 200 d + 10 a))`,
+    /// `e` the reprojection error in pixels, `d` the relative depth
+    /// difference and `a` the normal angle in radians, must reach this
+    /// (0.3 in ACMMP's code; 0 leaves it out).
     pub min_mean_consistency: f64,
     /// A point averages the agreeing pixels; without, it is the reference
     /// pixel's (ACMMP's released code).
@@ -44,7 +44,7 @@ impl Default for FusionOptions {
             max_relative_depth_diff: 0.01,
             max_normal_angle_deg: 10.0,
             min_consistent_views: 1,
-            min_mean_consistency: 0.0,
+            min_mean_consistency: 0.15,
             average: true,
         }
     }

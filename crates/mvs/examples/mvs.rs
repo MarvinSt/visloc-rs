@@ -12,7 +12,7 @@
 //!     [--restorer infinity|start|off] [--detail-threshold 0.1] [--no-planar-prior] \
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 10] \
-//!     [--min-mean-consistency 0] [--no-average] \
+//!     [--min-mean-consistency 0.15] [--no-average] \
 //!     [--deformable] \
 //!     [--mesh] [--mesh-voxel <world units>] [--mesh-voxel-pixels 1] [--mesh-levels 2] [--mesh-min-weight 1]
 //! ```

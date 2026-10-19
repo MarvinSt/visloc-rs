@@ -627,6 +627,22 @@ impl IncrementalMapper {
         if report.inliers.len() < min_num_inliers {
             return false;
         }
+        // Inliers per registered image, most first, and those that continue
+        // a triangulated track (diagnostics for the log line below).
+        let mut per_world: BTreeMap<ImageT, usize> = BTreeMap::new();
+        let mut continuing = 0;
+        for &i in &report.inliers {
+            let (_, world_id, world_idx) = corrs[i];
+            *per_world.entry(world_id).or_insert(0) += 1;
+            if recon.image(world_id).points2d[world_idx]
+                .point3d_id
+                .is_some()
+            {
+                continuing += 1;
+            }
+        }
+        let mut per_world: Vec<usize> = per_world.into_values().collect();
+        per_world.sort_unstable_by(|a, b| b.cmp(a));
 
         let cam_from_world = SE3::new(report.pose.rotation, report.pose.translation);
         let camera_id = recon.image(image_id).camera_id;
@@ -637,13 +653,15 @@ impl IncrementalMapper {
         self.obs.register_frame(recon, graph, frame_id);
         self.register_frame_event(recon, frame_id);
         self.log_event(format!(
-            "REGISTER path=SL frame={} image={} inliers={} correspondences={} num_reg_frames={} num_points3d={}",
+            "REGISTER path=SL frame={} image={} inliers={} correspondences={} num_reg_frames={} num_points3d={} inliers_per_image={:?} continuing={}",
             frame_id,
             image_id,
             report.inliers.len(),
             corrs.len(),
             recon.num_reg_frames(),
-            recon.num_points3d()
+            recon.num_points3d(),
+            &per_world[..per_world.len().min(4)],
+            continuing
         ));
 
         // Inlier correspondences per 2D point, in COLMAP's order.

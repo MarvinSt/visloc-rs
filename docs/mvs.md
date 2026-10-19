@@ -332,9 +332,9 @@ accuracy and completeness are at 2 cm; times cover the whole run
 - **Office.** This is the scene where ACMMP leads, by 5.3 points. The two
   are equally complete, but ACMMP is 11 points more accurate. ACMMP's
   fusion also requires the agreeing views to agree closely on average
-  (`--min-mean-consistency 0.3`). On office's 800 px maps that rule
-  raises accuracy from 76.7% to 90.5% but drops completeness from 46.6%
-  to 36.2%, so it has not been tried at 3200 px yet.
+  (`--min-mean-consistency 0.3`). On our 3200 px maps that rule takes
+  office from 78.4% to 80.1% (see Fusion settings). The remaining 3.6
+  points are in the depth maps.
 - **`--geom-iterations 2`** (ACMMP's count) saves 13% of the time for
   0.5 point of F1; the default stays 3.
 - **Mesh** (`--mesh --mesh-voxel-pixels 2`): 72.6% against the clouds'
@@ -502,6 +502,23 @@ accuracy from 96.9% to 90.7%. On pipes at 800 px, a stricter depth
 (0.5%) or reprojection (1 px) check, or dropping pixels by matching cost,
 only lowered F1. At 3200 px (above) a tighter normal check pays: 10° and
 15° beat 30°, and on the multi-scale maps 30° beats no check.
+
+ACMMP's mean-consistency rule (`--min-mean-consistency`, with or without
+`--no-average`), on the default 3200 px maps of four scenes (r44, L4,
+commit `1cbf908`; F1 at 2 cm, accuracy / completeness):
+
+| Scene | Default | 0.3 | 0.3, no average | 0.15 |
+|---|---|---|---|---|
+| pipes | **84.4%** (93.8 / 76.7) | 83.1% (97.1 / 72.7) | 83.2% | 84.1% (95.2 / 75.3) |
+| office | 78.4% (76.3 / 80.7) | 80.1% (88.9 / 72.9) | **80.2%** | **80.2%** (82.7 / 77.8) |
+| kicker | 82.3% (79.1 / 85.8) | **84.7%** (88.9 / 80.9) | **84.7%** | 83.8% (83.6 / 84.1) |
+| terrace | 91.1% (94.9 / 87.6) | 91.1% (97.4 / 85.5) | 91.1% | **91.2%** (95.8 / 87.1) |
+| Mean | 84.0% | 84.8% | 84.8% | 84.8% |
+
+The rule trades completeness for accuracy. It pays on the indoor scenes,
+whose wrong depths agree loosely between views (office +1.8, kicker +2.4
+points), and costs pipes up to 1.3. On 800 px maps it cost about
+10 points. It stays off until all 13 scenes are scored.
 
 ### Local runs on pipes (CPU)
 

@@ -18,7 +18,10 @@ track](#two-sequences-per-track) (mean 74.64 over the five sequences it was
 developed on, 54.34 over all ten), the commands in [Usage](#usage). Run on
 windows of the latest 240 s as the data comes in, then once more over the
 whole recording, it reaches 59.70 (see [Online, then one batch
-pass](#online-then-one-batch-pass)).
+pass](#online-then-one-batch-pass)). From Basalt's default VIO, causal and
+within 4 cores, with a wider epipolar band for the matching, it averages
+60.54, and 61.19 with the batch pass after the recording (see [Matching
+guided by a drifting VIO](#matching-guided-by-a-drifting-vio)).
 
 ## Method
 
@@ -1281,10 +1284,10 @@ the VIO from its CPU time while it waited for the frames as they arrived):
 | SIFT on the 2 Hz stereo keyframes | 0.85 |
 | The same in low light, with non-local means (h = 7, search window 21) | 1.83 |
 | The same, h = 11, search window 11 (`--denoise-window 11`) | 1.09 |
-| `match` | 0.22 |
+| `match` (`--tau-slope 0.3 --tau-max 20`) | 0.22 (0.27) |
 | `loops` (candidate stride 2; stride 4) | 1.08; 0.26 |
 | `online` (two threads) | 1.1 |
-| **Sum, by day, `loops --step 4`** | **3.9** |
+| **Sum, by day, `loops --step 4`** | **3.9** (4.0) |
 
 The VIO of every result above, `euroc_config_big_window_multicam`, runs at
 0.42 times real time on these 4 cores; `euroc_config` at 1.95 times. From
@@ -1343,6 +1346,65 @@ it gives 60.37 against 59.70, with the 2 m chosen on these sequences. It
 needs both chains, twice the VIO and the solves, so it is not part of the
 pipeline.
 
+### Matching guided by a drifting VIO
+
+On sequence_3_17 the default VIO's heading drifts steadily, +8.8° … −8.2°
+per 120 s window against the pseudo-GT (0.16 mrad/s), and the chain scores
+37.58 online. The matches cause it, not the VIO the windows start from:
+with the big-window chain's matches, the default VIO's start and its own
+revisits, `online` scores 72.00. With the default VIO's matches the windows
+end at the same heading however they start: rotations of the new frames
+from the gyroscope instead of the VIO (38.77), `--modes yaw` (40.02), 20
+iterations per window (42.07) and revisits at candidate stride 2 (37.66)
+barely move it. Both chains have as many matches per keyframe offset, but
+those only the default VIO's guidance finds lie further off the pseudo-GT's
+epipolar geometry (offsets 192–256: median 4.1 px against 3.2 px): the band
+(2 px + 0.1 px per keyframe offset, at most 6 px) lets a drifting guide pick
+the matches that agree with its drift. A wider band, `match --tau-slope 0.3
+--tau-max 20`, on the online result of the chain:
+
+| Band | sequence_3_17 | sequence_2_12 | Mean of ten |
+|---|---:|---:|---:|
+| 2 px + 0.1 px per offset, at most 6 px (the default) | 37.58 | **56.41** | 52.19 |
+| + 0.2 px per offset, at most 12 px | 60.64 | | |
+| + 0.1 px per offset, at most 20 px | 66.37 | 53.22 | 57.60 |
+| + 0.3 px per offset, at most 20 px | **74.95** | 37.75 | **60.54** |
+
+Matching each new keyframe guided by the windows' trajectory as it stands
+instead of the VIO raises the default band's sequence_3_17 to 51.46 and
+sequence_2_11 to 77.01, but with the wide band it does worse than the VIO
+(68.98, and 33.65 on sequence_2_12). An essential matrix fitted to each
+pair's wide-band matches by RANSAC keeps fewer good ones (71.28 and 31.11)
+and makes the matching five times slower.
+
+The chain with the wide band, online and with the batch pass after the
+recording (by day), against the default band:
+
+| Sequence | Online | Online + pass |
+|---|---:|---:|
+| sequence_1_19 | 76.75 (78.20) | 79.62 (79.78) |
+| sequence_1_20 | **81.53** (56.92) | 81.71 (69.13) |
+| sequence_2_11 | 79.97 (72.48) | **89.84** (86.50) |
+| sequence_2_12 | 37.75 (56.41) | 27.15 (47.45) |
+| sequence_3_17 | **74.95** (37.58) | 74.04 (43.55) |
+| sequence_3_18 | 54.40 (43.61) | 59.16 (51.33) |
+| sequence_4_10 | 64.18 (63.58) | |
+| sequence_4_11 | **71.07** (53.58) | |
+| sequence_5_11 | 57.56 (52.68) | 57.53 (50.97) |
+| sequence_5_12 | 7.24 (6.89) | 7.57 (7.54) |
+| **Mean** | **60.54** (52.19) | **61.19** (55.34)¹ |
+
+¹ Low light: the online result.
+
+Causal and within 4 cores, the chain now beats the big-window pipeline run
+after the recording (59.70); so do sequence_1_20 (81.53, pose recall
+99.3 %, against 73.03) and sequence_4_11 (71.07 against 61.03), and
+sequence_3_17 comes within 0.6 of it (74.95 against 75.57). Only
+sequence_2_12 loses: there the default VIO's heading was already good, and
+the wide band's extra matches turn its first two minutes 3.3° off (1.3°
+with the default band). The matching takes about 0.27 cores instead of
+0.22.
+
 ## Usage
 
 ```bash
@@ -1400,6 +1462,9 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   steps with the revisits from that trajectory, `solve --vio online.tum
   --save-states`, `loop-correct` and `solve --loops`, improve it after the
   recording (see [Online, then one batch pass](#online-then-one-batch-pass)).
+  From Basalt's default VIO (`euroc_config`, the real-time chain), match
+  with `--tau-slope 0.3 --tau-max 20` (see [Matching guided by a drifting
+  VIO](#matching-guided-by-a-drifting-vio)).
   `BASALT_EUROC_WAIT_S=120` lets the VIO demo wait for frames that a
   streaming reader has not written yet.
 - **Heading drift.** `--modes yaw` lets the solve correct a slow heading

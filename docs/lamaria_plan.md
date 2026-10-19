@@ -308,6 +308,15 @@ before/after on training sequences.
    them where one fails, but needs both chains and is not used ([the
    real-time chain on all ten
    sequences](lamaria_batch_ba.md#the-real-time-chain-on-all-ten-sequences)).
+   That chain failed on sequence_3_17 because its matching followed the
+   drifting VIO: the epipolar band (at most 6 px) let the guide pick the
+   matches that agree with its drift. With `match --tau-slope 0.3 --tau-max
+   20` it averages **60.54** online (2026-10-19), above the big-window
+   pipeline after the recording (59.70), and **61.19** with the pass after
+   the recording (sequence_1_20 81.53, sequence_2_11 89.84, sequence_3_17
+   74.95, sequence_4_11 71.07); sequence_2_12, whose VIO heading was good,
+   falls to 37.75 ([Matching guided by a drifting
+   VIO](lamaria_batch_ba.md#matching-guided-by-a-drifting-vio)).
 
 ## 5. Test-set operational pipeline
 

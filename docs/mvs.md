@@ -454,7 +454,9 @@ F1 at 2 cm:
   to +2.4 cm along the sequence). The
   orientations move its cloud by 0.2 mm, while ICP moves it 12 mm and
   gains 15 points. Refining the focal length and principal point in a
-  replay of its matches leaves the drift as it is.
+  replay of its matches leaves the drift as it is. The far end of the
+  wall is bent away from the rest; the alignment now leaves it out
+  ([below](#facades-far-end)).
 - **The protocol now aligns by the orientations.**
   `align_colmap_model.py` does so by default (`--centres` for the
   centres' fit). The COLMAP comparison above aligned both by the centres;
@@ -463,6 +465,51 @@ F1 at 2 cm:
   was replayed on r49's L4 matches (r49a, seeds 0 to 2). It lowers
   meadow's relative-rotation error from 0.13° to 0.10° and changes the
   other scenes within noise, so the default stays.
+
+### facade's far end
+
+Measured locally on r49a's L4 model of facade (76 images; the same model
+as r49's), with the ground-truth cameras and the scan:
+
+- **The far end of the wall is bent.** Aligned on the rest, the
+  cameras are within 0.6 cm of the ground truth (median). The 14
+  cameras of the last 4 m are 2.5 to 6.5 cm off, mostly along the wall,
+  and up to 0.4° off in orientation. One camera-centre fit spread that
+  error over the whole wall (median 1.4 cm); ICP moved the cloud 12 mm.
+- **It is not the mapper.** COLMAP 4.2.1's incremental mapper (pycolmap)
+  on the same keypoints and verified matches bends the same end the same
+  way (up to 5.9 cm, against 6.5).
+- **It is the optimum of these observations.** A global bundle
+  adjustment started from the ground-truth poses converges to the same
+  bent shape. Its cost is 7% below the ground truth's. The following
+  leave the bend as it is:
+  - a Cauchy loss;
+  - radial or OpenCV distortion refined (k1 comes out at −6e-5);
+  - leaving out DSC_0414 and DSC_0415, whose matches with each other
+    fit the ground-truth poses worst of the end's links (0.74 px median
+    Sampson error, against 0.13 px between DSC_0356 and DSC_0357).
+- **The ground truth is not exact there either.** Triangulated with the
+  ground-truth poses, the far end's sparse points need a 3.6 cm shift
+  along the wall onto the scan. With the model's own poses they need
+  0.3 cm, but they spread more: 36% within 2 cm of the scan, against 45%
+  for the shifted ground-truth ones. Part of the model's 5 cm from the
+  ground truth there is the ground truth's.
+- **The alignment now leaves a bent part out.** `align_colmap_model.py`
+  fits the scale and translation on the cameras whose orientations agree
+  with the rest, then refits once without centres beyond three times the
+  median error. On facade that leaves out 15 cameras: 13 of the far end
+  and two at the other.
+  The sparse points within 2 cm of the scan go from 43.5% to 50.7%
+  (median distance 2.42 → 1.96 cm).
+  - The other 12 scenes move by at most 1 mm, except meadow, which moves
+    1.6 cm. Against the scan, meadow scores the same either way (39.2%
+    and 39.1% of sparse points within 2 cm).
+  - The script also normalizes the quaternions now. ETH3D writes six
+    digits, and the angles taken by arccos near the identity magnified
+    that rounding to about 0.1°. The orientation check had dropped half
+    the cameras of relief and delivery area for that noise.
+  - The F1 of the r49 table above was scored with the previous fit.
+    facade's F1 under this one is not measured yet.
 
 ### Against ACMMP on the same GPU
 

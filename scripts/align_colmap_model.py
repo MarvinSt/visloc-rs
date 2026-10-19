@@ -18,11 +18,12 @@ more than three times the median error off. The rotation then comes from
 the cameras' orientations (the chordal mean of R_ref^T R_est over the
 cameras kept by the centre fit, refitted once without those more than
 three times the median angle off), and the scale and translation from the
-centres under it: centres nearly in one plane, as on ETH3D's meadow, fix
-the tilt poorly, and one camera a few centimetres off can tilt the cloud
-by a degree. ``--centres`` keeps the centres' fit, the alignment before
-the orientations were used (``--rotations``, their old switch, is
-accepted). Prints the fit: matched cameras, scale, centre errors in
+centres under it, fitted on the cameras the orientations keep and refitted
+once without centres beyond three times the median error: centres nearly
+in one plane, as on ETH3D's meadow, fix the tilt poorly, and one camera a
+few centimetres off can tilt the cloud by a degree. ``--centres`` keeps
+the centres' fit, the alignment before the orientations were used
+(``--rotations``, their old switch, is accepted). Prints the fit: matched cameras, scale, centre errors in
 reference units and the rotation's change. Needs numpy.
 """
 from __future__ import annotations
@@ -35,6 +36,10 @@ import numpy as np
 
 
 def quat_to_r(qw, qx, qy, qz):
+    # Normalized: ETH3D's quaternions carry six digits, and the angles taken
+    # by arccos near the identity magnify their norm's error to 0.1 deg.
+    n = np.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    qw, qx, qy, qz = qw / n, qx / n, qy / n, qz / n
     return np.array([
         [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
         [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
@@ -146,11 +151,25 @@ def main():
             mean = mean_rotation([rs[i] for i in used])
         change = angle_deg(mean @ rot.T)
         rot = mean
-        ma, mb = a[keep].mean(0), b[keep].mean(0)
-        rb = (b[keep] - mb) @ rot.T
-        s = ((a[keep] - ma) * rb).sum() / (rb**2).sum()
-        t = ma - s * rot @ mb
+
+        def scale_translation(k):
+            ma, mb = a[k].mean(0), b[k].mean(0)
+            rb = (b[k] - mb) @ rot.T
+            sk = ((a[k] - ma) * rb).sum() / (rb**2).sum()
+            return sk, ma - sk * rot @ mb
+
+        # Scale and translation from the cameras whose orientations agree,
+        # then refitted once without centres beyond three times the median
+        # error: a part of the model bent away from the rest (the far end of
+        # ETH3D's facade) would otherwise pull the whole cloud along.
+        keep = np.zeros(len(common), bool)
+        keep[used] = True
+        s, t = scale_translation(keep)
         err = np.linalg.norm(a - (s * b @ rot.T + t), axis=1)
+        keep = err <= 3 * np.median(err) + 1e-12
+        if keep.sum() >= 3:
+            s, t = scale_translation(keep)
+            err = np.linalg.norm(a - (s * b @ rot.T + t), axis=1)
         note = f"; rotation from {len(used)} cameras' orientations, {change:.3f} deg from the centres' fit"
 
     os.makedirs(out_dir, exist_ok=True)

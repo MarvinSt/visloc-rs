@@ -313,6 +313,12 @@ All notable changes to `visloc-rs` will be documented here.
     `stereo_fusion`) over the 10 ETH3D scenes both finished on an L4, in
     58 minutes against 372; 76.0% over all 13 against 83.5% with the
     ground-truth poses.
+  - **End to end with the structure-less check (r49):** electro gains
+    2.6 points and kicker 0.1. Over the 13 scenes F1 is 76.0% aligned by
+    the camera centres. Aligned by the cameras' orientations
+    (`align_colmap_model.py --rotations`, ground-truth poses only) it is
+    79.2%, as high as ICP onto the scan, against 83.7% with the
+    ground-truth poses. meadow goes from 25.5% to 63.1% that way.
   - **End to end again (r47):** the multi-camera scenes resampled onto
     one camera, every cloud also scored after ICP onto the scan. Over
     the 13 scenes F1 is 75.8% against 83.7% with the ground-truth poses.

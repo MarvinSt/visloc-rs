@@ -404,6 +404,61 @@ column is its own run.
   is now checked against the tracks it continues, which refuses that
   image ([eth3d_auc_benchmark.md](eth3d_auc_benchmark.md#checking-structure-less-registrations)).
 
+### End to end with the structure-less check, three alignments (r49)
+
+r49 (L4, commit `c134a36`) repeated r47 with the structure-less
+registration check
+([eth3d_auc_benchmark.md](eth3d_auc_benchmark.md#checking-structure-less-registrations)).
+Each cloud is scored three ways:
+- aligned by the camera centres, as before;
+- by the cameras' orientations and centres (`align_colmap_model.py
+  --rotations`, the cloud moved by the similarity between the two fits),
+  which uses only the ground-truth poses;
+- after ICP onto the scan.
+
+F1 at 2 cm:
+
+| Scene | Ground-truth poses | r47 | Centres | Orientations | ICP |
+|---|---|---|---|---|---|
+| pipes | 84.1% | 88.5% | 88.5% | 88.7% | 88.6% |
+| meadow | 75.2% | 25.5% | 25.5% | 63.1% | 47.2% |
+| terrace | 91.2% | 91.2% | 91.2% | 90.3% | 90.4% |
+| office | 80.2% | 78.1% | 78.1% | 78.8% | 78.4% |
+| kicker | 83.8% | 81.8% | 81.9% | 82.0% | 82.1% |
+| relief | 88.2% | 85.4% | 85.4% | 85.9% | 86.0% |
+| relief 2 | 87.0% | 84.3% | 84.3% | 84.7% | 84.7% |
+| courtyard | 90.2% | 90.1% | 90.1% | 90.9% | 89.3% |
+| playground | 69.5% | 61.2% | 61.2% | 60.7% | 62.3% |
+| terrains | 91.4% | 90.8% | 90.8% | 91.0% | 91.3% |
+| delivery area | 90.3% | 84.2% | 84.2% | 86.3% | 86.6% |
+| electro | 89.5% | 75.4% | 78.0% | 78.3% | 78.8% |
+| facade | 67.3% | 49.0% | 49.0% | 49.4% | 64.2% |
+| **Mean** | 83.7% | 75.8% | 76.0% | **79.2%** | 79.2% |
+
+- **The check changes two scenes.**
+  - electro registers 41 of 45 images instead of 44, its largest
+    centre error 1.8 cm instead of 5.8, and gains 2.6 points.
+  - kicker loses DSC_6487 (66° off in r47) and gains 0.1. That image
+    sees little of the scan.
+  - The other eleven scenes give r47's F1 to the tenth.
+- **Aligned by the cameras' orientations, the 13 scenes score 79.2%,
+  4.5 points under the ground-truth poses.** That is as high as ICP
+  without the scan.
+  - meadow: the centres' fit is 1.05° off. The orientations fix it and
+    the scene goes from 25.5% to 63.1%, above ICP's 47.2%, which stops
+    in a local minimum.
+  - office and delivery area gain 0.7 and 2.1 points.
+- **facade is the exception.** Its cameras drift a few centimetres along
+  the 76-image wall, smoothly (one axis of the centre error runs from −3.5
+  to +2.4 cm along the sequence). The
+  orientations move its cloud by 0.2 mm, while ICP moves it 12 mm and
+  gains 15 points. Refining the focal length and principal point in a
+  replay of its matches leaves the drift as it is.
+- **The mapper's final converged BA** (`ba_global_final_converge_min_frames=0`)
+  was replayed on r49's L4 matches (r49a, seeds 0 to 2). It lowers
+  meadow's relative-rotation error from 0.13° to 0.10° and changes the
+  other scenes within noise, so the default stays.
+
 ### Against ACMMP on the same GPU
 
 ACMMP's released code (GhiXu/ACMMP, built for the L4) on the same

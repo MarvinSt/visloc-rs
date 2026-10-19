@@ -287,6 +287,43 @@ alignment (visloc-rs / COLMAP), and the SfM + MVS times:
   scan; on pipes the latter moves a ground-truth-pose cloud by 1.8 mm
   (F1 74.8% → 74.4% at 1600 px), so it measures little beyond noise there.
 
+### Against ACMMP on the same GPU
+
+ACMMP's released code (GhiXu/ACMMP, built for the L4) on the same
+images at 3200 px and ground-truth poses, its input from its
+`colmap2mvsnet_acm.py`, against visloc-mvs at commit `183af76` with its
+defaults. Each cloud comes from its own pipeline's fusion. F1,
+accuracy and completeness are at 2 cm; times cover the whole run
+(ACMMP's input conversion included). The pod was lost after six scenes.
+
+| Scene | visloc-mvs F1 (acc. / comp.) | ACMMP F1 (acc. / comp.) | `--geom-iterations 2` | Mesh | Time, visloc-mvs | Time, ACMMP |
+|---|---|---|---|---|---|---|
+| pipes | 84.4% (93.8 / 76.7) | 82.2% (95.4 / 72.2) | 83.6% | 79.2% | 2.4 min | 7.4 min |
+| meadow | 76.2% (85.0 / 69.1) | 72.6% (87.8 / 61.9) | 75.3% | 42.2% | 3.1 min | 9.9 min |
+| terrace | 91.1% (94.9 / 87.6) | 90.7% (95.9 / 86.0) | 91.0% | 83.2% | 4.5 min | 16.5 min |
+| office | 78.4% (76.3 / 80.7) | 83.7% (87.5 / 80.3) | 78.3% | 66.2% | 4.6 min | 17.4 min |
+| kicker | 82.3% (79.1 / 85.8) | 82.7% (85.5 / 80.1) | 81.6% | 80.1% | 5.9 min | 28.2 min |
+| relief | 87.8% (91.6 / 84.4) | 87.2% (95.2 / 80.4) | 87.7% | 84.5% | 7.0 min | 30.6 min |
+| **Mean / total** | **83.4%** | **83.2%** | 82.9% | 72.6% | **27.5 min** | **110.0 min** |
+
+- **Accuracy and time.** Over these six scenes the two score within 0.2
+  point (74.1% against 73.0% at 1 cm, 90.6% against 90.7% at 5 cm), and
+  visloc-mvs is 4.0 times faster. ACMMP is the more accurate on every
+  scene and visloc-mvs the more complete, by 3.9 points on average.
+- **Office.** This is the scene where ACMMP leads, by 5.3 points. The two
+  are equally complete, but ACMMP is 11 points more accurate. ACMMP's
+  fusion also requires the agreeing views to agree closely on average
+  (`--min-mean-consistency 0.3`). On office's 800 px maps that rule
+  raises accuracy from 76.7% to 90.5% but drops completeness from 46.6%
+  to 36.2%, so it has not been tried at 3200 px yet.
+- **`--geom-iterations 2`** (ACMMP's count) saves 13% of the time for
+  0.5 point of F1; the default stays 3.
+- **Mesh** (`--mesh --mesh-voxel-pixels 2`): 72.6% against the clouds'
+  83.4%. Meadow's 42.2% comes from its voxel, 4.6 cm. The voxel is two
+  pixels' footprint at the median of the views' depth-range midpoints,
+  and meadow's ranges reach far behind the scene; terrace gets 2.3 cm,
+  office 0.31 cm.
+
 ### One scale and the planar prior
 
 One run at commit `21b6596`: one scale, the photometric pass, the planar

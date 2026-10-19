@@ -76,6 +76,8 @@ pub struct View {
     pub rgb: Vec<[u8; 3]>,
     /// Depths searched for this view.
     pub depth_range: (f32, f32),
+    /// The median depth of the sparse points the view observes.
+    pub median_depth: f32,
     /// Indices of the source views, best first.
     pub sources: Vec<usize>,
 }
@@ -179,10 +181,12 @@ impl Workspace {
                 let sy = f64::from(rgb.height()) / f64::from(camera.height);
                 let rotation = image.rotation();
                 let translation = image.translation();
-                let depth_range = depth_range(model, image, &rotation, &translation, options)
-                    .ok_or_else(|| WorkspaceError::NoDepthRange {
-                        name: image.name.clone(),
-                    })?;
+                let (depth_range, median_depth) =
+                    depth_range(model, image, &rotation, &translation, options).ok_or_else(
+                        || WorkspaceError::NoDepthRange {
+                            name: image.name.clone(),
+                        },
+                    )?;
                 let mut candidates: Vec<(usize, f64)> = scores
                     .iter()
                     .filter_map(|(&(a, b), &score)| {
@@ -212,6 +216,7 @@ impl Workspace {
                     gray: Vec::new(),
                     rgb: rgb.pixels().map(|p| p.0).collect(),
                     depth_range,
+                    median_depth,
                     sources: candidates.into_iter().map(|(view, _)| view).collect(),
                 })
             })
@@ -295,14 +300,15 @@ fn view_pair_scores(
     scores
 }
 
-/// The depth range of `image` from the depths of the points it observes.
+/// The depth range of `image` from the depths of the points it observes,
+/// and their median.
 fn depth_range(
     model: &SparseModel,
     image: &crate::model::Image,
     rotation: &Matrix3<f64>,
     translation: &Vector3<f64>,
     options: &WorkspaceOptions,
-) -> Option<(f32, f32)> {
+) -> Option<((f32, f32), f32)> {
     let mut depths: Vec<f64> = image
         .point3d_ids
         .iter()
@@ -318,8 +324,11 @@ fn depth_range(
     let at = |q: f64| depths[((depths.len() - 1) as f64 * q).round() as usize];
     let (lo, hi) = options.depth_quantiles;
     Some((
-        (at(lo) * (1.0 - options.depth_stretch)) as f32,
-        (at(hi) * (1.0 + options.depth_stretch)) as f32,
+        (
+            (at(lo) * (1.0 - options.depth_stretch)) as f32,
+            (at(hi) * (1.0 + options.depth_stretch)) as f32,
+        ),
+        at(0.5) as f32,
     ))
 }
 

@@ -400,7 +400,9 @@ column is its own run.
     centres' fit 1.05° off (`align_colmap_model.py --rotations`).
   - facade moves 12 mm and gains 15 points.
 - **kicker registers its last image 66° and 1.3 m off**, and stays 2
-  points under its ground-truth-pose F1.
+  points under its ground-truth-pose F1. The structure-less registration
+  is now checked against the tracks it continues, which refuses that
+  image ([eth3d_auc_benchmark.md](eth3d_auc_benchmark.md#checking-structure-less-registrations)).
 
 ### Against ACMMP on the same GPU
 

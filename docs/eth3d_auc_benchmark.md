@@ -51,6 +51,9 @@ The scoring follows the GLOMAP paper.
   photo and EuRoC pipelines turn it on. `gsplat_photos` now also writes
   `complete_largest_model=1`. The Results tables predate it; its effect is
   under [Completing the largest model](#completing-the-largest-model).
+  It writes `structure_less_min_verified=10` too, which the tables
+  predate as well
+  ([Checking structure-less registrations](#checking-structure-less-registrations)).
 - **Metrics:**
   - AUC at 1°, 3° and 5° of the relative pose error over every pair of
     ground-truth images. The error is the larger of the rotation angle and
@@ -214,6 +217,49 @@ change from run to run:
   the six left-out photos, so the model stays byte for byte as it was, and
   the mapper takes 1% longer.
 - The rows are in `benchmarks/eth3d_auc_complete/`.
+
+## Checking structure-less registrations
+
+A structure-less registration (COLMAP 4's 2D–2D fallback, used by the
+completing pass too) can land far off with nothing in its own numbers to
+show it. ETH3D runs:
+- **kicker on an L4:** r47 placed DSC_6487 66° and 1.3 m off. Its 175
+  matches go to two registered images, 149 and 17. The GR6P RANSAC found
+  a rival pose with 166 inliers against the right one's 170. Replayed
+  from the L4's matches, seeds 0 and 1 kept the wrong one (66° and 77°
+  off) and seeds 2 to 5 the right one.
+- **electro on COLMAP's matches:** DSC_9290, DSC_9291 and DSC_9298 come
+  out 17 cm to 3.2 m off, depending on the seed.
+
+The inliers whose match continues a triangulated track give an
+independent check: the new pose should reproject those tracks' 3D points.
+With `structure_less_min_verified=N` (0 by default; `gsplat_photos` and
+`gsplat_euroc` write 10) the registration is refused unless at least N of
+those points reproject within `abs_pose_max_error` and they are at least
+70% of the points checked. The mapper log's `REGISTER path=SL` and
+`REJECT path=SL` lines give the inliers per registered image and the
+points verified.
+
+Mapper replays of the 13 scenes' exported matches, seeds 0 to 2. Each
+case is the registered images and the largest camera-centre error after a
+Sim(3), check off → on:
+
+| Matches | Scene | Off | On |
+|---|---|---|---|
+| COLMAP's (1600 px) | electro | 44–45 of 45, 0.08–3.2 m | 40 of 45, 5.5 cm |
+| | meadow | 15, 11–26 cm | 14–15, 10–15 cm |
+| | pipes, office | unchanged (pipes verifies all of 17 to 19 points, office 22 to 28 of 28) | |
+| visloc-rs's (3200 px, L4) | kicker | 31, 5.6 cm–1.5 m | 30, 0.8 cm |
+| visloc-rs's (3200 px, software Vulkan) | kicker | 31, 4.9 cm–1.5 m | 30, 0.8–1.0 cm |
+| | meadow | 15, 7.8–23 cm | 14–15, 7.8–23 cm |
+
+- **The other scenes do not change**, bit for bit: they register no image
+  structure-less.
+- **What the check costs:** kicker loses DSC_6487 even in the runs that
+  placed it right (2 to 4 continuing tracks are too few to verify). It
+  sees only 46 of the scan's points, and its loss improves the rest of
+  the model (largest error 5.2 → 0.8 cm). meadow's DSC_6553 stays where its
+  tracks verify (12 of 13) and goes where they do not (2 of 13, 4 cm off).
 
 ## Where visloc-rs trails
 

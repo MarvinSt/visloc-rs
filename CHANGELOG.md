@@ -121,6 +121,20 @@ All notable changes to `visloc-rs` will be documented here.
     2.93 against a rig scale of 3.57, so object captures keep their
     defaults.
 
+- **COLMAP-port mapper: structure-less registrations far off.** One whose
+  matches nearly all go to one registered image fixes the pose poorly.
+  GR6P RANSAC can then settle on a rival pose almost as well supported:
+  on an L4, ETH3D kicker's DSC_6487 came out 66° and 1.3 m off (r47), and
+  electro's images up to 3.2 m off on COLMAP's matches.
+  `MapperOptions::structure_less_min_verified` (0 by default; the photo
+  and EuRoC pipelines set 10) refuses the registration unless that many
+  of the tracks its inliers continue reproject within
+  `abs_pose_max_error`, and at least 70% of them. Over the 13 scenes'
+  replays only kicker, electro and meadow change. Their largest camera
+  errors fall from 1.5 m, 3.2 m and 26 cm to 1.0 cm, 5.5 cm and 15 cm,
+  for one to five fewer images. The `REGISTER path=SL` log line now gives
+  the inliers per registered image and the tracks verified.
+
 - **COLMAP-port mapper: structure-less registration triangulated with no
   error bound.** Its new tracks use the angular residual, in radians, but
   were bounded by `abs_pose_max_error` (12 px), so every ray passed.

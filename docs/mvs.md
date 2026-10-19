@@ -140,13 +140,16 @@ a point) are fused into a truncated signed distance field on a sparse
 grid, after the last view that reads the view, and the zero level set is
 extracted with surface nets (the TSDF of `gsplat_photos`' mesh, now in
 `visloc-gsplat-core`). The voxel is one pixel's footprint at the median
-depth (`--mesh-voxel`, `--mesh-voxel-pixels`); pixels without such a
-depth are unknown rather than empty, a cell whose corners are not all
+over the views of their sparse points' median depth (`--mesh-voxel`,
+`--mesh-voxel-pixels`). Pixels at least twice as far go to a second
+level four times coarser (`--mesh-levels`, 2 by default). Pixels without
+such a depth are unknown rather than empty, a cell whose corners are not all
 known still gets a vertex from its known edges (`--mesh-full-cells`
 requires all eight), and components under 50 triangles are dropped
 (`--mesh-min-component`).
 
-On pipes at 1600 px (the saved depth maps of an earlier run; F1 at 2 cm,
+On pipes at 1600 px (the saved depth maps of an earlier run, the earlier
+voxel rule below and one level; F1 at 2 cm,
 accuracy / completeness):
 
 | Output | F1 | Accuracy | Completeness |
@@ -160,9 +163,25 @@ Requiring every corner loses most of the surface: a pixel whose agreeing
 source pixel already went into a point fails fusion's check, so the
 depth maps have holes a pixel wide, and one unknown corner drops a cell.
 Thin structures (pipes' pipes) and far surfaces, whose depth noise
-exceeds the voxel, stay fragmented. Coarser TSDF levels for far pixels
-(`--mesh-levels`) did not help on pipes, whose surfaces are mostly within
-2 m of a camera. The mesh adds 1.5 s of fusion and 6.6 s of extraction
+exceeds the voxel, stay fragmented. The coarser level changes nothing on
+pipes, whose surfaces are mostly within 2 m of a camera.
+
+The voxel used to be the footprint at the median of the views'
+depth-range midpoints. Those ranges reach the far 99% quantile plus 25%.
+On meadow the midpoint is 40.5 m against a median depth of 7.9 m, so
+the voxel came out five times too coarse (4.6 cm at 3200 px; F1 42.2%
+at 2 cm in r40, against the cloud's 76.2%). Meadow's 800 px maps,
+meshed with two-pixel voxels (F1 at 2 cm; the cloud scores 67.5%):
+
+| Voxel | F1 | Accuracy | Completeness | Blocks | Peak memory |
+|---|---|---|---|---|---|
+| depth-range midpoint (18 cm) | 3.8% | 59.2% | 2.0% | 11,353 | 487 MiB |
+| median depth (3.6 cm), one level | 55.8% | 64.2% | 49.4% | 58,413 | 929 MiB |
+| median depth, two levels (the default) | 58.1% | 73.7% | 47.9% | 27,096 | 548 MiB |
+| median depth, three levels | 58.1% | 73.7% | 47.9% | 25,342 | 567 MiB |
+
+On office's 800 px maps the second level changes F1 by less than 0.01
+point (51.8%) and saves 4% of the memory. The mesh adds 1.5 s of fusion and 6.6 s of extraction
 there, and 1.0 GiB of peak memory (5.3 million triangles, 118 MB).
 
 ## ETH3D high-resolution benchmark
@@ -319,10 +338,10 @@ accuracy and completeness are at 2 cm; times cover the whole run
 - **`--geom-iterations 2`** (ACMMP's count) saves 13% of the time for
   0.5 point of F1; the default stays 3.
 - **Mesh** (`--mesh --mesh-voxel-pixels 2`): 72.6% against the clouds'
-  83.4%. Meadow's 42.2% comes from its voxel, 4.6 cm. The voxel is two
-  pixels' footprint at the median of the views' depth-range midpoints,
-  and meadow's ranges reach far behind the scene; terrace gets 2.3 cm,
-  office 0.31 cm.
+  83.4%. Meadow's 42.2% came from its voxel, 4.6 cm. The voxel was then
+  taken from the views' depth-range midpoints, which reach far behind
+  the scene (terrace got 2.3 cm, office 0.31 cm). It now comes from the
+  median depth, with a second, coarser level for far pixels (see Mesh).
 
 ### One scale and the planar prior
 

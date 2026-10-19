@@ -32,7 +32,8 @@ Text parsing maps the COLMAP camera model name to a `CameraModel`:
 - Fisheye family: `OPENCV_FISHEYE`, `SIMPLE_RADIAL_FISHEYE`, `RADIAL_FISHEYE`, `FOV`
 - `Unknown(String)` for other text model names (e.g. `THIN_PRISM_FISHEYE`)
 
-Binary parsing recognizes COLMAP camera model ids 0 through 10; ids 5
+Binary parsing recognizes COLMAP camera model ids 0 through 10 and 17
+(`EQUIRECTANGULAR`, two parameters); ids 5
 (`OPENCV_FISHEYE`), 6 (`FULL_OPENCV`), 7 (`FOV`), 8 (`SIMPLE_RADIAL_FISHEYE`)
 and 9 (`RADIAL_FISHEYE`) decode to their real `CameraModel` variants, and id 10
 (`THIN_PRISM_FISHEYE`) remains `Unknown`.

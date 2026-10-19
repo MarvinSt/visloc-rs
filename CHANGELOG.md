@@ -106,6 +106,12 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **A `cameras.bin` with one `EQUIRECTANGULAR` camera did not parse.** The
+  reader checked for room for three parameters per camera, the least any
+  other model takes, but model 17 has two, so a binary model with a single
+  panorama camera (the usual case) failed with `camera_count=1 requires at
+  least 48 remaining byte(s), but only 40 remain`. The floor is now 16.
+
 - **Mesh: empty for cameras close together looking out.** The TSDF voxel
   (scale / 256) and depth cut-off (2 x scale) were sized by the rig scale,
   the median distance of the camera centres from their centroid. A 360

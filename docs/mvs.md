@@ -320,7 +320,30 @@ alignment (visloc-rs / COLMAP), and the SfM + MVS times:
 - **Meadow** defeats both SfMs: visloc-rs registers all 15 images but
   triangulates 850 points and leaves a 2.7 cm median centre error (one
   image 9 cm off); COLMAP registers 14, one 23 cm off. With 16384
-  keypoints instead of 8192 visloc-rs keeps a 25 cm outlier.
+  keypoints instead of 8192 visloc-rs keeps a 25 cm outlier. Its sparse
+  points lie in a band along the barrack's wall (none on the grass, roof
+  or trees), which leaves the relative rotations about 0.09° off the
+  ground truth (pipes: 0.04°). DSC_6541, looking along the wall, comes
+  out 1.15° off in both SfMs: its posts and gutter repeat bay after bay,
+  and matches one bay apart agree with a slightly wrong pose (82 of its
+  268 matches with DSC_6540). The 26.0% above is also one unlucky run.
+  The same command on a software Vulkan device instead of the L4 (852
+  points against 850) gave a 1.3 cm median centre error, and r46
+  (`65ad452`, an L4) fused that model at 3200 px:
+
+  | Poses | Camera-centre Sim(3) | Then ICP onto the scan |
+  |---|---|---|
+  | Ground truth | 75.2% | 74.4% |
+  | visloc-rs SfM (that run) | 58.8% | 70.3% |
+  | pycolmap 4.2.1 SfM (CPU SIFT, 14 images) | 68.6% | 71.4% |
+
+  Fusion's reprojection limit does not matter: 3, 4 or 8 px instead of
+  2 px change F1 by less than 0.2 point for every pose set. The camera
+  centres, almost in one horizontal plane with one 22 cm outlier, fix the
+  alignment's tilt poorly. ICP moves the visloc-rs cloud by 0.13° and
+  3.1 cm (COLMAP's by 0.07° and 1.2 cm, the ground truth's by 0.02° and
+  3 mm). Aligned by the scan, the SfM poses lose about 4 to 5 points to
+  the ground truth on meadow.
 - **Tools for a next run:** `scripts/eth3d_one_camera.py` resamples a
   scene's images onto its most used camera (`K K_i^-1`, exact for pinhole
   images: patches at the moved observations match with NCC 0.997), and

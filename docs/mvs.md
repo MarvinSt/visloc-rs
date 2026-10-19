@@ -275,11 +275,12 @@ same GPU type), visloc-rs at commit `b05aeca`. Both take the images at
 3200 px, one pinhole camera for all of them (the scene's most used
 ground-truth camera, intrinsics held fixed), GPU SIFT and exhaustive
 matching; each model is then moved onto the ground-truth camera centres
-by a Sim(3) (`scripts/align_colmap_model.py`, refitted without centres
-beyond three times the median error), and the clouds are scored like the
-ground-truth-pose runs. visloc-mvs runs with its defaults, COLMAP with
-`image_undistorter --max_image_size 3200`, `patch_match_stereo
---PatchMatchStereo.geom_consistency true` and `stereo_fusion`'s defaults.
+by a Sim(3) (`scripts/align_colmap_model.py --centres`, refitted
+without centres beyond three times the median error), and the clouds are
+scored like the ground-truth-pose runs. visloc-mvs runs with its
+defaults, COLMAP with `image_undistorter --max_image_size 3200`,
+`patch_match_stereo --PatchMatchStereo.geom_consistency true` and
+`stereo_fusion`'s defaults.
 COLMAP's pod stopped at its 7-hour cap after 10 scenes. F1 at 2 cm
 (accuracy / completeness), the median camera-centre error after the
 alignment (visloc-rs / COLMAP), and the SfM + MVS times:
@@ -454,6 +455,10 @@ F1 at 2 cm:
   orientations move its cloud by 0.2 mm, while ICP moves it 12 mm and
   gains 15 points. Refining the focal length and principal point in a
   replay of its matches leaves the drift as it is.
+- **The protocol now aligns by the orientations.**
+  `align_colmap_model.py` does so by default (`--centres` for the
+  centres' fit). The COLMAP comparison above aligned both by the centres;
+  COLMAP's clouds were not kept, so it stays as measured.
 - **The mapper's final converged BA** (`ba_global_final_converge_min_frames=0`)
   was replayed on r49's L4 matches (r49a, seeds 0 to 2). It lowers
   meadow's relative-rotation error from 0.13° to 0.10° and changes the

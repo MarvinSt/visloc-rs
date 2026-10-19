@@ -779,6 +779,17 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **`scripts/align_colmap_model.py` takes the rotation from the cameras'
+  orientations by default.** The centres are still fitted first, then the
+  scale and translation under that rotation. `--centres` keeps the
+  centres' fit, and `--rotations`, the previous switch, is accepted.
+  - **Why:** on r49's ETH3D end-to-end run, F1 at 2 cm over the 13
+    scenes is 79.2% this way against 76.0% by the centres alone, as high
+    as ICP onto the scan, without the scan. meadow goes from 25.5% to
+    63.1%. Two scenes lose under a point (terrace 0.9, playground 0.5).
+  - The end-to-end comparison with COLMAP (76.3% against 57.4%) was
+    aligned by the centres for both and stays as measured.
+
 - **`gsplat_photos` extracts SIFT on the GPU and completes the largest
   model by default.** `--cpu-sift` and `--no-complete-model` restore the
   previous behaviour; `--cpu` also extracts on the CPU.

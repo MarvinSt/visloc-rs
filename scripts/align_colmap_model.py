@@ -2,25 +2,28 @@
 """Move a COLMAP text model into a reference model's frame.
 
     align_colmap_model.py EST_DIR REF_IMAGES_TXT OUT_DIR [--names IMAGE_NAMES_TXT]
-                          [--rotations]
+                          [--centres]
 
-Fits the Sim(3) taking EST_DIR's camera centres onto those of the
-reference images with the same file names (compared without directories),
-refits once without the cameras more than three times the median error
-off, and writes the model with its poses and points transformed to
-OUT_DIR. Observations and tracks are kept as they are, so a dense
-reconstruction from OUT_DIR lands in the reference frame (ETH3D's laser
-scans, for example). With ``--names`` (a ``gsplat_photos`` run's
-``image_names.txt``: working name, original path), images are matched and
-written under their original file names. With ``--rotations`` the
-rotation comes from the cameras' orientations instead (the chordal mean of
-R_ref^T R_est over the cameras kept by the centre fit, refitted once
-without those more than three times the median angle off), and the scale
-and translation from the centres under it: centres nearly in one plane,
-as on ETH3D's meadow, fix the tilt poorly, and one camera a few
-centimetres off can tilt the cloud by a degree. Prints the fit: matched
-cameras, scale and centre errors in reference units (and the rotation's
-change). Needs numpy.
+Fits the Sim(3) taking EST_DIR's cameras onto the reference images with
+the same file names (compared without directories) and writes the model
+with its poses and points transformed to OUT_DIR. Observations and
+tracks are kept as they are, so a dense reconstruction from OUT_DIR lands
+in the reference frame (ETH3D's laser scans, for example). With
+``--names`` (a ``gsplat_photos`` run's ``image_names.txt``: working name,
+original path), images are matched and written under their original file
+names.
+
+The camera centres are fitted first, refitted once without the cameras
+more than three times the median error off. The rotation then comes from
+the cameras' orientations (the chordal mean of R_ref^T R_est over the
+cameras kept by the centre fit, refitted once without those more than
+three times the median angle off), and the scale and translation from the
+centres under it: centres nearly in one plane, as on ETH3D's meadow, fix
+the tilt poorly, and one camera a few centimetres off can tilt the cloud
+by a degree. ``--centres`` keeps the centres' fit, the alignment before
+the orientations were used (``--rotations``, their old switch, is
+accepted). Prints the fit: matched cameras, scale, centre errors in
+reference units and the rotation's change. Needs numpy.
 """
 from __future__ import annotations
 
@@ -98,9 +101,8 @@ def angle_deg(r):
 
 def main():
     args = sys.argv[1:]
-    rotations = "--rotations" in args
-    if rotations:
-        args.remove("--rotations")
+    rotations = "--centres" not in args
+    args = [a for a in args if a not in ("--centres", "--rotations")]
     original = {}
     if "--names" in args:
         k = args.index("--names")

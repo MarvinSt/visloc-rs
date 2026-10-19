@@ -25,13 +25,15 @@ const LEVEL_RATIO: f64 = 4.0;
 #[derive(Debug, Clone)]
 pub struct MeshOptions {
     /// The finest level's voxel edge in world units; `None` takes
-    /// `voxel_pixels` pixels' footprint at the median of the views'
-    /// depth-range midpoints.
+    /// `voxel_pixels` pixels' footprint at the median over the views of
+    /// their sparse points' median depth.
     pub voxel: Option<f64>,
     /// A pixel's depth goes to the level whose voxel is nearest (in
     /// ratio) to this many times its footprint.
     pub voxel_pixels: f64,
-    /// TSDF levels, each 4 times coarser than the one before.
+    /// TSDF levels, each 4 times coarser than the one before (two by
+    /// default: pixels twice as far as the median depth or more fuse at
+    /// the coarser one).
     pub levels: usize,
     /// Truncation distance, in voxels.
     pub trunc_voxels: f32,
@@ -52,7 +54,7 @@ impl Default for MeshOptions {
         Self {
             voxel: None,
             voxel_pixels: 1.0,
-            levels: 1,
+            levels: 2,
             trunc_voxels: 3.0,
             min_weight: 1.0,
             min_component: 50,
@@ -78,7 +80,7 @@ impl TsdfMesher {
             let mut footprints: Vec<f64> = ws
                 .views
                 .iter()
-                .map(|v| 0.5 * f64::from(v.depth_range.0 + v.depth_range.1) / v.fx)
+                .map(|v| f64::from(v.median_depth) / v.fx)
                 .collect();
             footprints.sort_by(f64::total_cmp);
             options.voxel_pixels * footprints.get(footprints.len() / 2).copied().unwrap_or(1.0)

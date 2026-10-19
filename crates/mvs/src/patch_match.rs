@@ -1901,6 +1901,7 @@ pub(crate) fn plane_scene() -> Workspace {
             rgb: gray.iter().map(|&g| [g as u8; 3]).collect(),
             gray,
             depth_range: (2.0, 8.0),
+            median_depth: 4.0,
             sources: Vec::new(),
         }
     };

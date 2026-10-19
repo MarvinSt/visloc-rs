@@ -126,6 +126,16 @@ rasterizer renders a frame without a GPU. This is the stage-0 foundation of the
 Rust 3DGS effort; the plan and staged roadmap are in
 [rust_3dgs_plan.md](rust_3dgs_plan.md).
 
+`visloc-gsplat-train` trains from such a model (`gsplat_train --data <root>`,
+text or binary, with the images in `<root>/images`). A model whose camera is
+`EQUIRECTANGULAR` (id 17, parameters `width, height`; COLMAP 4.1
+writes it for 360° panoramas) is cut into cube-face
+views first: the six 90° faces of `gsplat_photos --equirect`, each posed by
+the panorama's pose with the face's fixed rotation behind it. Faces that see
+fewer than 15 of the model's points are left out, and the face images are
+written to `<root>/equirect_faces`. Every other camera must be a pinhole
+(undistort first).
+
 ## Validation
 
 Use map validation before localization:

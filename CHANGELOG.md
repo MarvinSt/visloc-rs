@@ -807,6 +807,25 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **`gsplat_photos` runs the mapper's converged final global BA on every
+  model** (`ba_global_final_converge_min_frames=0`; the pipeline's
+  default stays at 1,000 frames).
+  - **Why:** images registered from few tracks keep a few tenths of a
+    degree of error after the incremental loop's global BAs, which stop
+    after a step or two. On ETH3D electro (r52), DSC_9289, DSC_9290 and
+    DSC_9298 came out 0.17 to 0.27° and 0.6 to 1.5 cm off. A BA run to
+    convergence, started from the mapper's model or from the ground
+    truth, lands on 0.02 to 0.05° and 0.3 to 1.0 cm.
+  - **Mapper replays of the 13 ETH3D scenes** (seeds 0 to 2): electro's
+    relative-rotation error goes from 0.040° to 0.031° and its largest
+    centre error from 1.7-2.3 to 1.3-1.8 cm. meadow's goes from 0.13 and
+    0.15° to 0.10 and 0.11° on seeds 0 and 1 (seed 2 stays at 0.10°). The
+    others change by under a millimetre, at a few seconds more.
+  - **End to end on electro (r53, L4):** F1 at 2 cm goes from 78.7%
+    (r52) to 84.5%, and from 86.4% to 92.5% at 5 cm, against 89.4% and
+    95.1% with the ground-truth poses. The 13-scene end-to-end mean
+    becomes 81.5%.
+
 - **`scripts/align_colmap_model.py` takes the rotation from the cameras'
   orientations by default.** The centres are still fitted first. The
   scale and translation follow under that rotation, from the cameras

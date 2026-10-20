@@ -1539,7 +1539,27 @@ times looser in the pass (`--gyro-rw-scale 10` in both solves, on top of the
 warm-up) it loses 4 (51.96), and six of the eight day sequences gain
 (sequence_1_20 +4.5, 3_17 +4.1; 2_11 −2.5 and 3_18 −4.6).
 
+In low light the pass still loses to the online result. From the wide-band
+online results (no warm-up), sequence_4_10 and 4_11 score 54.40 and 62.27
+after the pass, and 66.27 and 67.27 with its random walk ten times looser,
+against 64.18 and 71.07 online (mean 66.77 against 67.63), so low light
+keeps the online result. [`scripts/lamaria_ba_chain.py`](../scripts/lamaria_ba_chain.py)
+runs these steps per track and reproduces the scratch runs: sequence_1_20
+online 81.79, after the pass 86.20.
+
 ## Usage
+
+[`scripts/lamaria_ba_chain.py`](../scripts/lamaria_ba_chain.py) runs the real-time chain behind a VIO
+trajectory, with the options of each track, and resumes where an earlier run stopped:
+
+```bash
+S=sequence_2_11
+python scripts/lamaria_ba_chain.py --mav0 data/$S/mav0 --vio vio/$S.tum \
+  --imu data/$S/mav0/imu0/data.csv --calib calib/$S.json --track 2 --work work/$S --out out/$S.tum
+```
+
+`scripts/run_lamaria_test_submission.py --ba-chain` runs it on every downloaded sequence (the VIO with
+`euroc_config`, `euroc_config_lowlight` in low light) and packages its trajectories. The steps one by one:
 
 ```bash
 pip install numpy scipy opencv-python gtsam numba
@@ -1635,5 +1655,6 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   about 6.5 GB of memory.
 - **Removed options.** The options of some experiments above that did not
   help are gone: the keypoint position correction, the focal length trend,
-  the keypoint size ratio filter, the warm-up random walk, and the `sizes`
-  stage for features written without sizes. Commit `adfe888` still has them.
+  the keypoint size ratio filter, an earlier warm-up random walk of the batch
+  solve (`--gyro-rw-warmup` now does it, online), and the `sizes` stage for
+  features written without sizes. Commit `adfe888` still has them.

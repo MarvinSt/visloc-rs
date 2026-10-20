@@ -261,6 +261,52 @@ Sim(3), check off → on:
   the model (largest error 5.2 → 0.8 cm). meadow's DSC_6553 stays where its
   tracks verify (12 of 13) and goes where they do not (2 of 13, 4 cm off).
 
+### Views panned from one spot
+
+On electro (visloc-rs's L4 matches) DSC_9289, DSC_9290 and DSC_9298 look
+at ground that, among the registered images, only DSC_9293 to DSC_9295
+see. Those three were taken from one spot, 5 cm apart:
+- **No 3D points there.** The three views triangulate nothing in that
+  area, so the images reach too few 3D points for PnP (6 to 30).
+- **No distance either.** Their 2D–2D matches fix the direction from
+  that spot but hardly the distance. GR6P put DSC_9289 15 cm off
+  (distance × 0.83, direction within 0.55°), DSC_9290 9 cm and DSC_9298
+  36 cm, and the check refused all three.
+
+With the check on, a structure-less pose now gets two more rules:
+- **A second try when the check fails.** GR6P's rotation and direction
+  are kept, and the distance is taken from the continuing tracks. That
+  is one degree of freedom, so the check on those tracks stays nearly
+  independent. The pose is then refined on the 2D–2D inliers' epipolar
+  errors alone, and the distance is chosen again. The mapper log writes
+  `RESCUE path=SL`.
+- **Parallax.** Half the inliers must see their point at 1.5° or more,
+  for the GR6P pose and the second try alike. Matches to a view taken
+  from the same spot satisfy the epipolar constraint wherever the camera
+  is. DSC_9291, 8 cm from DSC_9292, has about 160 such matches and about
+  30 wrong ones, which put it 6.6 m off. In the replays 8 to 13% of its
+  inliers have parallax (once 85%, where its tracks failed), against 72
+  to 99% for the poses kept. In one replay (seed 3) its GR6P pose had
+  passed the track check (19 of 22) once its neighbours were in.
+
+Mapper replays of visloc-rs's L4 matches, seeds 0 to 2; registered images
+and the largest camera-centre error:
+
+| Scene | Before | After |
+|---|---|---|
+| electro | 41 of 45, 1.3–1.8 cm | 44 of 45, 1.7–2.3 cm |
+| meadow | 14–15, 20–22 cm | 15, 21–22 cm |
+| kicker | 30, 0.8 cm | 30, 0.8 cm |
+
+- **electro, seeds 3 and 4:** 44 of 45, 1.7 and 1.8 cm. DSC_9291 stays out.
+- **meadow:** seed 1 now keeps DSC_6553 as seeds 0 and 2 do. The 21 cm
+  is its other outlier, the same in every seed.
+- **The other ten scenes** register no image structure-less and do not
+  change.
+- **What it is worth:** with the ground-truth poses, electro's MVS
+  scores 89.4% F1 at 2 cm with all 45 images and 80.6% without the four
+  ([mvs.md](mvs.md#electro-what-the-unregistered-images-cost-r51)).
+
 ## Where visloc-rs trails
 
 - **Registrations:** the global mapper registers every image. On electro,

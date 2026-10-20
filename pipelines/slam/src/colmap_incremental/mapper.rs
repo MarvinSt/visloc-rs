@@ -135,11 +135,27 @@ pub struct Options {
     /// almost as well supported. On an L4, ETH3D kicker's DSC_6487 came
     /// out 66° off that way, its 175 matches all but 17 to one image and 3
     /// continuing tracks.
+    ///
+    /// With the check on, a structure-less pose also needs
+    /// [`STRUCTURE_LESS_MIN_PARALLAX_RATIO`] of its inliers to see their
+    /// point with parallax, and a pose that fails the track check gets a
+    /// second try with its distance from the matched cameras taken from
+    /// the tracks (see `rescue_structure_less_pose`): views panned from one
+    /// spot fix the direction to a new image but hardly its distance.
     pub structure_less_min_verified: usize,
 }
 
 /// See [`Options::structure_less_min_verified`].
 pub const STRUCTURE_LESS_MIN_VERIFIED_RATIO: f64 = 0.7;
+
+/// See [`Options::structure_less_min_verified`]: the share of a
+/// structure-less registration's inliers that must see their point at
+/// [`STRUCTURE_LESS_MIN_TRI_ANGLE_DEG`] or more.
+pub const STRUCTURE_LESS_MIN_PARALLAX_RATIO: f64 = 0.5;
+
+/// See [`STRUCTURE_LESS_MIN_PARALLAX_RATIO`] (COLMAP's default
+/// `min_tri_angle`).
+pub const STRUCTURE_LESS_MIN_TRI_ANGLE_DEG: f64 = 1.5;
 
 impl Default for Options {
     fn default() -> Self {
@@ -661,12 +677,12 @@ impl IncrementalMapper {
         let mut per_world: Vec<usize> = per_world.into_values().collect();
         per_world.sort_unstable_by(|a, b| b.cmp(a));
 
-        let cam_from_world = SE3::new(report.pose.rotation, report.pose.translation);
-        // Inlier 2D points whose match continues a triangulated track, and
-        // those of them whose 3D point the new pose reprojects within
+        let mut cam_from_world = SE3::new(report.pose.rotation, report.pose.translation);
+        // Inlier 2D points whose match continues a triangulated track, one
+        // 3D point each: the pose must reproject them within
         // `abs_pose_max_error` (an independent check of the pose).
         let mut checked: BTreeSet<usize> = BTreeSet::new();
-        let mut verified = 0;
+        let mut tracks: Vec<(Point2<f64>, Vector3<f64>)> = Vec::new();
         for &i in &report.inliers {
             let (idx, world_id, world_idx) = corrs[i];
             let Some(point3d_id) = recon.image(world_id).points2d[world_idx].point3d_id else {
@@ -675,32 +691,94 @@ impl IncrementalMapper {
             if !checked.insert(idx) {
                 continue;
             }
-            let xyz = recon.point3d(point3d_id).xyz;
-            let in_cam = cam_from_world.rotation * xyz.coords + cam_from_world.translation;
-            if in_cam.z <= 0.0 {
-                continue;
-            }
-            if let Some(uv) = camera.project(&Point3::from(in_cam)) {
-                if (uv - recon.image(image_id).points2d[idx].xy).norm()
-                    <= options.abs_pose_max_error
-                {
-                    verified += 1;
-                }
-            }
-        }
-        if options.structure_less_min_verified > 0
-            && (verified < options.structure_less_min_verified
-                || (verified as f64) < STRUCTURE_LESS_MIN_VERIFIED_RATIO * checked.len() as f64)
-        {
-            self.log_event(format!(
-                "REJECT path=SL image={} inliers={} inliers_per_image={:?} verified={}/{}",
-                image_id,
-                report.inliers.len(),
-                &per_world[..per_world.len().min(4)],
-                verified,
-                checked.len()
+            tracks.push((
+                recon.image(image_id).points2d[idx].xy,
+                recon.point3d(point3d_id).xyz.coords,
             ));
-            return false;
+        }
+        let passes = |verified: usize| {
+            options.structure_less_min_verified == 0
+                || (verified >= options.structure_less_min_verified
+                    && (verified as f64) >= STRUCTURE_LESS_MIN_VERIFIED_RATIO * tracks.len() as f64)
+        };
+        let mut verified = count_reprojected(
+            &camera,
+            &cam_from_world,
+            &tracks,
+            options.abs_pose_max_error,
+        );
+        let epipolar: Vec<(Vector3<f64>, Vector3<f64>, Vector3<f64>)> = report
+            .inliers
+            .iter()
+            .map(|&i| {
+                (
+                    gr_corrs[i].rig2.bearing,
+                    gr_corrs[i].rig1.origin,
+                    gr_corrs[i].rig1.bearing,
+                )
+            })
+            .collect();
+        // Matches to a view taken from the same spot hold wherever the camera
+        // is, so most inliers must also see their point with parallax.
+        let parallax = |pose: &SE3| {
+            epipolar_support(
+                pose,
+                &epipolar,
+                options.abs_pose_max_error,
+                pixels_per_radian,
+            )
+            .1
+        };
+        let has_parallax = |count: usize| {
+            options.structure_less_min_verified == 0
+                || (count as f64) >= STRUCTURE_LESS_MIN_PARALLAX_RATIO * epipolar.len() as f64
+        };
+        let mut with_parallax = parallax(&cam_from_world);
+        if !passes(verified) || !has_parallax(with_parallax) {
+            let rescued = if passes(verified) {
+                None
+            } else {
+                rescue_structure_less_pose(
+                    &camera,
+                    &cam_from_world,
+                    &epipolar,
+                    &tracks,
+                    options.abs_pose_max_error,
+                    pixels_per_radian,
+                )
+                .map(|pose| {
+                    let count =
+                        count_reprojected(&camera, &pose, &tracks, options.abs_pose_max_error);
+                    let with_parallax = parallax(&pose);
+                    (pose, count, with_parallax)
+                })
+                .filter(|&(_, count, with_parallax)| passes(count) && has_parallax(with_parallax))
+            };
+            let Some((pose, count, rescued_parallax)) = rescued else {
+                self.log_event(format!(
+                    "REJECT path=SL image={} inliers={} inliers_per_image={:?} verified={}/{} parallax={}",
+                    image_id,
+                    report.inliers.len(),
+                    &per_world[..per_world.len().min(4)],
+                    verified,
+                    tracks.len(),
+                    with_parallax
+                ));
+                return false;
+            };
+            self.log_event(format!(
+                "RESCUE path=SL image={} verified={}/{} -> {}/{} parallax={} -> {}",
+                image_id,
+                verified,
+                tracks.len(),
+                count,
+                tracks.len(),
+                with_parallax,
+                rescued_parallax
+            ));
+            cam_from_world = pose;
+            verified = count;
+            with_parallax = rescued_parallax;
         }
         let camera_id = recon.image(image_id).camera_id;
         let rig = recon.rig(recon.frame(frame_id).rig_id()).clone();
@@ -710,7 +788,7 @@ impl IncrementalMapper {
         self.obs.register_frame(recon, graph, frame_id);
         self.register_frame_event(recon, frame_id);
         self.log_event(format!(
-            "REGISTER path=SL frame={} image={} inliers={} correspondences={} num_reg_frames={} num_points3d={} inliers_per_image={:?} continuing={} verified={}/{}",
+            "REGISTER path=SL frame={} image={} inliers={} correspondences={} num_reg_frames={} num_points3d={} inliers_per_image={:?} continuing={} verified={}/{} parallax={}",
             frame_id,
             image_id,
             report.inliers.len(),
@@ -720,7 +798,8 @@ impl IncrementalMapper {
             &per_world[..per_world.len().min(4)],
             continuing,
             verified,
-            checked.len()
+            tracks.len(),
+            with_parallax
         ));
 
         // Inlier correspondences per 2D point, in COLMAP's order.
@@ -1639,6 +1718,236 @@ impl IncrementalMapper {
     }
 }
 
+/// Of the GR6P inliers `epipolar` (query ray, world centre, world ray):
+/// those within `max_error / 2` pixels of their epipolar planes under
+/// `cam_from_world`, and those of them whose two rays meet at
+/// [`STRUCTURE_LESS_MIN_TRI_ANGLE_DEG`] or more.
+fn epipolar_support(
+    cam_from_world: &SE3,
+    epipolar: &[(Vector3<f64>, Vector3<f64>, Vector3<f64>)],
+    max_error: f64,
+    pixels_per_radian: f64,
+) -> (usize, usize) {
+    let world_from_cam = cam_from_world.rotation.inverse();
+    let centre = -(world_from_cam * cam_from_world.translation);
+    let min_cos = STRUCTURE_LESS_MIN_TRI_ANGLE_DEG.to_radians().cos();
+    let (mut kept, mut parallax) = (0, 0);
+    for (query, origin, world_ray) in epipolar {
+        let normal = (centre - origin).cross(world_ray);
+        let norm = normal.norm();
+        let query = (world_from_cam * query).normalize();
+        if norm <= 1e-12 || pixels_per_radian * (normal / norm).dot(&query).abs() > 0.5 * max_error
+        {
+            continue;
+        }
+        kept += 1;
+        if query.dot(&world_ray.normalize()) <= min_cos {
+            parallax += 1;
+        }
+    }
+    (kept, parallax)
+}
+
+/// How many of `tracks` (pixel, 3D point) `cam_from_world` reprojects in
+/// front of the camera within `max_error` pixels.
+fn count_reprojected(
+    camera: &visloc_core::types::Camera,
+    cam_from_world: &SE3,
+    tracks: &[(Point2<f64>, Vector3<f64>)],
+    max_error: f64,
+) -> usize {
+    tracks
+        .iter()
+        .filter(|(xy, xyz)| {
+            let in_cam = cam_from_world.rotation * xyz + cam_from_world.translation;
+            in_cam.z > 0.0
+                && camera
+                    .project(&Point3::from(in_cam))
+                    .is_some_and(|uv| (uv - xy).norm() <= max_error)
+        })
+        .count()
+}
+
+/// Not in COLMAP: another pose for a structure-less registration whose
+/// GR6P pose fails the track check, when the registered cameras it matches
+/// sit at nearly one centre (views panned from one spot). Their 2D-2D
+/// matches fix the rotation and the direction from that centre but hardly
+/// the distance: on ETH3D electro, DSC_9289's matches went to three views
+/// 5 cm apart, and GR6P put it 15 cm off with 0 of 14 tracks reprojecting.
+///
+/// The tracks set the distance only, one degree of freedom, so the caller's
+/// check on them stays nearly independent:
+/// - along GR6P's direction from the inliers' mean world centre, the
+///   distance that reprojects the most `tracks` within `max_error`;
+/// - the pose refined from there on the inliers' epipolar errors alone, in
+///   pixels (Levenberg-Marquardt, Huber at `max_error / 6`);
+/// - the distance chosen again along the refined direction.
+///
+/// Returns `None` unless a track agrees and 90% of the inliers stay within
+/// `max_error / 2` of their epipolar planes. `epipolar` holds, per GR6P
+/// inlier, the query camera's ray and the world camera's centre and ray.
+/// The caller checks the result as it checks GR6P's pose.
+fn rescue_structure_less_pose(
+    camera: &visloc_core::types::Camera,
+    pose: &SE3,
+    epipolar: &[(Vector3<f64>, Vector3<f64>, Vector3<f64>)],
+    tracks: &[(Point2<f64>, Vector3<f64>)],
+    max_error: f64,
+    pixels_per_radian: f64,
+) -> Option<SE3> {
+    use nalgebra::{Matrix6, UnitQuaternion, Vector6};
+    if epipolar.is_empty() || tracks.is_empty() {
+        return None;
+    }
+    let cluster = epipolar
+        .iter()
+        .fold(Vector3::zeros(), |sum, (_, origin, _)| sum + origin)
+        / epipolar.len() as f64;
+    let at = |rotation: UnitQuaternion<f64>, centre: Vector3<f64>| {
+        SE3::new(rotation, -(rotation * centre))
+    };
+    // The centre along `centre - cluster` from which the most tracks
+    // reproject, and how many: each track's ray passes closest to its 3D
+    // point from one distance.
+    let place = |rotation: UnitQuaternion<f64>, centre: Vector3<f64>| {
+        let distance = (centre - cluster).norm();
+        if distance.is_nan() || distance <= 1e-12 {
+            return None;
+        }
+        let direction = (centre - cluster) / distance;
+        let world_from_cam = rotation.inverse();
+        let mut best: Option<(usize, Vector3<f64>)> = None;
+        for (xy, xyz) in tracks {
+            let Some(ray) = pixel_ray(camera, xy) else {
+                continue;
+            };
+            let ray = (world_from_cam * ray).normalize();
+            let b = direction.dot(&ray);
+            let det = 1.0 - b * b;
+            if det < 1e-9 {
+                continue;
+            }
+            let offset = xyz - cluster;
+            let (along, depth) = (direction.dot(&offset), ray.dot(&offset));
+            let lambda = (along - b * depth) / det;
+            if lambda <= 0.0 || (depth - b * along) / det <= 0.0 {
+                continue;
+            }
+            let candidate = cluster + lambda * direction;
+            let count = count_reprojected(camera, &at(rotation, candidate), tracks, max_error);
+            if best.is_none_or(|(n, _)| count > n) {
+                best = Some((count, candidate));
+            }
+        }
+        best
+    };
+    let epipolar_errors = |rotation: UnitQuaternion<f64>, centre: Vector3<f64>| -> Vec<f64> {
+        let cam_from_world = rotation.inverse();
+        epipolar
+            .iter()
+            .map(|(query, origin, world_ray)| {
+                let normal = (centre - origin).cross(world_ray);
+                let norm = normal.norm();
+                if norm > 1e-12 {
+                    pixels_per_radian * (normal / norm).dot(&(cam_from_world * query).normalize())
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    };
+
+    let gr6p_centre = -(pose.rotation.inverse() * pose.translation);
+    let start = place(pose.rotation, gr6p_centre)
+        .filter(|&(count, _)| count > 0)
+        .map_or(gr6p_centre, |(_, centre)| centre);
+    let scale = (start - cluster).norm().max(1e-12);
+
+    // Levenberg-Marquardt on the epipolar errors: a left-multiplied rotation
+    // (scaled axis) and a centre update.
+    let unpack = |p: &Vector6<f64>| {
+        (
+            UnitQuaternion::from_scaled_axis(Vector3::new(p[0], p[1], p[2])) * pose.rotation,
+            start + Vector3::new(p[3], p[4], p[5]),
+        )
+    };
+    let huber = max_error / 6.0;
+    let cost = |r: &[f64]| -> f64 {
+        r.iter()
+            .map(|&e| {
+                if e.abs() <= huber {
+                    0.5 * e * e
+                } else {
+                    huber * (e.abs() - 0.5 * huber)
+                }
+            })
+            .sum()
+    };
+    let steps = [1e-7, 1e-7, 1e-7, 1e-7 * scale, 1e-7 * scale, 1e-7 * scale];
+    let mut p = Vector6::zeros();
+    let (r0, c0) = unpack(&p);
+    let mut residuals = epipolar_errors(r0, c0);
+    let mut current = cost(&residuals);
+    let mut damping = 1e-4;
+    for _ in 0..30 {
+        let mut jtj = Matrix6::<f64>::zeros();
+        let mut jtr = Vector6::<f64>::zeros();
+        let mut jac = vec![Vector6::<f64>::zeros(); residuals.len()];
+        for (k, h) in steps.iter().enumerate() {
+            let (mut plus, mut minus) = (p, p);
+            plus[k] += h;
+            minus[k] -= h;
+            let (rp, cp) = unpack(&plus);
+            let (rm, cm) = unpack(&minus);
+            for (row, (a, b)) in jac
+                .iter_mut()
+                .zip(epipolar_errors(rp, cp).iter().zip(&epipolar_errors(rm, cm)))
+            {
+                row[k] = (a - b) / (2.0 * h);
+            }
+        }
+        for (row, &e) in jac.iter().zip(&residuals) {
+            let w = if e.abs() <= huber {
+                1.0
+            } else {
+                huber / e.abs()
+            };
+            jtj += w * row * row.transpose();
+            jtr += w * e * row;
+        }
+        let mut improved = false;
+        while damping < 1e8 {
+            let lhs = jtj + Matrix6::from_diagonal(&(jtj.diagonal() * damping));
+            let Some(step) = lhs.cholesky().map(|c| c.solve(&(-jtr))) else {
+                damping *= 10.0;
+                continue;
+            };
+            let trial = p + step;
+            let (rt, ct) = unpack(&trial);
+            let trial_residuals = epipolar_errors(rt, ct);
+            let trial_cost = cost(&trial_residuals);
+            if trial_cost < current {
+                improved = current - trial_cost > 1e-12 * current;
+                (p, residuals, current) = (trial, trial_residuals, trial_cost);
+                damping = (damping * 0.1).max(1e-9);
+                break;
+            }
+            damping *= 10.0;
+        }
+        if !improved {
+            break;
+        }
+    }
+    let (rotation, centre) = unpack(&p);
+    let (count, centre) = place(rotation, centre)?;
+    let rescued = at(rotation, centre);
+    let (kept, _) = epipolar_support(&rescued, epipolar, max_error, pixels_per_radian);
+    if count == 0 || (kept as f64) < 0.9 * epipolar.len() as f64 {
+        return None;
+    }
+    Some(rescued)
+}
+
 /// The camera-frame ray of pixel `xy`: `(x, y, 1)` on the normalized image
 /// plane, or a spherical camera's unit ray, which may point behind it.
 fn pixel_ray(camera: &visloc_core::types::Camera, xy: &Point2<f64>) -> Option<Vector3<f64>> {
@@ -1737,6 +2046,101 @@ mod tests {
         ));
         assert!(!recon.is_image_registered(2));
         assert_eq!(recon.num_points3d(), 0);
+    }
+
+    /// A camera whose 2D-2D matches all go to three views 2 cm apart, 1 m
+    /// away: started 30% short of that distance and 0.6° off, the rescue
+    /// puts it back from 15 tracks, with parallax on most inliers. At 1 cm
+    /// from them, whatever it returns lacks that parallax, and the caller
+    /// refuses it.
+    #[test]
+    fn rescue_sets_the_distance_from_a_panned_cluster() {
+        use super::{
+            count_reprojected, epipolar_support, rescue_structure_less_pose,
+            STRUCTURE_LESS_MIN_PARALLAX_RATIO,
+        };
+        use nalgebra::{Point2, UnitQuaternion, Vector3};
+        use visloc_core::geometry::SE3;
+        use visloc_core::types::Camera;
+
+        let camera = Camera::pinhole(1, 1280, 960, 1000.0, 1000.0, 640.0, 480.0);
+        let cluster: Vec<Vector3<f64>> = (0..3)
+            .map(|j| Vector3::new(0.01 * j as f64, 0.0, 0.0))
+            .collect();
+        let mut seed = 7u64;
+        let mut uniform = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let points: Vec<Vector3<f64>> = (0..300)
+            .map(|_| {
+                Vector3::new(
+                    4.0 * uniform() - 1.5,
+                    3.0 * uniform() - 1.5,
+                    3.0 + 4.0 * uniform(),
+                )
+            })
+            .collect();
+        let scene = |centre: Vector3<f64>, rotation: UnitQuaternion<f64>| {
+            let pose = SE3::new(rotation, -(rotation * centre));
+            let mut epipolar = Vec::new();
+            let mut tracks = Vec::new();
+            for x in &points {
+                let in_cam = rotation * (x - centre);
+                let Some(uv) = camera.project(&nalgebra::Point3::from(in_cam)) else {
+                    continue;
+                };
+                if in_cam.z <= 0.0 || uv.x < 0.0 || uv.y < 0.0 || uv.x > 1280.0 || uv.y > 960.0 {
+                    continue;
+                }
+                for c in &cluster {
+                    epipolar.push((in_cam.normalize(), *c, (x - c).normalize()));
+                }
+                if tracks.len() < 15 {
+                    tracks.push((Point2::new(uv.x, uv.y), *x));
+                }
+            }
+            (pose, epipolar, tracks)
+        };
+        let rotation = UnitQuaternion::from_scaled_axis(Vector3::new(0.0, -3f64.to_radians(), 0.0));
+        let tilt = UnitQuaternion::from_scaled_axis(
+            Vector3::new(0.006, 0.004, -0.008).normalize() * 0.6f64.to_radians(),
+        );
+        let mean = (cluster[0] + cluster[1] + cluster[2]) / 3.0;
+
+        let centre = Vector3::new(1.0, 0.0, 0.2);
+        let (truth, epipolar, tracks) = scene(centre, rotation);
+        let short = mean + 0.7 * (centre - mean);
+        let start = SE3::new(tilt * rotation, -((tilt * rotation) * short));
+        assert_eq!(count_reprojected(&camera, &start, &tracks, 12.0), 0);
+        let rescued = rescue_structure_less_pose(&camera, &start, &epipolar, &tracks, 12.0, 1000.0)
+            .expect("rescued pose");
+        let rescued_centre = -(rescued.rotation.inverse() * rescued.translation);
+        assert!(
+            (rescued_centre - centre).norm() < 1e-3,
+            "centre {rescued_centre:?}"
+        );
+        assert!(rescued.rotation.angle_to(&truth.rotation).to_degrees() < 0.01);
+        assert_eq!(
+            count_reprojected(&camera, &rescued, &tracks, 12.0),
+            tracks.len()
+        );
+        let share = |pose: &SE3, epipolar: &[(Vector3<f64>, Vector3<f64>, Vector3<f64>)]| {
+            epipolar_support(pose, epipolar, 12.0, 1000.0).1 as f64 / epipolar.len() as f64
+        };
+        assert!(share(&rescued, &epipolar) >= STRUCTURE_LESS_MIN_PARALLAX_RATIO);
+
+        let centre = mean + Vector3::new(0.01, 0.0, 0.0);
+        let (_, epipolar, tracks) = scene(centre, rotation);
+        let far = mean + Vector3::new(1.0, 0.0, 0.0);
+        let start = SE3::new(rotation, -(rotation * far));
+        if let Some(pose) =
+            rescue_structure_less_pose(&camera, &start, &epipolar, &tracks, 12.0, 1000.0)
+        {
+            assert!(share(&pose, &epipolar) < STRUCTURE_LESS_MIN_PARALLAX_RATIO);
+        }
     }
 
     #[test]

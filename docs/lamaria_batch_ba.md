@@ -1541,6 +1541,18 @@ warm-up) it loses 4 (51.96), and six of the eight day sequences gain
 
 ## Usage
 
+[`scripts/lamaria_ba_chain.py`](../scripts/lamaria_ba_chain.py) runs the real-time chain behind a VIO
+trajectory, with the options of each track, and resumes where an earlier run stopped:
+
+```bash
+S=sequence_2_11
+python scripts/lamaria_ba_chain.py --mav0 data/$S/mav0 --vio vio/$S.tum \
+  --imu data/$S/mav0/imu0/data.csv --calib calib/$S.json --track 2 --work work/$S --out out/$S.tum
+```
+
+`scripts/run_lamaria_test_submission.py --ba-chain` runs it on every downloaded sequence (the VIO with
+`euroc_config`, `euroc_config_lowlight` in low light) and packages its trajectories. The steps one by one:
+
 ```bash
 pip install numpy scipy opencv-python gtsam numba
 S=sequence_1_19
@@ -1635,5 +1647,6 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   about 6.5 GB of memory.
 - **Removed options.** The options of some experiments above that did not
   help are gone: the keypoint position correction, the focal length trend,
-  the keypoint size ratio filter, the warm-up random walk, and the `sizes`
-  stage for features written without sizes. Commit `adfe888` still has them.
+  the keypoint size ratio filter, an earlier warm-up random walk of the batch
+  solve (`--gyro-rw-warmup` now does it, online), and the `sizes` stage for
+  features written without sizes. Commit `adfe888` still has them.

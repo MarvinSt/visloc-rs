@@ -67,6 +67,11 @@ class TrackTests(unittest.TestCase):
         repo = Path(__file__).resolve().parents[2]
         self.assertTrue((repo / submission.DEFAULT_LOW_LIGHT_CONFIG).is_file())
 
+    def test_ba_chain_configs_ship_with_the_repo(self):
+        repo = Path(__file__).resolve().parents[2]
+        for config in (submission.DEFAULT_CONFIG, submission.BA_CHAIN_CONFIG, submission.BA_CHAIN_LOW_LIGHT_CONFIG):
+            self.assertTrue((repo / config).is_file(), config)
+
 
 if __name__ == "__main__":
     unittest.main()

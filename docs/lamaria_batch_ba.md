@@ -23,9 +23,9 @@ within 4 cores, with a wider epipolar band for the matching, it averages
 60.54, and 61.19 with the batch pass after the recording (see [Matching
 guided by a drifting VIO](#matching-guided-by-a-drifting-vio)). With the gyro
 bias random walk loosened in the first minutes of a recording (day tracks),
-it averages 61.40 online and **63.03** with the pass, above GroundedSLAM's
-62.3 on the leaderboard (see [The first minutes,
-online](#the-first-minutes-online)).
+it averages 61.40 online and **64.35** with the pass (its random walk ten
+times looser), above GroundedSLAM's 62.3 on the leaderboard (see [The first
+minutes, online](#the-first-minutes-online)).
 
 ## Method
 
@@ -1502,19 +1502,19 @@ heading then spans −1.33° … +0.56° online (−3.33° … +0.89° without) 
 online and with the batch pass after the recording, both solves of the pass
 with the same warm-up:
 
-| Sequence | Online | Random walk ×10 | Warm-up | Online + pass | Warm-up, + pass |
-|---|---:|---:|---:|---:|---:|
-| sequence_1_19 | 76.75 | **78.16** | 77.52 | **79.62** | 79.48 |
-| sequence_1_20 | 81.53 | 81.01 | **81.79** | 81.71 | 81.71 |
-| sequence_2_11 | **79.97** | 76.57 | 78.39 | 89.84 | **90.13** |
-| sequence_2_12 | 37.75 | 51.51 | **56.00** | 27.15 | **43.07** |
-| sequence_3_17 | **74.95** | 70.91 | 72.63 | 74.04 | **76.37** |
-| sequence_3_18 | **54.40** | 53.11 | 53.93 | **59.16** | 58.94 |
-| sequence_4_10 | **64.18** | 52.68 | 61.09 | | |
-| sequence_4_11 | 71.07 | **71.43** | 68.47 | | |
-| sequence_5_11 | **57.56** | 56.80 | 56.98 | 57.53 | **58.02** |
-| sequence_5_12 | **7.24** | 7.12 | 7.15 | **7.57** | 7.32 |
-| **Mean** | 60.54 | 59.93 | **61.40** | 61.19¹ | **63.03**² |
+| Sequence | Online | Random walk ×10 | Warm-up | Online + pass | Warm-up, + pass | Warm-up, + pass with ×10 |
+|---|---:|---:|---:|---:|---:|---:|
+| sequence_1_19 | 76.75 | **78.16** | 77.52 | 79.62 | 79.48 | **81.35** |
+| sequence_1_20 | 81.53 | 81.01 | **81.79** | 81.71 | 81.71 | **86.20** |
+| sequence_2_11 | **79.97** | 76.57 | 78.39 | 89.84 | **90.13** | 87.65 |
+| sequence_2_12 | 37.75 | 51.51 | **56.00** | 27.15 | 43.07 | **51.96** |
+| sequence_3_17 | **74.95** | 70.91 | 72.63 | 74.04 | 76.37 | **80.47** |
+| sequence_3_18 | **54.40** | 53.11 | 53.93 | **59.16** | 58.94 | 54.32 |
+| sequence_4_10 | **64.18** | 52.68 | 61.09 | | | |
+| sequence_4_11 | 71.07 | **71.43** | 68.47 | | | |
+| sequence_5_11 | **57.56** | 56.80 | 56.98 | 57.53 | 58.02 | **58.88** |
+| sequence_5_12 | **7.24** | 7.12 | 7.15 | **7.57** | 7.32 | 7.41 |
+| **Mean** | 60.54 | 59.93 | **61.40** | 61.19¹ | 63.03² | **64.35**² |
 
 ¹ Low light: the online result. ² Low light: the online result without the
 warm-up, which costs both low-light sequences (−3.1 and −2.6; with it the
@@ -1523,17 +1523,21 @@ with the looser random walk throughout.
 
 By track, with the leaderboard's GroundedSLAM (test set, 2026-10-17):
 
-| Track | Online + pass | Warm-up, + pass | GroundedSLAM |
-|---|---:|---:|---:|
-| Short | **80.67** | 80.60 | 80.2 |
-| Medium | 58.50 | **66.60** | 61.6 |
-| Long | 66.60 | **67.66** | 59.9 |
-| Low light (online, no warm-up) | 67.63 | 67.63 | **67.7** |
-| Moving platform | 32.55 | 32.67 | **41.9** |
-| **Mean** | 61.19 | **63.03** | 62.3 |
+| Track | Online + pass | Warm-up, + pass | Warm-up, + pass with ×10 | GroundedSLAM |
+|---|---:|---:|---:|---:|
+| Short | 80.67 | 80.60 | **83.78** | 80.2 |
+| Medium | 58.50 | 66.60 | **69.81** | 61.6 |
+| Long | 66.60 | **67.66** | 67.40 | 59.9 |
+| Low light (online, no warm-up) | 67.63 | 67.63 | 67.63 | **67.7** |
+| Moving platform | 32.55 | 32.67 | 33.15 | **41.9** |
+| **Mean** | 61.19 | 63.03 | **64.35** | 62.3 |
 
-The pass still costs sequence_2_12 13 points (56.00 online): its solves keep
-one bias for the whole 28 minutes after the warm-up.
+The pass with the warm-up alone still costs sequence_2_12 13 points (56.00
+online): its solves keep one bias for the whole 28 minutes after the
+warm-up, where each online window has its own. With the random walk ten
+times looser in the pass (`--gyro-rw-scale 10` in both solves, on top of the
+warm-up) it loses 4 (51.96), and six of the eight day sequences gain
+(sequence_1_20 +4.5, 3_17 +4.1; 2_11 −2.5 and 3_18 −4.6).
 
 ## Usage
 
@@ -1595,8 +1599,9 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   From Basalt's default VIO (`euroc_config`, the real-time chain), match
   with `--tau-slope 0.3 --tau-max 20` (see [Matching guided by a drifting
   VIO](#matching-guided-by-a-drifting-vio)); by day, `online` and both solves
-  of the pass with `--gyro-rw-warmup 10 --gyro-rw-warmup-s 300` (see [The
-  first minutes, online](#the-first-minutes-online)).
+  of the pass with `--gyro-rw-warmup 10 --gyro-rw-warmup-s 300`, the pass
+  also with `--gyro-rw-scale 10` (see [The first minutes,
+  online](#the-first-minutes-online)).
   `BASALT_EUROC_WAIT_S=120` lets the VIO demo wait for frames that a
   streaming reader has not written yet.
 - **Heading drift.** `--modes yaw` lets the solve correct a slow heading

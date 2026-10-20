@@ -251,34 +251,8 @@ if njit is not None:
                 cnt += 1
         return out[:cnt]
 
-def _refined_epipolar(xa, xb, r_ba, t_ba, iters=5):
-    """Epipolar distances (normalized image b units) of matches xa <-> xb (normalized, homogeneous) once the
-    relative rotation is refined on them: Gauss-Newton with Huber weights on a rotation update of r_ba, the
-    translation direction kept. A guide whose rotation drifted moves its lines back onto the matches."""
-    tx = np.array([[0, -t_ba[2], t_ba[1]], [t_ba[2], 0, -t_ba[0]], [-t_ba[1], t_ba[0], 0]])
-    xa, xb = xa.astype(np.float64), xb.astype(np.float64)
-
-    def dist(r):
-        lines = xa @ (tx @ r).T
-        return np.sum(lines * xb, axis=1) / np.hypot(lines[:, 0], lines[:, 1])
-
-    r, h = r_ba, 1e-6
-    d = dist(r)
-    for _ in range(iters):
-        jac = np.stack([(dist(so3_exp(h * e) @ r) - d) / h for e in np.eye(3)], axis=1)
-        scale = max(1.4826 * np.median(np.abs(d)), 1e-4)
-        w = np.minimum(1.0, 1.5 * scale / np.maximum(np.abs(d), 1e-12))  # Huber at 1.5 robust sigmas
-        step = np.linalg.lstsq(jac * w[:, None] ** 0.5, -d * w ** 0.5, rcond=None)[0]
-        r = so3_exp(step) @ r
-        d = dist(r)
-        if np.linalg.norm(step) < 1e-7:
-            break
-    return np.abs(d)
-
-
 def _match_worker(pair):
-    """Mutual, ratio-tested SIFT matches restricted to the VIO's epipolar band; with refine_px in _G, only those
-    within refine_px of the epipolar lines once the pair's relative rotation is refined on them."""
+    """Mutual, ratio-tested SIFT matches restricted to the VIO's epipolar band."""
     ka, ca, kb, cb, tau = pair
     xya, da = _image(ka, ca)
     xyb, db = _image(kb, cb)
@@ -296,13 +270,9 @@ def _match_worker(pair):
     if njit is not None:
         mat = r_ba if use_rot else np.array([[0, -t_ba[2], t_ba[1]], [t_ba[2], 0, -t_ba[0]],
                                              [-t_ba[1], t_ba[0], 0]]) @ r_ba
-        m = _match_kernel(xa, xb, np.ascontiguousarray(da), np.ascontiguousarray(db),
-                          mat.astype(np.float32), use_rot, np.float32(tau / fb),
-                          np.float32(_G["ratio"]), np.float32(_G["max_desc"]))
-        px = _G.get("refine_px", 0.0)
-        if px > 0 and not use_rot and len(m) >= 12:
-            m = m[_refined_epipolar(xa[m[:, 0]], xb[m[:, 1]], r_ba, t_ba) < px / fb]
-        return pair, m
+        return pair, _match_kernel(xa, xb, np.ascontiguousarray(da), np.ascontiguousarray(db),
+                                   mat.astype(np.float32), use_rot, np.float32(tau / fb),
+                                   np.float32(_G["ratio"]), np.float32(_G["max_desc"]))
     if not use_rot:
         e = np.array([[0, -t_ba[2], t_ba[1]], [t_ba[2], 0, -t_ba[0]], [-t_ba[1], t_ba[0], 0]]) @ r_ba
         lines = xa @ e.T.astype(np.float32)
@@ -332,7 +302,7 @@ def cmd_match(a):
     cams, _ = load_calib(a.calib)
     kf_p, kf_r = keyframe_poses(kf_ns, a.vio)
     _G.update(offsets=offsets, xy=xy, desc=desc, cams=cams, kf_p=kf_p, kf_r=kf_r,
-              ratio=a.ratio, max_desc=a.max_desc, refine_px=a.refine_px)
+              ratio=a.ratio, max_desc=a.max_desc)
     offs = [int(x) for x in a.offsets.split(",")]
     cos_max = np.cos(np.radians(a.max_axis_angle))
     pairs = []
@@ -1841,9 +1811,6 @@ def main():
     m.add_argument("--ratio", type=float, default=0.8, help="descriptor ratio test within the band")
     m.add_argument("--max-desc", type=float, default=300.0, help="maximum SIFT L2 distance")
     m.add_argument("--jobs", type=int, default=2)
-    m.add_argument("--refine-px", type=float, default=0.0,
-                   help="refine each pair's relative rotation on its matches and keep those within this many px "
-                   "of the refined epipolar lines (0: off); with a wide band (--tau-slope, --tau-max)")
     lp = sub.add_parser("loops", help="verified matches between revisits of the same place")
     lp.add_argument("--work", required=True)
     lp.add_argument("--vio", required=True)

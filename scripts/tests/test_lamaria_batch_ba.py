@@ -468,20 +468,6 @@ class MatchingTest(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_CV2, "needs opencv-python")
-class RefinedEpipolarTest(unittest.TestCase):
-    def test_a_drifted_guide_turns_back_onto_the_matches(self):
-        rng = np.random.default_rng(3)
-        r_ba, t_ba = rot(rng, 0.2), np.array([0.8, 0.1, 0.3])
-        pts_a = np.c_[rng.uniform(-4, 4, (80, 2)), rng.uniform(4, 30, 80)]  # camera a frame
-        pts_b = pts_a @ r_ba.T + t_ba
-        xa, xb = pts_a / pts_a[:, 2:], pts_b / pts_b[:, 2:]
-        xb[:10, :2] += rng.uniform(0.02, 0.05, (10, 2)) * rng.choice([-1, 1], (10, 2))  # wrong matches
-        guide = lb.so3_exp(np.radians([0.3, 1.0, -0.4])) @ r_ba  # the guide's rotation is a degree off
-        d = lb._refined_epipolar(xa, xb, guide, t_ba / np.linalg.norm(t_ba))
-        self.assertLess(np.max(d[10:]), 2e-4)  # the true matches end on their lines (a tenth of a pixel)
-        self.assertGreater(np.median(d[:10]), 5e-3)
-
-
 class LoopEdgeTest(unittest.TestCase):
     def test_pnp_body_pose_recovers_the_body(self):
         rng = np.random.default_rng(5)

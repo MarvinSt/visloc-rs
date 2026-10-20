@@ -1081,6 +1081,12 @@ pub fn build_photo_dataset(
     if cfg.complete_model {
         port_overrides.push("complete_largest_model=1".into());
     }
+    // The converged final global BA on every model, not only from 1,000
+    // frames: images registered from few tracks (structure-less, next to
+    // views panned from one spot) stay a few tenths of a degree off after
+    // the incremental loop's capped BAs. On ETH3D electro it takes three
+    // such images from 0.17-0.27° to 0.02-0.05°.
+    port_overrides.push("ba_global_final_converge_min_frames=0".into());
     // Face `k`'s `sensor_from_rig`: the panorama (rig) frame to the face's.
     let rig: Option<Vec<nalgebra::Matrix3<f64>>> =
         (cfg.equirect && cfg.equirect_rig && faces.is_none()).then(|| {

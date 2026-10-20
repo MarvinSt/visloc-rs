@@ -1138,8 +1138,6 @@ def cmd_solve(a):
     cams, noise = load_calib(a.calib)
     vio = load_tum(a.vio)
     kf_p, kf_r = keyframe_poses(kf_ns, a.vio)
-    # online windows start from the trajectory so far; the rotation prior takes the VIO's own (vio_prior)
-    vio_r = keyframe_poses(kf_ns, getattr(a, "vio_prior", None) or a.vio)[1] if a.vio_rot_sigma > 0 else None
     m = np.load(os.path.join(a.work, "matches.npz"))
     k0, k1 = (int(x) for x in a.kf_range.split(":")) if a.kf_range else (0, len(kf_ns))
     k1 = min(k1, len(kf_ns))
@@ -1195,15 +1193,6 @@ def cmd_solve(a):
                                                    a.accel_rw_scale, a.gyro_rw_scale, a.prior_rot_sigma, omega,
                                                    getattr(a, "init_states", None))
     n = len(kf_ns)
-    if vio_r is not None:
-        # the VIO's rotation change over every --vio-rot-span keyframes (within the band), --vio-rot-sigma loose
-        vio_r = vio_r[k0:k1]
-        span = min(a.vio_rot_span, rp.band_kf)
-        rot_noise = gtsam.noiseModel.Diagonal.Sigmas(np.r_[np.full(3, np.radians(a.vio_rot_sigma)), np.full(3, 1e3)])
-        for k in range(0, n - span, span):
-            graph.add(gtsam.BetweenFactorPose3(X(k), X(k + span), gtsam.Pose3(gtsam.Rot3(vio_r[k].T @ vio_r[k + span]),
-                                                                               np.zeros(3)), rot_noise))
-        print(f"  VIO rotation prior every {span} keyframes, {a.vio_rot_sigma} deg", flush=True)
     nb, ne, npar = n * DOF, rp.n_par * rp.n_ext, rp.n_par
     modes = expand_modes(a.modes)
     nm = len(modes)
@@ -1505,7 +1494,6 @@ def cmd_online(a):
             w = copy.copy(a)
             w.init_states = states
             w.kf_range, w.vio, w.save_states = f"{max(0, k1 - a.window)}:{k1}", a.out, False
-            w.vio_prior = a.vio
             w.out = base + "_window.tum"
             ti = time.time()
             with contextlib.redirect_stdout(log):
@@ -1881,10 +1869,6 @@ def main():
                        "e.g. w_e (0, cos lat, sin lat) turned into it; needs the world frame's north")
         s.add_argument("--prior-rot-sigma", type=float, default=1e-4,
                        help="prior on the first keyframe's rotation (rad); its position stays pinned")
-        s.add_argument("--vio-rot-sigma", type=float, default=0.0,
-                       help="prior on the rotation change over every --vio-rot-span keyframes: the VIO's, within "
-                            "this many degrees (0: off)")
-        s.add_argument("--vio-rot-span", type=int, default=64)
         s.add_argument("--lm-damp-floor", type=float, default=0.01,
                        help="landmark damping floor, relative to the landmark's largest diagonal entry")
         s.add_argument("--kf-range", default="", help="START:END keyframe window (default: all)")

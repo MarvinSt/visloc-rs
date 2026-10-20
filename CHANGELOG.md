@@ -313,6 +313,12 @@ All notable changes to `visloc-rs` will be documented here.
     `stereo_fusion`) over the 10 ETH3D scenes both finished on an L4, in
     58 minutes against 372; 76.0% over all 13 against 83.5% with the
     ground-truth poses.
+  - **End to end with the structure-less check (r49):** electro gains
+    2.6 points and kicker 0.1. Over the 13 scenes F1 is 76.0% aligned by
+    the camera centres. Aligned by the cameras' orientations
+    (`align_colmap_model.py --rotations`, ground-truth poses only) it is
+    79.2%, as high as ICP onto the scan, against 83.7% with the
+    ground-truth poses. meadow goes from 25.5% to 63.1% that way.
   - **End to end again (r47):** the multi-camera scenes resampled onto
     one camera, every cloud also scored after ICP onto the scan. Over
     the 13 scenes F1 is 75.8% against 83.7% with the ground-truth poses.
@@ -772,6 +778,33 @@ All notable changes to `visloc-rs` will be documented here.
   fixed unless `refine_distortion` is set). Default off.
 
 ### Changed
+
+- **`scripts/align_colmap_model.py` takes the rotation from the cameras'
+  orientations by default.** The centres are still fitted first. The
+  scale and translation follow under that rotation, from the cameras
+  whose orientations agree, refitted once without centres beyond three
+  times the median error. `--centres` keeps the centres' fit, and
+  `--rotations`, the previous switch, is accepted.
+  - The far end of ETH3D's facade is bent away from the rest. COLMAP's
+    mapper on the same matches bends it too, and so does a bundle
+    adjustment started from the ground-truth poses, which are a few
+    centimetres off the scan there themselves. Leaving the far end out
+    of the fit puts 50.7% of facade's sparse points within 2 cm of the
+    scan, against 43.5%. The other scenes move by at most
+    1 mm, except meadow (1.6 cm, the same against the scan).
+  - Quaternions are normalized before use. The six digits ETH3D writes
+    had put about 0.1° of noise into the orientation check.
+  - **Why:** on r49's ETH3D end-to-end run, F1 at 2 cm over the 13
+    scenes is 79.2% this way (before the two changes above) against 76.0%
+    by the centres alone, as high as ICP onto the scan, without the scan.
+    meadow goes from 25.5% to 63.1%. Two scenes lose under a point
+    (terrace 0.9, playground 0.5).
+  - **r50, with the fit above:** facade scores 70.7% instead of 49.4%,
+    above the ground-truth poses' 67.3%, and meadow 64.9% instead of
+    63.1%. Over the 13 scenes that makes 81.0%, against 83.7% with the
+    ground-truth poses.
+  - The end-to-end comparison with COLMAP (76.3% against 57.4%) was
+    aligned by the centres for both and stays as measured.
 
 - **`gsplat_photos` extracts SIFT on the GPU and completes the largest
   model by default.** `--cpu-sift` and `--no-complete-model` restore the

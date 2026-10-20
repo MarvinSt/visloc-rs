@@ -275,11 +275,12 @@ same GPU type), visloc-rs at commit `b05aeca`. Both take the images at
 3200 px, one pinhole camera for all of them (the scene's most used
 ground-truth camera, intrinsics held fixed), GPU SIFT and exhaustive
 matching; each model is then moved onto the ground-truth camera centres
-by a Sim(3) (`scripts/align_colmap_model.py`, refitted without centres
-beyond three times the median error), and the clouds are scored like the
-ground-truth-pose runs. visloc-mvs runs with its defaults, COLMAP with
-`image_undistorter --max_image_size 3200`, `patch_match_stereo
---PatchMatchStereo.geom_consistency true` and `stereo_fusion`'s defaults.
+by a Sim(3) (`scripts/align_colmap_model.py --centres`, refitted
+without centres beyond three times the median error), and the clouds are
+scored like the ground-truth-pose runs. visloc-mvs runs with its
+defaults, COLMAP with `image_undistorter --max_image_size 3200`,
+`patch_match_stereo --PatchMatchStereo.geom_consistency true` and
+`stereo_fusion`'s defaults.
 COLMAP's pod stopped at its 7-hour cap after 10 scenes. F1 at 2 cm
 (accuracy / completeness), the median camera-centre error after the
 alignment (visloc-rs / COLMAP), and the SfM + MVS times:
@@ -403,6 +404,130 @@ column is its own run.
   points under its ground-truth-pose F1. The structure-less registration
   is now checked against the tracks it continues, which refuses that
   image ([eth3d_auc_benchmark.md](eth3d_auc_benchmark.md#checking-structure-less-registrations)).
+
+### End to end with the structure-less check, three alignments (r49)
+
+r49 (L4, commit `c134a36`) repeated r47 with the structure-less
+registration check
+([eth3d_auc_benchmark.md](eth3d_auc_benchmark.md#checking-structure-less-registrations)).
+Each cloud is scored three ways:
+- aligned by the camera centres, as before;
+- by the cameras' orientations and centres (`align_colmap_model.py
+  --rotations`, the cloud moved by the similarity between the two fits),
+  which uses only the ground-truth poses;
+- after ICP onto the scan.
+
+F1 at 2 cm:
+
+| Scene | Ground-truth poses | r47 | Centres | Orientations | ICP |
+|---|---|---|---|---|---|
+| pipes | 84.1% | 88.5% | 88.5% | 88.7% | 88.6% |
+| meadow | 75.2% | 25.5% | 25.5% | 63.1% | 47.2% |
+| terrace | 91.2% | 91.2% | 91.2% | 90.3% | 90.4% |
+| office | 80.2% | 78.1% | 78.1% | 78.8% | 78.4% |
+| kicker | 83.8% | 81.8% | 81.9% | 82.0% | 82.1% |
+| relief | 88.2% | 85.4% | 85.4% | 85.9% | 86.0% |
+| relief 2 | 87.0% | 84.3% | 84.3% | 84.7% | 84.7% |
+| courtyard | 90.2% | 90.1% | 90.1% | 90.9% | 89.3% |
+| playground | 69.5% | 61.2% | 61.2% | 60.7% | 62.3% |
+| terrains | 91.4% | 90.8% | 90.8% | 91.0% | 91.3% |
+| delivery area | 90.3% | 84.2% | 84.2% | 86.3% | 86.6% |
+| electro | 89.5% | 75.4% | 78.0% | 78.3% | 78.8% |
+| facade | 67.3% | 49.0% | 49.0% | 49.4% | 64.2% |
+| **Mean** | 83.7% | 75.8% | 76.0% | **79.2%** | 79.2% |
+
+- **The check changes two scenes.**
+  - electro registers 41 of 45 images instead of 44, its largest
+    centre error 1.8 cm instead of 5.8, and gains 2.6 points.
+  - kicker loses DSC_6487 (66° off in r47) and gains 0.1. That image
+    sees little of the scan.
+  - The other eleven scenes give r47's F1 to the tenth.
+- **Aligned by the cameras' orientations, the 13 scenes score 79.2%,
+  4.5 points under the ground-truth poses.** That is as high as ICP
+  without the scan.
+  - meadow: the centres' fit is 1.05° off. The orientations fix it and
+    the scene goes from 25.5% to 63.1%, above ICP's 47.2%, which stops
+    in a local minimum.
+  - office and delivery area gain 0.7 and 2.1 points.
+- **facade is the exception.** Its cameras drift a few centimetres along
+  the 76-image wall, smoothly (one axis of the centre error runs from −3.5
+  to +2.4 cm along the sequence). The
+  orientations move its cloud by 0.2 mm, while ICP moves it 12 mm and
+  gains 15 points. Refining the focal length and principal point in a
+  replay of its matches leaves the drift as it is. The far end of the
+  wall is bent away from the rest; the alignment now leaves it out
+  ([below](#facades-far-end)).
+- **The protocol now aligns by the orientations.**
+  `align_colmap_model.py` does so by default (`--centres` for the
+  centres' fit). The COLMAP comparison above aligned both by the centres;
+  COLMAP's clouds were not kept, so it stays as measured.
+- **The mapper's final converged BA** (`ba_global_final_converge_min_frames=0`)
+  was replayed on r49's L4 matches (r49a, seeds 0 to 2). It lowers
+  meadow's relative-rotation error from 0.13° to 0.10° and changes the
+  other scenes within noise, so the default stays.
+
+### facade's far end
+
+Measured locally on r49a's L4 model of facade (76 images; the same model
+as r49's), with the ground-truth cameras and the scan:
+
+- **The far end of the wall is bent.** Aligned on the rest, the
+  cameras are within 0.6 cm of the ground truth (median). The 14
+  cameras of the last 4 m are 2.5 to 6.5 cm off, mostly along the wall,
+  and up to 0.4° off in orientation. One camera-centre fit spread that
+  error over the whole wall (median 1.4 cm); ICP moved the cloud 12 mm.
+- **It is not the mapper.** COLMAP 4.2.1's incremental mapper (pycolmap)
+  on the same keypoints and verified matches bends the same end the same
+  way (up to 5.9 cm, against 6.5).
+- **It is the optimum of these observations.** A global bundle
+  adjustment started from the ground-truth poses converges to the same
+  bent shape. Its cost is 7% below the ground truth's. The following
+  leave the bend as it is:
+  - a Cauchy loss;
+  - radial or OpenCV distortion refined (k1 comes out at −6e-5);
+  - leaving out DSC_0414 and DSC_0415, whose matches with each other
+    fit the ground-truth poses worst of the end's links (0.74 px median
+    Sampson error, against 0.13 px between DSC_0356 and DSC_0357).
+- **The ground truth is not exact there either.** Triangulated with the
+  ground-truth poses, the far end's sparse points need a 3.6 cm shift
+  along the wall onto the scan. With the model's own poses they need
+  0.3 cm, but they spread more: 36% within 2 cm of the scan, against 45%
+  for the shifted ground-truth ones. Part of the model's 5 cm from the
+  ground truth there is the ground truth's.
+- **The alignment now leaves a bent part out.** `align_colmap_model.py`
+  fits the scale and translation on the cameras whose orientations agree
+  with the rest, then refits once without centres beyond three times the
+  median error. On facade that leaves out 15 cameras: 13 of the far end
+  and two at the other.
+  The sparse points within 2 cm of the scan go from 43.5% to 50.7%
+  (median distance 2.42 → 1.96 cm).
+  - The other 12 scenes move by at most 1 mm, except meadow, which moves
+    1.6 cm. Against the scan, meadow scores the same either way (39.2%
+    and 39.1% of sparse points within 2 cm).
+  - The script also normalizes the quaternions now. ETH3D writes six
+    digits, and the angles taken by arccos near the identity magnified
+    that rounding to about 0.1°. The orientation check had dropped half
+    the cameras of relief and delivery area for that noise.
+
+r50 (commit `3178986`) scored meadow and facade again under the new fit.
+No L4 was free on RunPod, so it took r49a's L4 SfM models (the same as
+r49's) and ran the MVS on an A40. The centre-aligned and ICP scores
+repeat r49's within 0.6 points, so the other GPU moves little. F1 at
+2 cm:
+
+| Scene | Ground-truth poses | Centres (r49 / r50) | r49's orientation fit | New fit (r50) | ICP (r49 / r50) |
+|---|---|---|---|---|---|
+| meadow | 75.2% | 25.5% / 25.5% | 63.1% | **64.9%** | 47.2% / 47.3% |
+| facade | 67.3% | 49.0% / 48.5% | 49.4% | **70.7%** | 64.2% / 64.2% |
+
+- **facade goes from 49.4% to 70.7%** (accuracy 77.0%, completeness
+  65.3%). That is above ICP's 64.2%. It is also above MVS from the
+  ground-truth poses (67.3%), whose far-end poses sit a few centimetres
+  off the scan.
+- **meadow gains 1.8 points.**
+- **Over the 13 scenes the mean is 81.0%**, 2.7 points under the
+  ground-truth poses' 83.7%. The other 11 scenes keep r49's orientation
+  scores, as the new fit moves them by at most 1 mm.
 
 ### Against ACMMP on the same GPU
 

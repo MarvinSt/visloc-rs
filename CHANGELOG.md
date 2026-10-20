@@ -142,6 +142,33 @@ All notable changes to `visloc-rs` will be documented here.
   other model takes, but model 17 has two, so a binary model with a single
   panorama camera (the usual case) failed with `camera_count=1 requires at
   least 48 remaining byte(s), but only 40 remain`. The floor is now 16.
+- **COLMAP-port mapper: structure-less poses next to views panned from one
+  spot.** With `structure_less_min_verified` set (`gsplat_photos` and
+  `gsplat_euroc` write 10), a structure-less pose that fails the track
+  check gets a second try.
+  - **The second try.** GR6P's rotation and direction from the matched
+    cameras are kept. The distance comes from the continuing tracks,
+    then the pose is refined on the 2D–2D inliers' epipolar errors and
+    the distance is chosen again (`RESCUE path=SL` in the log).
+  - **Parallax.** Any structure-less pose now also needs half its
+    inliers to see their point at 1.5° or more.
+  - **ETH3D electro (visloc-rs's L4 matches):** DSC_9289, DSC_9290 and
+    DSC_9298 see ground that only three registered views taken 5 cm apart
+    also see. GR6P put them 9 to 36 cm off, and the check refused them.
+    Mapper replays now register 44 of 45 images instead of 41 (seeds 0
+    to 4, largest centre error 1.7 to 2.3 cm).
+  - **DSC_9291, 8 cm from a registered view,** stays out. Its matches to
+    that view hold wherever it is, and its wrong ones put it 6.6 m off.
+    8 to 13% of its inliers have parallax.
+  - **Other scenes:** meadow's seed 1 keeps DSC_6553 like seeds 0 and 2.
+    The other scenes do not change.
+  - **What the images are worth (r51):** with the ground-truth poses
+    electro scores 89.4% F1 at 2 cm with all 45 images and 80.6% without
+    the four.
+  - **End to end (r52, L4):** the SfM registers 44 of 45 images. F1
+    rises from 82.9% to 86.4% at 5 cm, where completeness gains 5.3
+    points. At 2 cm it goes from 78.3% to 78.7%: the three images' poses
+    are 0.6 to 1.5 cm and up to 0.27° off.
 
 - **Mesh: empty for cameras close together looking out.** The TSDF voxel
   (scale / 256) and depth cut-off (2 x scale) were sized by the rig scale,
@@ -350,6 +377,12 @@ All notable changes to `visloc-rs` will be documented here.
     `stereo_fusion`) over the 10 ETH3D scenes both finished on an L4, in
     58 minutes against 372; 76.0% over all 13 against 83.5% with the
     ground-truth poses.
+  - **End to end with the structure-less check (r49):** electro gains
+    2.6 points and kicker 0.1. Over the 13 scenes F1 is 76.0% aligned by
+    the camera centres. Aligned by the cameras' orientations
+    (`align_colmap_model.py --rotations`, ground-truth poses only) it is
+    79.2%, as high as ICP onto the scan, against 83.7% with the
+    ground-truth poses. meadow goes from 25.5% to 63.1% that way.
   - **End to end again (r47):** the multi-camera scenes resampled onto
     one camera, every cloud also scored after ICP onto the scan. Over
     the 13 scenes F1 is 75.8% against 83.7% with the ground-truth poses.
@@ -809,6 +842,52 @@ All notable changes to `visloc-rs` will be documented here.
   fixed unless `refine_distortion` is set). Default off.
 
 ### Changed
+
+- **`gsplat_photos` runs the mapper's converged final global BA on every
+  model** (`ba_global_final_converge_min_frames=0`; the pipeline's
+  default stays at 1,000 frames).
+  - **Why:** images registered from few tracks keep a few tenths of a
+    degree of error after the incremental loop's global BAs, which stop
+    after a step or two. On ETH3D electro (r52), DSC_9289, DSC_9290 and
+    DSC_9298 came out 0.17 to 0.27° and 0.6 to 1.5 cm off. A BA run to
+    convergence, started from the mapper's model or from the ground
+    truth, lands on 0.02 to 0.05° and 0.3 to 1.0 cm.
+  - **Mapper replays of the 13 ETH3D scenes** (seeds 0 to 2): electro's
+    relative-rotation error goes from 0.040° to 0.031° and its largest
+    centre error from 1.7-2.3 to 1.3-1.8 cm. meadow's goes from 0.13 and
+    0.15° to 0.10 and 0.11° on seeds 0 and 1 (seed 2 stays at 0.10°). The
+    others change by under a millimetre, at a few seconds more.
+  - **End to end on electro (r53, L4):** F1 at 2 cm goes from 78.7%
+    (r52) to 84.5%, and from 86.4% to 92.5% at 5 cm, against 89.4% and
+    95.1% with the ground-truth poses. The 13-scene end-to-end mean
+    becomes 81.5%.
+
+- **`scripts/align_colmap_model.py` takes the rotation from the cameras'
+  orientations by default.** The centres are still fitted first. The
+  scale and translation follow under that rotation, from the cameras
+  whose orientations agree, refitted once without centres beyond three
+  times the median error. `--centres` keeps the centres' fit, and
+  `--rotations`, the previous switch, is accepted.
+  - The far end of ETH3D's facade is bent away from the rest. COLMAP's
+    mapper on the same matches bends it too, and so does a bundle
+    adjustment started from the ground-truth poses, which are a few
+    centimetres off the scan there themselves. Leaving the far end out
+    of the fit puts 50.7% of facade's sparse points within 2 cm of the
+    scan, against 43.5%. The other scenes move by at most
+    1 mm, except meadow (1.6 cm, the same against the scan).
+  - Quaternions are normalized before use. The six digits ETH3D writes
+    had put about 0.1° of noise into the orientation check.
+  - **Why:** on r49's ETH3D end-to-end run, F1 at 2 cm over the 13
+    scenes is 79.2% this way (before the two changes above) against 76.0%
+    by the centres alone, as high as ICP onto the scan, without the scan.
+    meadow goes from 25.5% to 63.1%. Two scenes lose under a point
+    (terrace 0.9, playground 0.5).
+  - **r50, with the fit above:** facade scores 70.7% instead of 49.4%,
+    above the ground-truth poses' 67.3%, and meadow 64.9% instead of
+    63.1%. Over the 13 scenes that makes 81.0%, against 83.7% with the
+    ground-truth poses.
+  - The end-to-end comparison with COLMAP (76.3% against 57.4%) was
+    aligned by the centres for both and stays as measured.
 
 - **`gsplat_photos` extracts SIFT on the GPU and completes the largest
   model by default.** `--cpu-sift` and `--no-complete-model` restore the

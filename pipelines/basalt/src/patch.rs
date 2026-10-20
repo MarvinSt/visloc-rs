@@ -25,6 +25,9 @@ pub struct MeanNormalizedPatch51 {
     pub h_se2_inv_j_se2_t: PatchInverseJacobian51,
     pub valid_samples: usize,
     pub valid: bool,
+    /// Multiplier on the pattern offsets: 1 for Basalt's `Pattern51`, 2 for
+    /// `Pattern52` (the same layout at twice the size).
+    pub scale: f32,
 }
 
 impl MeanNormalizedPatch51 {
@@ -32,12 +35,20 @@ impl MeanNormalizedPatch51 {
     /// same normalized data/Jacobian sequence as Basalt's
     /// `OpticalFlowPatch::setDataJacSe2`.
     pub fn from_image(image: &RawU16Image, position: Vector2<f32>) -> Self {
+        Self::from_image_scaled(image, position, 1.0)
+    }
+
+    /// [`Self::from_image`] with the pattern offsets multiplied by `scale`;
+    /// `scale = 2` is Basalt's `Pattern52`. A scale of 1 is bit-identical to
+    /// `from_image`.
+    pub fn from_image_scaled(image: &RawU16Image, position: Vector2<f32>, scale: f32) -> Self {
         let mut data = PatchData51::from_element(-1.0);
         let mut jacobian = PatchJacobian51::zeros();
         let mut sum = 0.0_f32;
         let mut valid_samples = 0_usize;
 
         for (index, [offset_x, offset_y]) in Pattern51::offsets().iter().enumerate() {
+            let (offset_x, offset_y) = (&(offset_x * scale), &(offset_y * scale));
             let offset = Vector2::new(*offset_x, *offset_y);
             let sample_position = position + offset;
             if image.in_bounds(sample_position, 2.0) {
@@ -67,6 +78,7 @@ impl MeanNormalizedPatch51 {
             h_se2_inv_j_se2_t: PatchInverseJacobian51::zeros(),
             valid_samples,
             valid: false,
+            scale,
         };
 
         if valid_samples == 0 || sum <= EPS || !sum.is_finite() {
@@ -181,7 +193,7 @@ impl MeanNormalizedPatch51 {
     pub fn transformed_pattern(&self, transform: &AffineCompact2f) -> [Vector2<f32>; 52] {
         std::array::from_fn(|index| {
             let [x, y] = Pattern51::OFFSETS[index];
-            transform.transform_point(Vector2::new(x, y))
+            transform.transform_point(Vector2::new(x * self.scale, y * self.scale))
         })
     }
 }
@@ -498,6 +510,46 @@ mod tests {
 
     use super::*;
 
+    fn textured_image() -> RawU16Image {
+        let (width, height) = (48, 48);
+        let pixels = (0..width * height)
+            .map(|i| {
+                let (x, y) = ((i % width) as f32, (i / width) as f32);
+                (20_000.0 + 9_000.0 * (0.37 * x).sin() * (0.23 * y).cos() + 150.0 * x) as u16
+            })
+            .collect();
+        RawU16Image::new(width, height, pixels).unwrap()
+    }
+
+    #[test]
+    fn unit_scale_is_bit_identical_to_the_unscaled_patch() {
+        let image = textured_image();
+        let position = Vector2::new(23.3, 24.6);
+        let plain = MeanNormalizedPatch51::from_image(&image, position);
+        let scaled = MeanNormalizedPatch51::from_image_scaled(&image, position, 1.0);
+        assert!(plain.valid);
+        assert_eq!(plain, scaled);
+    }
+
+    #[test]
+    fn scale_two_samples_the_pattern_at_twice_the_offsets() {
+        let image = textured_image();
+        let position = Vector2::new(23.3, 24.6);
+        let patch = MeanNormalizedPatch51::from_image_scaled(&image, position, 2.0);
+        assert!(patch.valid);
+        let identity = AffineCompact2f::new(nalgebra::Matrix2::identity(), position);
+        for (point, [x, y]) in patch
+            .transformed_pattern(&identity)
+            .iter()
+            .zip(Pattern51::OFFSETS)
+        {
+            assert_eq!(*point, position + Vector2::new(2.0 * x, 2.0 * y));
+        }
+        // The patch matches itself at the identity warp.
+        let residual = patch.residual(&image, &identity).unwrap();
+        assert!(residual.iter().all(|value| value.abs() < 1e-5));
+    }
+
     #[test]
     fn all_black_patch_is_invalid_without_non_finite_outputs() {
         let image = RawU16Image::new(32, 32, vec![0; 32 * 32]).unwrap();
@@ -645,6 +697,7 @@ mod tests {
             h_se2_inv_j_se2_t: PatchInverseJacobian51::zeros(),
             valid_samples: Pattern51::SAMPLE_COUNT,
             valid: true,
+            scale: 1.0,
         };
         patch.h_se2_inv_j_se2_t[(0, 0)] = 1.0;
         patch.h_se2_inv_j_se2_t[(1, 1)] = 1.0;
@@ -702,6 +755,7 @@ mod tests {
             h_se2_inv_j_se2_t: matrix,
             valid_samples: Pattern51::SAMPLE_COUNT,
             valid: true,
+            scale: 1.0,
         };
         let residual_bits: [[u32; 52]; 2] = [
             [
@@ -772,6 +826,7 @@ mod tests {
             h_se2_inv_j_se2_t: matrix,
             valid_samples: Pattern51::SAMPLE_COUNT,
             valid: true,
+            scale: 1.0,
         };
         let residual =
             PatchData51::from_fn(|sample, _| f32::from_bits(fixture.residual_bits[sample]));

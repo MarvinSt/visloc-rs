@@ -333,6 +333,12 @@ that looks like panoramas gets a warning: 2:1 images whose left and right
 edges meet and whose top and bottom rows are poles, or whose metadata says
 equirectangular. The pinhole model gives no usable result on them.
 
+To train on panoramas that another tool already solved (such as COLMAP
+4.1), point `gsplat_train --data <colmap_root>` at the model: for
+an `EQUIRECTANGULAR` camera it cuts the same cube faces (`--max-face-size`,
+`--min-face-points`, `--faces-dir`), holds out every 8th panorama whole, and
+reads `sparse/0` as text or binary.
+
 ## Visual-Inertial SLAM (Basalt Rust port)
 
 A separate, faithful Rust port of upstream

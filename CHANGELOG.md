@@ -6,6 +6,37 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **`gsplat_train` on an existing equirectangular COLMAP model** (#301).
+  `load_colmap_dataset` (`visloc_gsplat_train::dataset`) now takes models
+  whose camera is `EQUIRECTANGULAR` (model 17, parameters `width, height`),
+  as COLMAP 4.1 and other SfM tools write them. Each panorama becomes the
+  six cube-face views `gsplat_photos --equirect` trains on: the same face
+  rotations, the same fixed 90° pinhole intrinsics, a face's pose the
+  panorama's with the face rotation behind it, and the same rule that
+  leaves out faces seeing fewer than 15 model points. A panorama's faces
+  are held out together, every 8th panorama. The face images are written
+  as PNGs to `<data>/equirect_faces` (`--faces-dir`, `--max-face-size`,
+  `--min-face-points` on `gsplat_train`; `EquirectOptions` and
+  `load_colmap_dataset_with` in code), an alpha channel in a panorama is
+  cut with it, and pinhole models load as before.
+  - `gsplat_train` and the dataset loader read binary models
+    (`sparse/0/{cameras,images,points3D}.bin`) as well as text:
+    `visloc_io::colmap::parse_images_bin_names` and
+    `parse_points3d_bin_with_colors` return what `parse_images_bin` and
+    `parse_points3d_bin` drop (the image names and the point colours), and
+    `gsplat_train` seeds from `points3D.txt` or, without it, `points3D.bin`.
+  - `equirect::face_pose` and `equirect::nearest_face` are the pose and
+    face-assignment code `gsplat_photos --equirect-native` ran inline; both
+    paths now call them.
+  - A synthetic box room (nine 1024 x 512 panoramas on a 0.8 m circle, exact
+    poses, 2,500 wall points, a COLMAP `EQUIRECTANGULAR` model as text and
+    as binary), `gsplat_train --strategy brush --steps 7000`, a GTX 1070 Ti:
+    54 faces, 42 for training and the 12 of the two held-out panoramas for
+    evaluation, 26.9 to 27.2 dB on them in five runs over both formats (the
+    same input differs by up to 0.26 dB from run to run). With the face rotations
+    applied transposed the same run reaches 10.9 dB. A synthetic scene, so
+    this checks the poses and not the quality of a real capture.
+
 - **`gsplat_photos --equirect`: 360° panoramas as cube faces** (#301).
   `PhotoSfmConfig::equirect` cuts each 2:1 equirectangular panorama into
   six 90° cube faces (`visloc_gsplat_train::equirect`), at most `max_size`
@@ -106,6 +137,11 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **A `cameras.bin` with one `EQUIRECTANGULAR` camera did not parse.** The
+  reader checked for room for three parameters per camera, the least any
+  other model takes, but model 17 has two, so a binary model with a single
+  panorama camera (the usual case) failed with `camera_count=1 requires at
+  least 48 remaining byte(s), but only 40 remain`. The floor is now 16.
 - **COLMAP-port mapper: structure-less poses next to views panned from one
   spot.** With `structure_less_min_verified` set (`gsplat_photos` and
   `gsplat_euroc` write 10), a structure-less pose that fails the track

@@ -1195,17 +1195,11 @@ pub fn build_photo_dataset(
     // `equirect_native`, where every face of a registered panorama has a
     // pose whether or not anything in it was matched.
     let face_support: Option<Vec<usize>> = if faces.is_some() {
-        let axes: Vec<Vector3<f64>> = equirect::cube_face_rotations()
-            .iter()
-            .map(|(_, r)| r.column(2).into_owned())
-            .collect();
+        let axes = equirect::face_axes();
         let mut counts = vec![0usize; 6 * n];
         for &(pano, _, px) in tracks.iter().flat_map(|t| &t.observations) {
             if let Some(ray) = camera.unit_ray_from_pixel(&px) {
-                let face = (0..6)
-                    .max_by(|&a, &b| ray.dot(&axes[a]).total_cmp(&ray.dot(&axes[b])))
-                    .expect("six faces");
-                counts[6 * pano + face] += 1;
+                counts[6 * pano + equirect::nearest_face(&axes, &ray)] += 1;
             }
         }
         Some(counts)
@@ -1227,18 +1221,9 @@ pub fn build_photo_dataset(
             let face_poses: Vec<Option<visloc_core::geometry::Pose>> = poses
                 .iter()
                 .flat_map(|pose| {
-                    rotations.iter().map(move |(_, r)| {
-                        pose.as_ref().map(|pose| {
-                            let face_from_pano = nalgebra::UnitQuaternion::from_rotation_matrix(
-                                &nalgebra::Rotation3::from_matrix_unchecked(r.transpose()),
-                            );
-                            let w2c = &pose.world_to_camera;
-                            visloc_core::geometry::Pose::from_world_to_camera(
-                                face_from_pano * w2c.rotation,
-                                face_from_pano * w2c.translation,
-                            )
-                        })
-                    })
+                    rotations
+                        .iter()
+                        .map(move |(_, r)| pose.as_ref().map(|pose| equirect::face_pose(pose, r)))
                 })
                 .collect();
             (face_poses, face_names, face_camera, size, size, 6)

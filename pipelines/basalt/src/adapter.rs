@@ -708,8 +708,18 @@ pub fn direct_klt_config(config: &BasaltConfig) -> Result<DirectKltConfig, Confi
             Err(ConfigError::Value(format!("{key} must be positive")))
         }
     };
+    let pattern_scale = match config.value::<i64>("config.optical_flow_pattern")? {
+        51 => 1.0,
+        52 => 2.0,
+        other => {
+            return Err(ConfigError::Value(format!(
+                "config.optical_flow_pattern: {other} is not supported (51 or 52)"
+            )))
+        }
+    };
     Ok(DirectKltConfig {
         imu_seed_rotation: config.optional_bool("config.optical_flow_imu_seed_rotation")?,
+        pattern_scale,
         pyramid_levels: positive_usize("config.optical_flow_levels")?,
         max_iterations: positive_usize("config.optical_flow_max_iterations")?,
         fb_squared_threshold: positive_f32("config.optical_flow_max_recovered_dist2")?,
@@ -768,6 +778,21 @@ mod tests {
         value["value0"]["config.optical_flow_imu_seed_rotation"] = serde_json::json!(true);
         let config = BasaltConfig::from_json(&value.to_string()).unwrap();
         assert!(direct_klt_config(&config).unwrap().imu_seed_rotation);
+    }
+
+    #[test]
+    fn optical_flow_pattern_selects_the_patch_scale() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../../../configs/basalt/euroc_config.json"))
+                .unwrap();
+        let mut scale = |pattern: i64| {
+            value["value0"]["config.optical_flow_pattern"] = serde_json::json!(pattern);
+            let config = BasaltConfig::from_json(&value.to_string()).unwrap();
+            direct_klt_config(&config).map(|direct| direct.pattern_scale)
+        };
+        assert_eq!(scale(51).unwrap(), 1.0);
+        assert_eq!(scale(52).unwrap(), 2.0);
+        assert!(scale(24).is_err());
     }
 
     #[test]

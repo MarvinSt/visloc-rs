@@ -154,14 +154,14 @@ def download_head(url: str, dest: Path, nbytes: int) -> None:
 
 
 def rectify_imu(seq: str, inner: Path, work: Path, calib_dir: Path,
-                refine: bool = False):
+                refine: bool = False, split: str = "test"):
     """Replace inner/mav0/imu0/data.csv with the factory-rectified IMU.
 
     With `refine`, a known device's IMU is also re-aligned in time, and its
     refinement (see aria_device_refinement.py) is returned for the camera rig.
     """
     head = work / "vrs_head.bin"
-    download_head(f"{BASE_URL}/raw_data/test/{seq}.vrs", head, VRS_HEAD_BYTES)
+    download_head(f"{BASE_URL}/raw_data/{split}/{seq}.vrs", head, VRS_HEAD_BYTES)
     factory = extract_record(head.read_bytes())
     (calib_dir / f"{seq}_factory_calib.json").write_text(json.dumps(factory, indent=1))
     refinement = device_refinement(factory) if refine else None
@@ -247,6 +247,9 @@ def main() -> int:
                         choices=sorted(TRACK_COUNTS))
     parser.add_argument("--sequences", nargs="*", default=None,
                         help="explicit sequence names (overrides --tracks)")
+    parser.add_argument("--split", choices=("test", "training"), default="test",
+                        help="dataset split to download from; 'training' runs the same pipeline on "
+                             "training sequences (with --sequences), to score it with the evaluator")
     parser.add_argument("--vio-exe", type=Path,
                         help="basalt_euroc_vio_demo: VIO only")
     parser.add_argument("--slam-exe", type=Path,
@@ -303,9 +306,9 @@ def main() -> int:
         try:
             log(f"{seq}: download")
             pinhole = work / "pinhole.json"
-            download(f"{BASE_URL}/pinhole_calibrations/test/{seq}.json", pinhole)
+            download(f"{BASE_URL}/pinhole_calibrations/{args.split}/{seq}.json", pinhole)
             zip_path = work / f"{seq}.zip"
-            download(f"{BASE_URL}/asl_folder/test/{seq}.zip", zip_path)
+            download(f"{BASE_URL}/asl_folder/{args.split}/{seq}.zip", zip_path)
 
             log(f"{seq}: extract")
             extract_dir = work / "extracted"
@@ -313,7 +316,7 @@ def main() -> int:
             try:
                 inner = verify_and_extract(zip_path, extract_dir)
             except zipfile.BadZipFile:
-                download(f"{BASE_URL}/asl_folder/test/{seq}.zip", zip_path)
+                download(f"{BASE_URL}/asl_folder/{args.split}/{seq}.zip", zip_path)
                 inner = verify_and_extract(zip_path, extract_dir)
 
             refinement = None
@@ -321,7 +324,7 @@ def main() -> int:
                 log(f"{seq}: IMU rectification")
                 try:
                     refinement = rectify_imu(seq, inner, work, calib_dir,
-                                             refine=args.device_refinement)
+                                             refine=args.device_refinement, split=args.split)
                 except Exception as error:
                     log(f"{seq}: WARN IMU rectification failed ({error!r}); using raw IMU")
 

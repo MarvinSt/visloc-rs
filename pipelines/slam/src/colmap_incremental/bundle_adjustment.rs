@@ -124,7 +124,7 @@ use crate::bundle::{BaConfig, BaRigObservation, BundleAdjustment};
 use visloc_core::geometry::{Pose, SE3};
 
 use super::reconstruction::Reconstruction;
-use super::rig_ba_solver::{Obs, PointMajorObs, RigBaInput, RigObs};
+use super::rig_ba_solver::{Obs, ObsCamera, ObsCameraTable, PointMajorObs, RigBaInput, RigObs};
 use super::types::{CameraT, FrameT, ImageT, Point2DT, Point3DT, RigT, SensorT};
 
 /// Port of `BundleAdjustmentGauge` (`bundle_adjustment.h:47-48`). See module
@@ -796,14 +796,14 @@ fn solve_native(
     }
 
     // Per observed image: its frame's index and its camera as the solver
-    // reads them. An unsupported camera model fails the solve.
+    // reads them (an index into `cameras`, shared by the images with the
+    // same intrinsics and sensor). An unsupported camera model fails the
+    // solve.
     struct ImageInfo {
         frame_idx: u32,
-        intrinsics: (f64, f64, f64, f64),
-        sensor_from_rig: SE3,
-        /// Index into `extras.sensors` when its `sensor_from_rig` is refined.
-        sensor: Option<u32>,
+        camera: u32,
     }
+    let mut cameras = ObsCameraTable::default();
     // The refined sensors: each observed rig's calibrated non-reference
     // sensors, in (rig, sensor) order.
     let refine_sensors = options.refine_sensor_from_rig && !config.constant_sensors_from_rig;
@@ -826,7 +826,7 @@ fn solve_native(
         }
         let image_id = image_id as ImageT;
         let image = recon.image(image_id);
-        let Some(intrinsics) = recon.camera(image.camera_id).intrinsics() else {
+        let Some(intrinsics) = solver_intrinsics(recon.camera(image.camera_id)) else {
             return false;
         };
         let rig_id = recon.frame(image.frame_id).rig_id();
@@ -842,13 +842,15 @@ fn solve_native(
                     }
                 }
             });
+        let camera = ObsCamera::new(intrinsics, sensor_from_rig_for_image(recon, image_id));
         image_info.push(Some(ImageInfo {
             frame_idx: all_frame_ids
                 .binary_search(&image.frame_id)
                 .expect("observed frame") as u32,
-            intrinsics,
-            sensor_from_rig: sensor_from_rig_for_image(recon, image_id),
-            sensor,
+            camera: cameras.index_of(match sensor {
+                Some(sensor) => camera.with_sensor(sensor),
+                None => camera,
+            }),
         }));
     }
     // The camera block: one PINHOLE/SIMPLE_PINHOLE camera behind every
@@ -897,16 +899,11 @@ fn solve_native(
             let info = image_info[image_id as usize]
                 .as_ref()
                 .expect("observed image");
-            let obs = Obs::new(
+            Obs::new(
                 info.frame_idx,
                 recon.image(image_id).points2d[point2d_idx].xy,
-                info.intrinsics,
-                info.sensor_from_rig.clone(),
-            );
-            match info.sensor {
-                Some(sensor) => obs.with_sensor(sensor),
-                None => obs,
-            }
+                info.camera,
+            )
         })
         .collect();
     drop(keys);
@@ -930,6 +927,7 @@ fn solve_native(
         PointMajorObs {
             obs,
             point_obs_range,
+            cameras: cameras.into_cameras(),
         },
         options.max_num_iterations,
         options.loss_function,
@@ -991,10 +989,22 @@ pub fn solve(
     }
     let accelerate = options.loss_function == LossFunction::Trivial
         && std::env::var_os("VISLOC_PORT_GPU_BA").is_some();
-    if options.backend == BaBackend::Native && !accelerate {
+    // The legacy and GPU paths project pinholes only.
+    if (options.backend == BaBackend::Native && !accelerate) || recon.has_spherical_camera() {
         return solve_native(options, config, recon);
     }
     solve_legacy(options, config, recon, accelerate)
+}
+
+/// The native solver's `(fx, fy, cx, cy)` for `camera`: its pinhole
+/// intrinsics, or an equirectangular panorama's marker tuple
+/// ([`super::rig_ba_solver::equirectangular_intrinsics`]).
+fn solver_intrinsics(camera: &visloc_core::types::Camera) -> Option<(f64, f64, f64, f64)> {
+    if camera.model == visloc_core::types::CameraModel::Equirectangular {
+        let (&w, &h) = (camera.params.first()?, camera.params.get(1)?);
+        return Some(super::rig_ba_solver::equirectangular_intrinsics(w, h));
+    }
+    camera.intrinsics()
 }
 
 /// [`solve`] through a [`BundleAdjustment`] problem: the `Legacy` backend and

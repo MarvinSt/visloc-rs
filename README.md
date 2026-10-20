@@ -68,6 +68,7 @@ the docs record open gaps.
 | --- | --- | --- | --- | --- |
 | Monocular, unordered photos | SfM, 3DGS, mesh | **Benchmarked** | ETH3D Electro 1,200: 3.46× faster than COLMAP CPU, 3.50 vs 4.68 cm | `unordered_sfm_demo`, `gsplat_photos` |
 | Monocular video | SfM | **Benchmarked** | EuRoC: faster than COLMAP 4.1 CUDA on 8/8 sequences, more accurate on 4/8 | `gsplat_euroc` |
+| Posed photos (a COLMAP sparse model) | Dense MVS | Experimental | ETH3D high-res training, all 13 scenes at 3200 px on one L4: F1 83.7% at 2 cm in 74 min (ACMMP 83.42%, ACMP 79.79%, ACMM 78.86%, COLMAP 67.66%); ACMMP's released code on the same L4 matches its F1 over six scenes in 4.0× the time; end to end from the photos (`gsplat_photos` SfM, then MVS, aligned to the ground-truth cameras) 81.5% over the 13 scenes; aligned by the camera centres alone, 76.3% against COLMAP 4.2.1 CUDA's 57.4% on the 10 scenes it finished, 6.4× faster | `visloc-mvs` example `mvs` ([notes](docs/mvs.md)) |
 | Monocular video | VO (DPVO port) | Experimental | MH_01 prefix 0.16 m, about 2× DPVO's published error; CPU only | `euroc_dpvo_vo_demo` |
 | Monocular + IMU | VIO (Basalt port) | Experimental | Runs end to end; synthetic tests recover metric scale within 0.3% at 5–9 mm RMS over 5–7 m paths; no EuRoC result yet | `basalt_euroc_vio_demo --mono` ([notes](docs/mono_inertial_vio.md)) |
 | Stereo | VO / SLAM | **Benchmarked** | KITTI seq00 1.23 m and seq09 2.07 m, vs 1.3 m and 3.2 m for ORB-SLAM2 | `deep_stereo_slam`, `online_slam_stereo_vo_kitti_demo` |
@@ -311,6 +312,24 @@ The pipeline has three stages:
    with no SfM point nearby, such as the sky, are dropped. The
    `--normal-weight 0.005` depth-normal loss makes surfaces smoother for
    -0.2 dB.
+
+**360° cameras.** `--equirect` takes a folder of 2:1 equirectangular
+panoramas and cuts each one into its six 90° cube faces, at most
+`--max-size` square. The faces then go through the three stages as pinhole
+images with their exact focal length held fixed, the six of a panorama as
+one rig: one pose per panorama, the faces at its centre
+(`--equirect-independent-faces` solves them as separate cameras). Faces of
+one panorama are never matched with each other, and `--window` counts
+panoramas. `--equirect-native` runs SfM on the panoramas themselves as
+equirectangular cameras (COLMAP's `EQUIRECTANGULAR`), at most
+`2 x --max-size` wide: several times faster, with fewer points. Either way
+training sees the cube faces that see SfM points; a camera mount or selfie
+stick below the camera is left out. Panoramas taken from almost the same
+spot (slow video) have too little parallax to reconstruct: space the
+frames out. Without `--equirect`, a folder
+that looks like panoramas gets a warning: 2:1 images whose left and right
+edges meet and whose top and bottom rows are poles, or whose metadata says
+equirectangular. The pinhole model gives no usable result on them.
 
 ## Visual-Inertial SLAM (Basalt Rust port)
 

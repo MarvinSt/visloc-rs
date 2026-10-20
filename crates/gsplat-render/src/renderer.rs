@@ -1065,7 +1065,7 @@ impl Renderer {
             {
                 let raster = self.raster_stage();
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-                dispatch(&mut pass, raster, num_tiles);
+                dispatch_groups_2d(&mut pass, raster, num_tiles);
             }
             self.ctx.queue.submit(Some(encoder.finish()));
         }
@@ -1167,7 +1167,7 @@ impl Renderer {
         });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            dispatch(&mut pass, stage, self.last_frame.num_tiles);
+            dispatch_groups_2d(&mut pass, stage, self.last_frame.num_tiles);
         }
         self.ctx.queue.submit(Some(encoder.finish()));
         let raw = read_f32s(dev, &self.ctx.queue, out, pixels * 2);

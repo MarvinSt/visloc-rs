@@ -189,6 +189,13 @@ impl Reconstruction {
             .get(&camera_id)
             .unwrap_or_else(|| panic!("camera {camera_id} does not exist"))
     }
+    /// Whether any camera is a spherical (equirectangular) panorama, which
+    /// only the native bundle adjustment solves.
+    pub fn has_spherical_camera(&self) -> bool {
+        self.cameras
+            .values()
+            .any(|c| c.model == visloc_core::types::CameraModel::Equirectangular)
+    }
     pub fn rig_mut(&mut self, rig_id: RigT) -> &mut Rig {
         self.rigs
             .get_mut(&rig_id)
@@ -499,11 +506,11 @@ impl Reconstruction {
             poses.push(Pose {
                 world_to_camera: cam_from_world,
             });
+            // The writer reads only the keypoints.
             let keypoints: Vec<Point2<f64>> = image.points2d.iter().map(|p| p.xy).collect();
-            let descriptors = vec![Vec::new(); keypoints.len()];
             features.push(FeatureSet {
                 keypoints,
-                descriptors,
+                descriptors: Vec::new(),
             });
             names.push(image.name.clone());
             output_index_of.insert(image_id, output_index);

@@ -136,7 +136,8 @@ Use map validation before localization:
 
 ## Current Non-Goals
 
-- Dense COLMAP outputs.
+- Dense COLMAP outputs (COLMAP's depth-map workspace). `visloc-mvs` computes
+  its own depth maps and fused cloud from a sparse model; see `docs/mvs.md`.
 - Full COLMAP database parsing.
 - Feature extraction from COLMAP databases.
 - Bundle adjustment compatibility.

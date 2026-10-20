@@ -4,7 +4,173 @@ All notable changes to `visloc-rs` will be documented here.
 
 ## Unreleased
 
+### Added
+
+- **`gsplat_photos --equirect`: 360° panoramas as cube faces** (#301).
+  `PhotoSfmConfig::equirect` cuts each 2:1 equirectangular panorama into
+  six 90° cube faces (`visloc_gsplat_train::equirect`), at most `max_size`
+  square, before SfM and training. Their focal length `size / 2` is exact
+  and stays fixed. Faces of one panorama are not matched with each other,
+  and the window counts panoramas. The log reports how far apart each
+  panorama's face centres land. Off by default. The numbers below solve
+  each face as its own camera, now `--equirect-independent-faces` (the
+  six-face rig below is the default).
+  - Five synthetic room panoramas (`equirect_end_to_end`, an ignored
+    test): all 30 faces register. Relative rotations are within 0.13° of
+    the truth, and panorama distances within 0.4 mm over 0.58 m spacing.
+  - The five real panoramas of the
+    [ScanVan example](https://github.com/ScanVan/sfs-framework-example)
+    (CPU, `--steps 0`): the four side faces of every panorama register;
+    the up and down faces (sky, the camera mount) do not. Panorama
+    distances match ScanVan's own trajectory within 0.4%. As pinhole
+    images the same panoramas reconstruct nothing.
+  - The same five on an RTX 5080 (GPU SIFT and matching, 30k steps): the
+    same 20 faces register, and SfM, training and the mesh take 5 to
+    14 min depending on the host. The held-out panorama (the first, a
+    step behind every training one) renders at 17.8 to 22.2 dB per face
+    (19.2 dB mean), the training faces at 35 to 38 dB. The buildings
+    land where they should. The losses are thin branches, and the lens
+    rims and camera mount that move with the camera (`gsplat_photos`
+    takes no mask for them).
+  - With `equirect`, the held-out views are whole panoramas. Every 8th
+    registered face would have held out the same face of every
+    panorama: on ScanVan it took 3 of the 5 front faces, which left the
+    view ahead with two training images.
+- **`--equirect`: the six cube faces of a panorama as one rig** (#301).
+  `PhotoSfmConfig::equirect_rig`, on by default: the mapper solves one pose
+  per panorama, its faces at the panorama's centre with their fixed
+  rotations, instead of six independent cameras
+  (`--equirect-independent-faces` restores those). The COLMAP-port mapper
+  initializes a central rig (every `sensor_from_rig` translation zero) from
+  the pair's ordinary two-view geometry: its generalized relative pose
+  solver (GR6P) is degenerate when every ray passes through one centre.
+  - Synthetic room (`equirect_end_to_end`): relative rotations within
+    0.006° of the truth (independent faces: 0.13°), panorama distances
+    within 0.2 mm (0.4 mm).
+  - Twelve synthetic panoramas 5 cm apart: both register all 72 faces;
+    independent faces spread their centres by 16.7% of the step, the rig
+    by none, in half the SfM time. 2 cm apart (22 cm in all, 4 m from the
+    walls) neither reconstructs: a rig does not add parallax.
+  - ScanVan: every panorama registers with all six faces posed
+    (independent: the 20 side faces); distances match ScanVan's
+    trajectory within 0.26% (0.33%).
+  - With a rig every face of a registered panorama has a pose. Faces that
+    see fewer than `min_matches` SfM points are left out of training: sky,
+    or a camera mount or selfie stick that moves with the camera. On
+    ScanVan that drops the five down faces (the mount) and keeps the up
+    faces (trees and buildings).
+  - ScanVan on an RTX 5080 (GPU SIFT and matching, 30k steps, 13 min with
+    the mesh): the held-out panorama renders at 19.12 dB over its five
+    kept faces (19.03 dB over the four side faces, against 19.2 dB with
+    independent faces), the 20 training faces at 34.7 dB.
+- **`--equirect-native`: SfM on the panoramas as equirectangular cameras**
+  (#301). `PhotoSfmConfig::equirect_native`: SIFT runs on the whole
+  panorama, at most `2 max_size` wide (COLMAP's 3200 px cap at the
+  default), and the mapper solves `CameraModel::Equirectangular`, COLMAP
+  4.1's `EQUIRECTANGULAR` (parameters `w, h`). The cube faces are then
+  posed from each panorama for training, with the same face filter.
+  - `visloc_core`: `CameraModel::Equirectangular` (projection, rays over
+    the whole sphere, analytic Jacobian), COLMAP model id 17 in the text
+    and binary readers and writers.
+  - Two-view verification on unit rays
+    (`visloc_vision::two_view::spherical`): five-point essential-matrix
+    RANSAC scored by the angle between a ray and its epipolar plane.
+  - The COLMAP-port mapper on unit rays where a pinhole uses the `z = 1`
+    plane: P3P bearings, DLT triangulation rows, cheirality, angular
+    errors, the native bundle adjustment's residual and Jacobians (the
+    panorama's left and right edges are one meridian: residuals wrap).
+    Its initial pair gates the triangulation angle per cube-face
+    direction, as a pinhole camera looking that way would be gated: a
+    panorama always shows the epipoles of the motion, where nothing has
+    parallax, and the median over the whole sphere fell to 1-3° on
+    ScanVan.
+  - Synthetic room (`equirect_native_end_to_end`): 5/5 panoramas,
+    relative face rotations within 0.010° of the truth, panorama
+    distances within 0.05 mm.
+  - ScanVan (CPU): 5/5 panoramas, distances within 0.29% of ScanVan's
+    trajectory, in 22 s against the rig's 163 s (SIFT on 3200 x 1600
+    panoramas instead of thirty 1504 px faces), with 2,052 SfM points
+    against 4,893. On the RTX 5080 (30k steps, 12 min) the held-out
+    panorama renders at 18.66 dB over five faces (rig: 19.12 dB), the
+    training faces at 33.1 dB (34.7 dB). As COLMAP notes for its own
+    model, faster but coarser than perspective views; the rig stays the
+    default.
+- **A warning for panoramas fed as pinhole photos.** When at least half the
+  images look equirectangular, `build_photo_dataset` logs a warning that
+  points to `--equirect`. An image counts when it is 2:1 with left and
+  right edges that meet and smooth pole rows, or when its metadata says
+  equirectangular (Photo Sphere XMP). Outputs are unchanged. It flags
+  three stitched Poly Haven panoramas and none of the 128 south-building
+  photos or their 2:1 crops. It misses the ScanVan panoramas, whose left
+  and right edges are lens rims that do not meet.
+
 ### Fixed
+
+- **COLMAP-port mapper: structure-less poses next to views panned from one
+  spot.** With `structure_less_min_verified` set (`gsplat_photos` and
+  `gsplat_euroc` write 10), a structure-less pose that fails the track
+  check gets a second try.
+  - **The second try.** GR6P's rotation and direction from the matched
+    cameras are kept. The distance comes from the continuing tracks,
+    then the pose is refined on the 2D–2D inliers' epipolar errors and
+    the distance is chosen again (`RESCUE path=SL` in the log).
+  - **Parallax.** Any structure-less pose now also needs half its
+    inliers to see their point at 1.5° or more.
+  - **ETH3D electro (visloc-rs's L4 matches):** DSC_9289, DSC_9290 and
+    DSC_9298 see ground that only three registered views taken 5 cm apart
+    also see. GR6P put them 9 to 36 cm off, and the check refused them.
+    Mapper replays now register 44 of 45 images instead of 41 (seeds 0
+    to 4, largest centre error 1.7 to 2.3 cm).
+  - **DSC_9291, 8 cm from a registered view,** stays out. Its matches to
+    that view hold wherever it is, and its wrong ones put it 6.6 m off.
+    8 to 13% of its inliers have parallax.
+  - **Other scenes:** meadow's seed 1 keeps DSC_6553 like seeds 0 and 2.
+    The other scenes do not change.
+  - **What the images are worth (r51):** with the ground-truth poses
+    electro scores 89.4% F1 at 2 cm with all 45 images and 80.6% without
+    the four.
+  - **End to end (r52, L4):** the SfM registers 44 of 45 images. F1
+    rises from 82.9% to 86.4% at 5 cm, where completeness gains 5.3
+    points. At 2 cm it goes from 78.3% to 78.7%: the three images' poses
+    are 0.6 to 1.5 cm and up to 0.27° off.
+
+- **Mesh: empty for cameras close together looking out.** The TSDF voxel
+  (scale / 256) and depth cut-off (2 x scale) were sized by the rig scale,
+  the median distance of the camera centres from their centroid. A 360
+  capture or a short walk sees the scene far beyond that: on ScanVan
+  99.8% of the SfM point depths lay past the cut-off, and every mesh of
+  #301 came out with 0 triangles. The scale is now the larger of the rig
+  scale and half the 90th percentile depth of the SfM points the views
+  see (`mesh::scene_scale`).
+  - ScanVan (5 panoramas, `--equirect`, 3k steps at 512 px on lavapipe),
+    the same splat: 25,922 -> 0 triangles before, 2,023,326 -> 212,856
+    now (rig scale 0.33, scene scale 3.77).
+  - south-building's COLMAP model: half the 90th percentile depth is
+    2.93 against a rig scale of 3.57, so object captures keep their
+    defaults.
+
+- **COLMAP-port mapper: structure-less registrations far off.** One whose
+  matches nearly all go to one registered image fixes the pose poorly.
+  GR6P RANSAC can then settle on a rival pose almost as well supported:
+  on an L4, ETH3D kicker's DSC_6487 came out 66° and 1.3 m off (r47), and
+  electro's images up to 3.2 m off on COLMAP's matches.
+  `MapperOptions::structure_less_min_verified` (0 by default; the photo
+  and EuRoC pipelines set 10) refuses the registration unless that many
+  of the tracks its inliers continue reproject within
+  `abs_pose_max_error`, and at least 70% of them. Over the 13 scenes'
+  replays only kicker, electro and meadow change. Their largest camera
+  errors fall from 1.5 m, 3.2 m and 26 cm to 1.0 cm, 5.5 cm and 15 cm,
+  for one to five fewer images. The `REGISTER path=SL` log line now gives
+  the inliers per registered image and the tracks verified.
+
+- **COLMAP-port mapper: structure-less registration triangulated with no
+  error bound.** Its new tracks use the angular residual, in radians, but
+  were bounded by `abs_pose_max_error` (12 px), so every ray passed.
+  COLMAP 4 does the same; the bound is now divided by the camera's pixels
+  per radian, as the GR6P threshold next to it already was. The fallback
+  is on in `gsplat_photos` and `gsplat_euroc`; it registered no image on
+  south-building, ScanVan or EuRoC V1_01 (CPU, the README settings),
+  whose results are unchanged.
 
 - **COLMAP-port mapper: resuming a reconstruction with 3D points
   panicked.** `ObservationManager::new` counted the existing observations
@@ -128,6 +294,91 @@ All notable changes to `visloc-rs` will be documented here.
   decline distorted cameras and fall back to the regular solver.
 
 ### Added
+
+- **Multi-view stereo: `visloc-mvs`.** Dense point clouds from a COLMAP
+  sparse model with undistorted images: PatchMatch depth and normal maps
+  (ACMH, with ACMP's planar prior and ACMM's geometric consistency, on an
+  image pyramid in ACMMP's order), fused into `fused.ply`, on the CPU or
+  on the GPU through wgpu (`--features gpu`). Details and scores in
+  `docs/mvs.md`.
+  - **ETH3D high-res training, all 13 scenes at 3200 px, one NVIDIA L4:**
+    F1 83.5% at 2 cm on average (accuracy 86.6%, completeness 81.0%) with
+    the example's defaults (three scales, each with a photometric pass,
+    the planar prior pass and two geometric passes). On the same scenes
+    ACMMP reports 83.42%, HPM-MVS 84.58%, ACMP 79.79%, ACMM 78.86% and
+    COLMAP 67.66%.
+  - **Multi-scale** in ACMMP's order: a finer scale's photometric pass
+    starts from the upsampled coarser maps, and the detail restorer lets
+    a pixel leave its upsampled plane only for one that beats the plane
+    at infinity's cost by 0.1, as ACMM's and ACMMP's code compute. Three
+    scales score 2.1 points above one (81.4%), most on meadow (+12.1),
+    kicker (+4.7) and pipes (+3.2), with the detailed scenes within half a
+    point. Our first scheme, with the restorer of ACMM's paper and no
+    prior, scored 78.0%: it held upsampled planes that were slightly off.
+    `--scales 1` runs one scale.
+  - **Planar prior** (ACMP): credible pixels are triangulated into
+    planes that a prior pass favours where the costs cannot tell planes
+    apart. With one scale it raises F1 on all 13 scenes, from 79.5% to
+    81.4%, most on office (+7.2 points), meadow (+3.8) and pipes (+3.4);
+    `--no-planar-prior` leaves it out.
+  - **Time:** 74 minutes for all 13 scenes, 1:53 to 13:46 per scene,
+    loading and fusion included (65 minutes with one scale).
+  - **Fusion:** one agreeing source view within 10° keeps a point by
+    default (ACMM and ACMP ask for two): with one scale, 81.4% against
+    79.3% with two views at 30°. ACMMP's mean consistency and reference
+    points are options (`--min-mean-consistency`, `--no-average`), off by
+    default.
+  - **Memory:** one set of depth maps at a time (a geometric pass and
+    fusion drop each map after the last view that reads it), costs only
+    with `--save-maps`, grey levels computed from the colours. On ETH3D
+    facade (76 images at 3200 px, an L4), peak memory falls from 24.2 to
+    12.0 GiB with one scale and from 28.7 to 12.4 GiB with three;
+    `fused.ply` is byte-identical on pipes (CPU and GPU).
+  - **End to end against COLMAP:** from the photos (`gsplat_photos`' SfM
+    with the scene's main ground-truth camera held fixed, the model moved
+    onto the ground-truth camera centres, then `visloc-mvs`), F1 76.3%
+    against 57.4% for COLMAP 4.2.1 CUDA (SfM, `patch_match_stereo`,
+    `stereo_fusion`) over the 10 ETH3D scenes both finished on an L4, in
+    58 minutes against 372; 76.0% over all 13 against 83.5% with the
+    ground-truth poses.
+  - **End to end with the structure-less check (r49):** electro gains
+    2.6 points and kicker 0.1. Over the 13 scenes F1 is 76.0% aligned by
+    the camera centres. Aligned by the cameras' orientations
+    (`align_colmap_model.py --rotations`, ground-truth poses only) it is
+    79.2%, as high as ICP onto the scan, against 83.7% with the
+    ground-truth poses. meadow goes from 25.5% to 63.1% that way.
+  - **End to end again (r47):** the multi-camera scenes resampled onto
+    one camera, every cloud also scored after ICP onto the scan. Over
+    the 13 scenes F1 is 75.8% against 83.7% with the ground-truth poses.
+    Over the 12 with an ICP score it is 75.1%, and 78.6% after ICP.
+    One camera lifts courtyard by 5.2 points and terrains by 3.9, but
+    electro and facade lose 5.3 and 11.8 to a different SfM run.
+    `scripts/align_colmap_model.py --rotations` takes the alignment's
+    rotation from the cameras' orientations: on meadow the centres' fit
+    is 1.05° off. `scripts/eth3d_icp_align.py` skips non-finite points.
+  - **Against ACMMP's released code on the same L4:** F1 83.4% against
+    83.2% at 2 cm over six scenes (the pod was lost after them), in 27.5
+    minutes against 110. ACMMP leads on office by 5.3 points, all of it
+    accuracy.
+  - **Fusion:** the agreeing views must also agree well on average, as in
+    ACMMP's code (`--min-mean-consistency`, 0.15 against ACMMP's 0.3).
+    Over the 13 ETH3D scenes at 3200 px F1 at 2 cm goes from 83.46% to
+    83.69% (office +1.8, kicker +1.5 points).
+  - **Mesh voxel:** the footprint at the views' median sparse depth (it
+    was the depth ranges' midpoints, which reach far behind meadow), with
+    a second level four times coarser for pixels twice as far. Over the 13
+    scenes the mesh scores 79.3% at 2 cm; on meadow 68.9% instead of
+    42.2%.
+  - **Mesh:** `--mesh` fuses the depths that source views agree with into
+    a TSDF and writes `mesh.ply` (surface nets); on pipes at 1600 px F1
+    68.1% at 2 cm against the cloud's 74.8%. The TSDF moved from
+    `visloc-gsplat-train` to `visloc-gsplat-core` (feature `mesh`).
+  - **Experimental:** `--deformable`, APD-MVS's deformable patches for
+    weak texture (CPU and GPU). On an L4 at 3200 px it scored F1 90.1% on
+    terrace and 76.1% on office at 2 cm, against 91.0% and 79.0% for the
+    defaults, so it is off (docs/mvs.md).
+  - **Run it:** `cargo run --release -p visloc-mvs --features gpu
+    --example mvs -- --sparse <model> --images <dir> --out <dir> --gpu`.
 
 - **COLMAP-port mapper: complete the largest model
   (`complete_largest_model=1`).** Off by default in the mapper; on in
@@ -556,6 +807,52 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Changed
 
+- **`gsplat_photos` runs the mapper's converged final global BA on every
+  model** (`ba_global_final_converge_min_frames=0`; the pipeline's
+  default stays at 1,000 frames).
+  - **Why:** images registered from few tracks keep a few tenths of a
+    degree of error after the incremental loop's global BAs, which stop
+    after a step or two. On ETH3D electro (r52), DSC_9289, DSC_9290 and
+    DSC_9298 came out 0.17 to 0.27° and 0.6 to 1.5 cm off. A BA run to
+    convergence, started from the mapper's model or from the ground
+    truth, lands on 0.02 to 0.05° and 0.3 to 1.0 cm.
+  - **Mapper replays of the 13 ETH3D scenes** (seeds 0 to 2): electro's
+    relative-rotation error goes from 0.040° to 0.031° and its largest
+    centre error from 1.7-2.3 to 1.3-1.8 cm. meadow's goes from 0.13 and
+    0.15° to 0.10 and 0.11° on seeds 0 and 1 (seed 2 stays at 0.10°). The
+    others change by under a millimetre, at a few seconds more.
+  - **End to end on electro (r53, L4):** F1 at 2 cm goes from 78.7%
+    (r52) to 84.5%, and from 86.4% to 92.5% at 5 cm, against 89.4% and
+    95.1% with the ground-truth poses. The 13-scene end-to-end mean
+    becomes 81.5%.
+
+- **`scripts/align_colmap_model.py` takes the rotation from the cameras'
+  orientations by default.** The centres are still fitted first. The
+  scale and translation follow under that rotation, from the cameras
+  whose orientations agree, refitted once without centres beyond three
+  times the median error. `--centres` keeps the centres' fit, and
+  `--rotations`, the previous switch, is accepted.
+  - The far end of ETH3D's facade is bent away from the rest. COLMAP's
+    mapper on the same matches bends it too, and so does a bundle
+    adjustment started from the ground-truth poses, which are a few
+    centimetres off the scan there themselves. Leaving the far end out
+    of the fit puts 50.7% of facade's sparse points within 2 cm of the
+    scan, against 43.5%. The other scenes move by at most
+    1 mm, except meadow (1.6 cm, the same against the scan).
+  - Quaternions are normalized before use. The six digits ETH3D writes
+    had put about 0.1° of noise into the orientation check.
+  - **Why:** on r49's ETH3D end-to-end run, F1 at 2 cm over the 13
+    scenes is 79.2% this way (before the two changes above) against 76.0%
+    by the centres alone, as high as ICP onto the scan, without the scan.
+    meadow goes from 25.5% to 63.1%. Two scenes lose under a point
+    (terrace 0.9, playground 0.5).
+  - **r50, with the fit above:** facade scores 70.7% instead of 49.4%,
+    above the ground-truth poses' 67.3%, and meadow 64.9% instead of
+    63.1%. Over the 13 scenes that makes 81.0%, against 83.7% with the
+    ground-truth poses.
+  - The end-to-end comparison with COLMAP (76.3% against 57.4%) was
+    aligned by the centres for both and stays as measured.
+
 - **`gsplat_photos` extracts SIFT on the GPU and completes the largest
   model by default.** `--cpu-sift` and `--no-complete-model` restore the
   previous behaviour; `--cpu` also extracts on the CPU.
@@ -577,6 +874,85 @@ All notable changes to `visloc-rs` will be documented here.
 - **`gsplat_photos` logs how long decoding the photos took**, on its
   `N images at WxH` line. COLMAP's extraction times include decoding;
   `gsplat_photos`' SIFT times do not.
+
+- **COLMAP-port mapper: faster loading and model export, byte-identical.**
+  - **Loading:** the replay export's feature files are parsed in
+    parallel, and the correspondence graph looks up a pair's two images
+    once instead of per match and flattens images in parallel.
+  - **Export:** the COLMAP text writer
+    (`write_colmap_reconstruction_for_3dgs_with_cameras`) appends numbers
+    to its buffers instead of allocating a string each, keeps keypoint ids
+    in dense arrays instead of maps, and formats `points3D.txt` and
+    `images.txt` in parallel chunks joined in order.
+  - **SmallCity pass 1** (1,499 photos, 4 threads): loading 6.3 s instead
+    of 8.8 s, export 3.1 s instead of 8.4 s, and the model files are
+    byte-identical.
+  - `colmap_incremental_mapper` now logs both times.
+
+- **COLMAP-port mapper: about half the memory, byte-identical.** SmallCity
+  pass 1 (1,499 photos, 4 threads) writes the same model files as before:
+
+  | | before | now |
+  |---|---|---|
+  | Peak memory | 4.90 GB | **2.60 GB** |
+  | Memory after loading | 2.94 GB | **0.70 GB** |
+  | Loading | 6.5 s | **0.9 s** |
+  | Mapper wall time | 5:03 | **4:25** |
+
+  - **All of SmallCity** (5,822 photos, one run on an NVIDIA L4 pod with
+    13 CPU threads): peak memory **9.0 GiB** instead of 18.9 GiB (the run
+    in `docs/gpu_bundle_adjustment.md`, an L4 pod with 15 threads), and
+    2.7 GiB instead of 11.3 GiB after loading.
+    - **Accuracy:** the model registers 5,816 photos with a median
+      camera-centre error of 0.184 m (p90 0.276 m) against the release's
+      model.
+    - **Why the models differ:** the two runs' VLAD retrieval picked
+      slightly different candidate pairs (242,917 against 242,592), so the
+      mapper's input differed. The earlier model scored 0.297 m. Both lie
+      within the 0.15 to 0.65 m that mapper seeds alone give on this
+      capture.
+    - **Wall time:** the newer pod ran the unchanged stages 1.6 to 2.0
+      times slower, so the wall times (1,380 s against 847 s) do not
+      compare. The pass-1 replay above times both versions on one machine.
+    - **What remains:** the largest working sets are the last global
+      bundle adjustments', on 15.1M observations: 2.1 GiB of per-point
+      linearizations and 0.9 GiB for the reduced camera system.
+  - **Correspondence graph.** The replay export's graph is built in one
+    pass (`CorrespondenceGraph::finalized_from_pairs`), equal field for
+    field to `add_image`, `add_two_view_geometry` and `finalize`, without
+    the per-keypoint lists the incremental path keeps until `finalize`. The
+    export's matches stay in one `u32` buffer. Correspondences and each
+    image's offsets are 32-bit, as COLMAP stores them: `Correspondence`'s
+    fields are now `u32`, and `add_image` panics on an id or a keypoint
+    count past `u32::MAX`.
+  - **Bundle adjustment:**
+    - The elimination finds each pair's block through a per-row table of
+      partner positions instead of an index over every point's pairs
+      (1.9 GB on SmallCity's last bundle adjustment).
+    - Observations name their camera in a table instead of carrying its
+      intrinsics and sensor pose: 24 bytes each instead of 112 (1.3 GB
+      there).
+    - Systems from 20,000 off-diagonal blocks are eliminated by output, as
+      those from 1,000 frames already were. The sharded loop kept 8 copies
+      of every block: 825 MB at 358k blocks, pass 1's peak. By output, pass
+      1's eliminations from 20k to 400k blocks took 0.59 to 0.90 of the
+      time.
+    - Each row of the reduced system is written into the block array in
+      place, instead of into its own buffer and then concatenated.
+
+- **`gsplat_photos` loads large photos faster, with the same pixels.** Its
+  photos go to the working size through a Triangle resize that performs
+  `image::imageops::resize`'s arithmetic in the same order, so the working
+  images are byte-identical. It sums blocks of source rows in registers and
+  reads the intermediate row by row, where the `image` crate reads one
+  pixel at a time and walks its intermediate down columns.
+  - **Other changes:** the decoded RGB image is moved, not copied, and
+    each file is read once for both the decoder and the EXIF focal.
+  - **One 24-megapixel ETH3D photo to 1,600 px, one thread:** the resize
+    takes 108 ms instead of 261 ms, and decoding plus resizing 325 ms
+    instead of 552 ms.
+  - **ETH3D pipes on 4 threads:** loading takes 1.3 s instead of 2.0 s, and
+    every output file is byte-identical.
 
 - **COLMAP-port BA: cheaper setup of large bundle adjustments.** Results
   are bit-identical: the SmallCity pass-1 model matches byte for byte.

@@ -54,6 +54,7 @@ pub mod five_point;
 pub mod fundamental;
 pub mod homography;
 pub mod rescue;
+pub mod spherical;
 
 pub use colmap_verification::{
     two_view_pose_and_triangulation_angle, two_view_triangulation_angle, ConfigurationType,
@@ -61,6 +62,7 @@ pub use colmap_verification::{
 };
 pub use correspondence_graph::{
     Correspondence, CorrespondenceGraph, CorrespondenceGraphError, EdgeMetadata, IngestStats,
+    PairMatches,
 };
 pub use fundamental::{
     estimate_fundamental_dlt, fundamental_ransac, fundamental_squared_sampson_error,

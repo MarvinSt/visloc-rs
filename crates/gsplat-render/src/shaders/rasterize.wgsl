@@ -40,9 +40,11 @@ var<workgroup> all_done: u32;
 @compute @workgroup_size(256)
 fn rasterize(
     @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let tile = wid.x;
+    let tile = wid.x + wid.y * nwg.x;
+    if (tile >= u.tile_bw * u.tile_bh) { return; }
     let tid = lid.x;
 
     let tile_x = tile % u.tile_bw;

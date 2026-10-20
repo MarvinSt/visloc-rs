@@ -1693,7 +1693,7 @@ pub(super) fn build_tracks_via_graph(
                 graph.extract_transitive_correspondences(image_id, point2d_idx, usize::MAX);
             let mut obs: Vec<(usize, usize)> = closure
                 .iter()
-                .map(|c| (c.image_id, c.point2d_idx))
+                .map(|c| (c.image_id as usize, c.point2d_idx as usize))
                 .collect();
             obs.push((image_id, point2d_idx));
             for &node in &obs {

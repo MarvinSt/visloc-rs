@@ -187,13 +187,13 @@ impl IncrementalTriangulator {
             graph
                 .find_correspondences(image_id as usize, point2d_idx)
                 .iter()
-                .map(|c| (c.image_id as ImageT, c.point2d_idx))
+                .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
                 .collect()
         } else {
             graph
                 .extract_transitive_correspondences(image_id as usize, point2d_idx, transitivity)
                 .into_iter()
-                .map(|c| (c.image_id as ImageT, c.point2d_idx))
+                .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
                 .collect()
         };
 
@@ -989,7 +989,7 @@ impl IncrementalTriangulator {
             let corrs: Vec<(ImageT, Point2DT)> = graph
                 .find_correspondences(el.image_id as usize, el.point2d_idx)
                 .iter()
-                .map(|c| (c.image_id as ImageT, c.point2d_idx))
+                .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
                 .collect();
             for (corr_image_id, corr_point2d_idx) in corrs {
                 if !recon.is_image_registered(corr_image_id) {
@@ -1089,7 +1089,7 @@ impl IncrementalTriangulator {
                 let corrs: Vec<(ImageT, Point2DT)> = graph
                     .find_correspondences(elem.image_id as usize, elem.point2d_idx)
                     .iter()
-                    .map(|c| (c.image_id as ImageT, c.point2d_idx))
+                    .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
                     .collect();
                 for (corr_image_id, corr_point2d_idx) in corrs {
                     if !recon.is_image_registered(corr_image_id) {
@@ -1164,7 +1164,7 @@ fn points_reaching_free_2d_points(
                 }
                 for corr in graph.find_correspondences(image_id as usize, idx) {
                     let corr_image = recon.image(corr.image_id as ImageT);
-                    if let Some(id) = corr_image.points2d[corr.point2d_idx].point3d_id {
+                    if let Some(id) = corr_image.points2d[corr.point2d_idx as usize].point3d_id {
                         found.push(id);
                     }
                 }
@@ -1279,7 +1279,7 @@ fn plan_triangulate_image_point(
         graph
             .find_correspondences(image_id as usize, point2d_idx)
             .iter()
-            .map(|c| (c.image_id as ImageT, c.point2d_idx))
+            .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
             .collect()
     } else {
         graph
@@ -1289,7 +1289,7 @@ fn plan_triangulate_image_point(
                 options.max_transitivity,
             )
             .into_iter()
-            .map(|c| (c.image_id as ImageT, c.point2d_idx))
+            .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
             .collect()
     };
     let mut plan = TriangulatePlan {
@@ -1439,7 +1439,7 @@ fn plan_complete_image_point(
         graph
             .find_correspondences(image_id as usize, point2d_idx)
             .iter()
-            .map(|c| (c.image_id as ImageT, c.point2d_idx))
+            .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
             .collect()
     } else {
         graph
@@ -1449,7 +1449,7 @@ fn plan_complete_image_point(
                 options.max_transitivity,
             )
             .into_iter()
-            .map(|c| (c.image_id as ImageT, c.point2d_idx))
+            .map(|c| (c.image_id as ImageT, c.point2d_idx as usize))
             .collect()
     };
     // The usable correspondences (registered image, sane camera). A plan
@@ -1528,7 +1528,7 @@ fn plan_complete(
     for transitivity in 1..=max_transitivity {
         while let Some(elem) = curr_queue.pop() {
             for corr in graph.find_correspondences(elem.image_id as usize, elem.point2d_idx) {
-                let key = (corr.image_id as ImageT, corr.point2d_idx);
+                let key = (corr.image_id as ImageT, corr.point2d_idx as usize);
                 let (corr_image_id, corr_point2d_idx) = key;
                 let image = recon.image(corr_image_id);
                 if image.points2d[corr_point2d_idx].has_point3d()
@@ -1605,7 +1605,7 @@ fn plan_merge(
                 continue;
             }
             let Some(corr_point3d_id) =
-                recon.image(corr_image_id).points2d[corr.point2d_idx].point3d_id
+                recon.image(corr_image_id).points2d[corr.point2d_idx as usize].point3d_id
             else {
                 continue;
             };
@@ -1651,11 +1651,17 @@ fn angular_reprojection_error(
 ) -> f64 {
     let point_cam = cam_from_world.transform_point(&xyz);
     let predicted_ray = point_cam.coords.normalize();
-    let Some(observed_normalized) = camera.normalize_pixel(&xy) else {
-        return f64::MAX;
+    let observed_ray = if camera.model.is_spherical() {
+        let Some(ray) = camera.unit_ray_from_pixel(&xy) else {
+            return f64::MAX;
+        };
+        ray
+    } else {
+        let Some(observed_normalized) = camera.normalize_pixel(&xy) else {
+            return f64::MAX;
+        };
+        nalgebra::Vector3::new(observed_normalized.x, observed_normalized.y, 1.0).normalize()
     };
-    let observed_ray =
-        nalgebra::Vector3::new(observed_normalized.x, observed_normalized.y, 1.0).normalize();
     predicted_ray.dot(&observed_ray).clamp(-1.0, 1.0).acos()
 }
 
@@ -1778,7 +1784,7 @@ fn estimate_minimal_triangulation(
         (&first.cam_from_world, first.xy, &first.camera),
         (&second.cam_from_world, second.xy, &second.camera),
     ])?;
-    if !positive_depth(&first.cam_from_world, xyz) || !positive_depth(&second.cam_from_world, xyz) {
+    if !positive_depth(first, xyz) || !positive_depth(second, xyz) {
         return None;
     }
     let angle = calculate_triangulation_angle(
@@ -1803,7 +1809,7 @@ fn estimate_multiview_triangulation(
         .collect();
     let xyz = triangulate_dlt(&views)?;
     for &i in inlier_indices {
-        if !positive_depth(&corrs[i].cam_from_world, xyz) {
+        if !positive_depth(&corrs[i], xyz) {
             return None;
         }
     }
@@ -2018,15 +2024,16 @@ pub(super) fn matches_between_images(
     for idx1 in 0..num_points2d {
         for corr in graph.find_correspondences(image_id1 as usize, idx1) {
             if corr.image_id as ImageT == image_id2 {
-                out.push((idx1, corr.point2d_idx));
+                out.push((idx1, corr.point2d_idx as usize));
             }
         }
     }
     out
 }
 
-fn positive_depth(cam_from_world: &SE3, xyz: Point3<f64>) -> bool {
-    cam_from_world.transform_point(&xyz).z > 0.0
+fn positive_depth(corr: &CorrData, xyz: Point3<f64>) -> bool {
+    let point_camera = corr.cam_from_world.transform_point(&xyz);
+    corr.camera.sees_in_front(&point_camera, &corr.xy)
 }
 
 fn cam_center(cam_from_world: &SE3) -> Point3<f64> {
@@ -2092,14 +2099,36 @@ pub(super) fn triangulate_dlt(views: &[(&SE3, Point2<f64>, &Camera)]) -> Option<
 
 /// One view's two DLT rows, `x * P_row2 - P_row0` and `y * P_row2 - P_row1`,
 /// with `P = [R | t]` in the normalized (unit-focal, zero-principal-point)
-/// camera frame; `None` when the pixel cannot be normalized.
+/// camera frame; `None` when the pixel cannot be normalized. A spherical
+/// camera's ray `d` may point anywhere: its rows are the two of `d × (P X)
+/// = 0` that do not vanish with `d`'s largest component.
 fn dlt_rows((cam_from_world, xy, camera): &(&SE3, Point2<f64>, &Camera)) -> Option<[[f64; 4]; 2]> {
-    let normalized = camera.normalize_pixel(xy)?;
     let r = cam_from_world.rotation.to_rotation_matrix();
     let t = cam_from_world.translation;
     let p0 = [r[(0, 0)], r[(0, 1)], r[(0, 2)], t.x];
     let p1 = [r[(1, 0)], r[(1, 1)], r[(1, 2)], t.y];
     let p2 = [r[(2, 0)], r[(2, 1)], r[(2, 2)], t.z];
+    if camera.model.is_spherical() {
+        let d = camera.unit_ray_from_pixel(xy)?;
+        let row = |a: f64, pa: &[f64; 4], b: f64, pb: &[f64; 4]| -> [f64; 4] {
+            std::array::from_fn(|c| a * pa[c] - b * pb[c])
+        };
+        // (d × P X)_0 = d.y P2 - d.z P1, _1 = d.z P0 - d.x P2, _2 = d.x P1 - d.y P0.
+        let rows = [
+            row(d.y, &p2, d.z, &p1),
+            row(d.z, &p0, d.x, &p2),
+            row(d.x, &p1, d.y, &p0),
+        ];
+        let (ax, ay, az) = (d.x.abs(), d.y.abs(), d.z.abs());
+        return Some(if az >= ax && az >= ay {
+            [rows[0], rows[1]]
+        } else if ax >= ay {
+            [rows[1], rows[2]]
+        } else {
+            [rows[0], rows[2]]
+        });
+    }
+    let normalized = camera.normalize_pixel(xy)?;
     Some([
         std::array::from_fn(|c| normalized.x * p2[c] - p0[c]),
         std::array::from_fn(|c| normalized.y * p2[c] - p1[c]),

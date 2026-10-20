@@ -29,8 +29,9 @@ To publish crate by crate instead, use this order:
 12. `visloc-gsplat-render`
 13. `visloc-sift-gpu`
 14. `visloc-ba-gpu`
-15. `visloc-gsplat-train`
-16. `visloc-rs`
+15. `visloc-mvs`
+16. `visloc-gsplat-train`
+17. `visloc-rs`
 
 The order follows internal dependencies (optional ones marked `?`):
 
@@ -46,6 +47,7 @@ The order follows internal dependencies (optional ones marked `?`):
 - `visloc-gsplat-render` depends on `visloc-gsplat-core`.
 - `visloc-sift-gpu` depends on `visloc-vision` and `visloc-gsplat-render`.
 - `visloc-ba-gpu` depends on `visloc-core`, `visloc-slam`, and `visloc-gsplat-render`.
+- `visloc-mvs` depends on `visloc-gsplat-render?`.
 - `visloc-gsplat-train` depends on `visloc-gsplat-core`, `visloc-gsplat-render`, and optionally `visloc-core`, `visloc-vision`, `visloc-io`, `visloc-slam`, `visloc-sift-gpu`, and `visloc-ba-gpu`.
 - `visloc-rs` re-exports the workspace crates (`visloc-sift-gpu` and `visloc-ba-gpu` optionally).
 

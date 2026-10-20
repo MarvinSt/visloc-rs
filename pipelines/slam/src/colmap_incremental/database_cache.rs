@@ -74,14 +74,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use nalgebra::{Point2, Quaternion, UnitQuaternion, Vector3};
 use thiserror::Error;
 
 use visloc_core::geometry::SE3;
-use visloc_vision::two_view::{ConfigurationType, CorrespondenceGraph};
+use visloc_vision::two_view::{ConfigurationType, CorrespondenceGraph, PairMatches};
 
 use super::reconstruction::{Camera, Image, Point2D};
 use super::types::{CameraT, DataT, Frame, FrameT, ImageT, Rig, RigT, SensorT};
@@ -298,6 +298,21 @@ impl DatabaseCache {
         let mut frame_ids_seen: std::collections::BTreeSet<FrameT> =
             std::collections::BTreeSet::new();
 
+        // The feature files, parsed in parallel; the loop below takes each
+        // image's result in image order, so the first error is the same.
+        let mut parsed: Vec<Option<Result<Vec<Point2<f64>>, DatabaseCacheError>>> = {
+            use rayon::prelude::*;
+            pairs_export
+                .image_names
+                .par_iter()
+                .map(|name| {
+                    Some(parse_features_txt(
+                        &features_dir.join(format!("{}_features.txt", stem(name))),
+                    ))
+                })
+                .collect()
+        };
+
         for (image_index, name) in pairs_export.image_names.iter().enumerate() {
             let image_id = image_index as ImageT;
             let &(frame_idx, sensor_index) = frame_of_name.get(name.as_str()).ok_or_else(|| {
@@ -321,7 +336,7 @@ impl DatabaseCache {
                 .add_data_id(DataT::camera(camera_id, image_id));
 
             let features_path = features_dir.join(format!("{}_features.txt", stem(name)));
-            let keypoints = parse_features_txt(&features_path)?;
+            let keypoints = parsed[image_index].take().expect("parsed once")?;
             let expected = pairs_export.feature_counts[image_index] as usize;
             if keypoints.len() != expected {
                 return Err(DatabaseCacheError::Inconsistent(format!(
@@ -336,33 +351,34 @@ impl DatabaseCache {
             cache.add_image(image);
         }
 
-        // Correspondence graph: `AddImage` capacities first (COLMAP requires
-        // every referenced image to be declared before
-        // `AddTwoViewGeometry`, `correspondence_graph.cc:111-112`), then
-        // ingest every verified pair, then `Finalize()`.
-        for image_id in 0..pairs_export.image_names.len() as ImageT {
-            let num_points2d = cache.image(image_id).num_points2d();
-            cache
-                .correspondence_graph
-                .add_image(image_id as usize, num_points2d);
-        }
-        for pair in &pairs_export.pairs {
-            cache
-                .correspondence_graph
-                .add_two_view_geometry(
-                    pair.image_i,
-                    pair.image_j,
-                    &pair.matches,
-                    ConfigurationType::Calibrated,
-                )
-                .map_err(|error| {
-                    DatabaseCacheError::Inconsistent(format!(
-                        "ingesting pair ({}, {}): {error}",
-                        pair.image_i, pair.image_j
-                    ))
-                })?;
-        }
-        cache.correspondence_graph.finalize();
+        // Correspondence graph: COLMAP's `AddImage` for every image (each
+        // referenced image must be declared before `AddTwoViewGeometry`,
+        // `correspondence_graph.cc:111-112`), `AddTwoViewGeometry` for every
+        // verified pair, then `Finalize()` — built in one pass, which yields
+        // the same graph without the per-keypoint lists in between.
+        let images: Vec<(usize, usize)> = (0..pairs_export.image_names.len())
+            .map(|image_id| (image_id, cache.image(image_id as ImageT).num_points2d()))
+            .collect();
+        let pairs: Vec<PairMatches<'_>> = pairs_export
+            .pairs
+            .iter()
+            .map(|pair| PairMatches {
+                image_id1: pair.image_i,
+                image_id2: pair.image_j,
+                matches: &pairs_export.matches[pair.matches.clone()],
+                config: ConfigurationType::Calibrated,
+            })
+            .collect();
+        let (graph, _) = CorrespondenceGraph::finalized_from_pairs(&images, &pairs).map_err(
+            |(index, error)| {
+                let pair = &pairs_export.pairs[index];
+                DatabaseCacheError::Inconsistent(format!(
+                    "ingesting pair ({}, {}): {error}",
+                    pair.image_i, pair.image_j
+                ))
+            },
+        )?;
+        cache.correspondence_graph = graph;
 
         Ok(cache)
     }
@@ -403,6 +419,8 @@ struct ParsedRigManifest {
 /// frame_idx image_name sensor_index` frame-membership rows, exactly the
 /// contract `examples/generalized_rig_sfm.rs::parse_manifest` reads (see
 /// module doc for why that function itself can't be called from here).
+/// Not in that contract: a sensor row may end in a camera model name,
+/// `EQUIRECTANGULAR` for a 360° panorama of `width x height` px.
 fn parse_rig_manifest(path: &Path) -> Result<ParsedRigManifest, DatabaseCacheError> {
     let contents = fs::read_to_string(path).map_err(|source| DatabaseCacheError::Io {
         path: path.display().to_string(),
@@ -423,12 +441,21 @@ fn parse_rig_manifest(path: &Path) -> Result<ParsedRigManifest, DatabaseCacheErr
         };
         match tokens.first().copied() {
             Some("S") => {
-                if tokens.len() != 16 {
-                    return Err(err(format!(
-                        "sensor row requires 16 fields, found {}",
-                        tokens.len()
-                    )));
-                }
+                // An optional 17th field names the camera model: only
+                // `EQUIRECTANGULAR` (its intrinsics fields are ignored).
+                let spherical = match tokens.get(16).copied() {
+                    _ if tokens.len() > 17 || tokens.len() < 16 => {
+                        return Err(err(format!(
+                            "sensor row requires 16 or 17 fields, found {}",
+                            tokens.len()
+                        )));
+                    }
+                    None | Some("PINHOLE") => false,
+                    Some("EQUIRECTANGULAR") => true,
+                    Some(other) => {
+                        return Err(err(format!("unsupported sensor camera model {other:?}")));
+                    }
+                };
                 let index: usize = parse_field(&tokens, 1, &err)?;
                 let camera_id: CameraT = parse_field(&tokens, 2, &err)?;
                 let width: u32 = parse_field(&tokens, 3, &err)?;
@@ -451,7 +478,11 @@ fn parse_rig_manifest(path: &Path) -> Result<ParsedRigManifest, DatabaseCacheErr
                 sensors.push(ManifestSensor {
                     index,
                     camera_id,
-                    camera: Camera::pinhole(camera_id, width, height, fx, fy, cx, cy),
+                    camera: if spherical {
+                        Camera::equirectangular(camera_id, width, height)
+                    } else {
+                        Camera::pinhole(camera_id, width, height, fx, fy, cx, cy)
+                    },
                     sensor_from_rig: SE3::new(
                         UnitQuaternion::new_normalize(quaternion),
                         Vector3::new(tx, ty, tz),
@@ -548,12 +579,16 @@ struct ColmapPairsExport {
     image_names: Vec<String>,
     feature_counts: Vec<u64>,
     pairs: Vec<ColmapPairRecord>,
+    /// Every pair's matches, back to back, as stored (`u32` point2D
+    /// indices): one allocation instead of one per pair.
+    matches: Vec<(u32, u32)>,
 }
 
 struct ColmapPairRecord {
     image_i: usize,
     image_j: usize,
-    matches: Vec<(usize, usize)>,
+    /// This pair's run of [`ColmapPairsExport::matches`].
+    matches: std::ops::Range<usize>,
 }
 
 /// Reads the fixed binary layout `examples/import_colmap_verified_snapshot.rs`
@@ -593,28 +628,44 @@ fn parse_colmap_pairs_export(path: &Path) -> Result<ColmapPairsExport, DatabaseC
     }
 
     let pair_count = read_u64(&mut reader, &err)? as usize;
+    let io_err = |source| DatabaseCacheError::Io {
+        path: path.display().to_string(),
+        source,
+    };
+    // The rest of the file bounds the matches (8 bytes each), so reserving
+    // that once never reallocates the buffer, which at a large scene's size
+    // would briefly hold both copies.
+    let rest = reader
+        .get_ref()
+        .metadata()
+        .map_err(io_err)?
+        .len()
+        .saturating_sub(reader.stream_position().map_err(io_err)?);
+    let mut matches: Vec<(u32, u32)> = Vec::with_capacity((rest / 8) as usize);
     let mut pairs = Vec::with_capacity(pair_count);
+    let mut chunk = [0u8; 8 * 1024];
     for _ in 0..pair_count {
         let image_i = read_u64(&mut reader, &err)? as usize;
         let image_j = read_u64(&mut reader, &err)? as usize;
         let match_count = read_u64(&mut reader, &err)? as usize;
-        let mut matches = Vec::with_capacity(match_count);
-        for _ in 0..match_count {
-            let mut bytes = [0u8; 8];
-            reader
-                .read_exact(&mut bytes)
-                .map_err(|source| DatabaseCacheError::Io {
-                    path: path.display().to_string(),
-                    source,
-                })?;
-            let left = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-            let right = u32::from_le_bytes(bytes[4..].try_into().unwrap()) as usize;
-            matches.push((left, right));
+        let start = matches.len();
+        let mut left = match_count;
+        while left > 0 {
+            let take = left.min(chunk.len() / 8);
+            let bytes = &mut chunk[..8 * take];
+            reader.read_exact(bytes).map_err(io_err)?;
+            matches.extend(bytes.chunks_exact(8).map(|pair| {
+                (
+                    u32::from_le_bytes(pair[..4].try_into().unwrap()),
+                    u32::from_le_bytes(pair[4..].try_into().unwrap()),
+                )
+            }));
+            left -= take;
         }
         pairs.push(ColmapPairRecord {
             image_i,
             image_j,
-            matches,
+            matches: start..matches.len(),
         });
     }
 
@@ -622,6 +673,7 @@ fn parse_colmap_pairs_export(path: &Path) -> Result<ColmapPairsExport, DatabaseC
         image_names,
         feature_counts,
         pairs,
+        matches,
     })
 }
 
@@ -717,6 +769,41 @@ mod tests {
         drop(file);
 
         (manifest_path, features_dir, pairs_path)
+    }
+
+    /// A sensor row may name its camera model: `EQUIRECTANGULAR` makes an
+    /// equirectangular camera of the row's size; others are rejected.
+    #[test]
+    fn manifest_sensor_rows_take_an_optional_camera_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "colmap_incremental_manifest_model_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("manifest.txt");
+        fs::write(
+            &path,
+            "S 0 1 2048 1024 0 0 0 0 1 0 0 0 0 0 0 EQUIRECTANGULAR\n\
+             S 1 2 640 480 500 500 320 240 1 0 0 0 0 0 0 PINHOLE\n\
+             F 0 a.png 0\n",
+        )
+        .unwrap();
+        let manifest = parse_rig_manifest(&path).unwrap();
+        assert_eq!(
+            manifest.sensors[0].camera,
+            Camera::equirectangular(1, 2048, 1024)
+        );
+        assert_eq!(
+            manifest.sensors[1].camera,
+            Camera::pinhole(2, 640, 480, 500.0, 500.0, 320.0, 240.0)
+        );
+        fs::write(
+            &path,
+            "S 0 1 640 480 500 500 320 240 1 0 0 0 0 0 0 OPENCV\n",
+        )
+        .unwrap();
+        assert!(parse_rig_manifest(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

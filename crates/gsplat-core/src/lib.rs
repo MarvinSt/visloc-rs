@@ -28,6 +28,8 @@ pub mod backward;
 pub mod camera;
 pub mod cpu_render;
 pub mod gaussian;
+#[cfg(feature = "mesh")]
+pub mod mesh;
 pub mod ply;
 pub mod sh;
 pub mod splat;

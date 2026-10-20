@@ -1,4 +1,4 @@
-use nalgebra::{Matrix2x3, Point2, Point3, Vector3};
+use nalgebra::{Matrix2x3, Point2, Point3, Vector2, Vector3};
 
 pub type CameraId = u64;
 
@@ -30,6 +30,13 @@ pub enum CameraModel {
     Fov,
     /// Double Sphere model: `[fx, fy, cx, cy, xi, alpha]`.
     DoubleSphere,
+    /// COLMAP's `EQUIRECTANGULAR` 360° panorama: `[w, h]`, the image size.
+    /// Column `x` is the azimuth `atan2(X, Z)` from `-π` at `x = 0` to `π`
+    /// at `x = w`, row `y` the elevation `atan2(-Y, hypot(X, Z))` from
+    /// `π/2` at `y = 0` to `-π/2` at `y = h`: every direction projects,
+    /// including those behind the camera. No focal length, so
+    /// [`Camera::intrinsics`] is `None`.
+    Equirectangular,
     Unknown(String),
 }
 
@@ -46,6 +53,7 @@ impl CameraModel {
             "SIMPLE_RADIAL_FISHEYE" => Self::SimpleRadialFisheye,
             "RADIAL_FISHEYE" => Self::RadialFisheye,
             "FOV" => Self::Fov,
+            "EQUIRECTANGULAR" => Self::Equirectangular,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -64,9 +72,17 @@ impl CameraModel {
             Self::SimpleRadialFisheye => "SIMPLE_RADIAL_FISHEYE",
             Self::RadialFisheye => "RADIAL_FISHEYE",
             Self::Fov => "FOV",
+            Self::Equirectangular => "EQUIRECTANGULAR",
             Self::DoubleSphere => return None,
             Self::Unknown(name) => return Some(name.as_str()),
         })
+    }
+
+    /// Whether this model sees in every direction (the equirectangular
+    /// panorama): rays behind the camera are valid, and there is no image
+    /// plane to measure depth against.
+    pub const fn is_spherical(&self) -> bool {
+        matches!(self, Self::Equirectangular)
     }
 
     /// Whether this model is a fisheye/wide-angle model whose pixel-to-ray map
@@ -89,6 +105,17 @@ pub struct Camera {
 }
 
 impl Camera {
+    /// A [`CameraModel::Equirectangular`] panorama of `width x height` px.
+    pub fn equirectangular(id: CameraId, width: u32, height: u32) -> Self {
+        Self {
+            id,
+            model: CameraModel::Equirectangular,
+            width,
+            height,
+            params: vec![width as f64, height as f64],
+        }
+    }
+
     pub fn pinhole(
         id: CameraId,
         width: u32,
@@ -235,8 +262,44 @@ impl Camera {
                 *self.params.get(2)?,
                 *self.params.get(3)?,
             )),
-            CameraModel::Unknown(_) => None,
+            CameraModel::Equirectangular | CameraModel::Unknown(_) => None,
         }
+    }
+
+    /// Image pixels per radian of the camera's rays near the image centre:
+    /// the focal length of a perspective model (`(fx + fy) / 2`), `w / 2π`
+    /// for an equirectangular one (COLMAP's `CamFromImgThreshold`). Divides
+    /// a pixel threshold into an angle.
+    pub fn pixels_per_radian(&self) -> Option<f64> {
+        if self.model == CameraModel::Equirectangular {
+            return Some(*self.params.first()? / (2.0 * std::f64::consts::PI));
+        }
+        let (fx, fy, _, _) = self.intrinsics()?;
+        Some(0.5 * (fx + fy))
+    }
+
+    /// `projected - observed` in pixels; a panorama's horizontal difference
+    /// wrapped into `[-w / 2, w / 2]`, its left and right edges being one
+    /// meridian.
+    pub fn pixel_residual(&self, projected: &Point2<f64>, observed: &Point2<f64>) -> Vector2<f64> {
+        let mut residual = projected - observed;
+        if self.model == CameraModel::Equirectangular {
+            let w = self.params.first().copied().unwrap_or(self.width as f64);
+            residual.x -= w * (residual.x / w).round();
+        }
+        residual
+    }
+
+    /// Whether the camera-frame point `point_camera` lies ahead along the
+    /// ray of its observation at pixel `observed`: in front of the image
+    /// plane (`z > 0`) for every model but a spherical one, on the ray's
+    /// side of the centre for that.
+    pub fn sees_in_front(&self, point_camera: &Point3<f64>, observed: &Point2<f64>) -> bool {
+        if !self.model.is_spherical() {
+            return point_camera.z > 0.0;
+        }
+        self.unit_ray_from_pixel(observed)
+            .is_some_and(|ray| ray.dot(&point_camera.coords) > 0.0)
     }
 
     /// Back-project a pixel to a normalized (undistorted) bearing `(x, y, 1)`.
@@ -256,6 +319,7 @@ impl Camera {
                 | CameraModel::RadialFisheye
                 | CameraModel::Fov
                 | CameraModel::DoubleSphere
+                | CameraModel::Equirectangular
         ) {
             let ray = self.unit_ray_from_pixel(point)?;
             if ray.z <= EPS {
@@ -289,6 +353,10 @@ impl Camera {
             return None;
         }
         match self.model {
+            CameraModel::Equirectangular => {
+                let [w, h] = params2(&self.params)?;
+                project_equirectangular(w, h, point_camera)
+            }
             CameraModel::DoubleSphere => {
                 let [fx, fy, cx, cy, xi, alpha] = params6(&self.params)?;
                 project_double_sphere(fx, fy, cx, cy, xi, alpha, point_camera)
@@ -383,6 +451,14 @@ impl Camera {
         point_camera: &Point3<f64>,
     ) -> Option<(Point2<f64>, Matrix2x3<f64>)> {
         let pixel = self.project(point_camera)?;
+        if self.model == CameraModel::Equirectangular {
+            let [w, h] = params2(&self.params)?;
+            let jacobian = equirectangular_point_jacobian(w, h, point_camera)?;
+            return jacobian
+                .iter()
+                .all(|value| value.is_finite())
+                .then_some((pixel, jacobian));
+        }
         let (fx, fy, _, _) = self.intrinsics()?;
         let jacobian = match self.model {
             CameraModel::DoubleSphere => {
@@ -444,6 +520,10 @@ impl Camera {
         if !point.coords.iter().all(|value| value.is_finite()) {
             return None;
         }
+        if self.model == CameraModel::Equirectangular {
+            let [w, h] = params2(&self.params)?;
+            return Some(unproject_equirectangular(w, h, point));
+        }
         let (fx, fy, cx, cy) = self.intrinsics()?;
         match self.model {
             CameraModel::DoubleSphere => {
@@ -482,6 +562,61 @@ impl Camera {
             }
         }
     }
+}
+
+fn params2(params: &[f64]) -> Option<[f64; 2]> {
+    let [w, h] = [*params.first()?, *params.get(1)?];
+    (w > 0.0 && h > 0.0).then_some([w, h])
+}
+
+/// [`CameraModel::Equirectangular`]'s projection (COLMAP's `ImgFromCam`).
+fn project_equirectangular(w: f64, h: f64, p: &Point3<f64>) -> Option<Point2<f64>> {
+    use std::f64::consts::PI;
+    let horizontal = p.x.hypot(p.z);
+    if horizontal + p.y.abs() < f64::EPSILON {
+        return None;
+    }
+    let azimuth = p.x.atan2(p.z);
+    let elevation = (-p.y).atan2(horizontal);
+    Some(Point2::new(
+        (azimuth / (2.0 * PI) + 0.5) * w,
+        (0.5 - elevation / PI) * h,
+    ))
+}
+
+/// Unit ray of an equirectangular pixel (COLMAP's `CamRayFromImg`).
+fn unproject_equirectangular(w: f64, h: f64, point: &Point2<f64>) -> Vector3<f64> {
+    use std::f64::consts::PI;
+    let azimuth = 2.0 * PI * (point.x / w - 0.5);
+    let elevation = PI * (0.5 - point.y / h);
+    let c = elevation.cos();
+    Vector3::new(c * azimuth.sin(), -elevation.sin(), c * azimuth.cos())
+}
+
+/// d(pixel)/d(point) of [`project_equirectangular`]; `None` on the vertical
+/// axis, where the azimuth is undefined.
+fn equirectangular_point_jacobian(w: f64, h: f64, p: &Point3<f64>) -> Option<Matrix2x3<f64>> {
+    use std::f64::consts::PI;
+    let rho2 = p.x * p.x + p.z * p.z;
+    if rho2 < EPS {
+        return None;
+    }
+    let rho = rho2.sqrt();
+    let r2 = rho2 + p.y * p.y;
+    // azimuth = atan2(x, z), elevation = atan2(-y, rho).
+    let (da_dx, da_dz) = (p.z / rho2, -p.x / rho2);
+    let de_dx = p.y * p.x / (rho * r2);
+    let de_dy = -rho / r2;
+    let de_dz = p.y * p.z / (rho * r2);
+    let (su, sv) = (w / (2.0 * PI), -h / PI);
+    Some(Matrix2x3::new(
+        su * da_dx,
+        0.0,
+        su * da_dz,
+        sv * de_dx,
+        sv * de_dy,
+        sv * de_dz,
+    ))
 }
 
 fn params4(params: &[f64]) -> Option<[f64; 4]> {
@@ -1068,6 +1203,45 @@ mod tests {
     }
 
     #[test]
+    fn equirectangular_round_trips_over_the_whole_sphere() {
+        let camera = Camera::equirectangular(1, 2048, 1024);
+        for point in [
+            Point3::new(0.3, -0.2, 2.0),
+            Point3::new(0.4, 0.1, -3.0),
+            Point3::new(-2.0, 0.5, 0.1),
+            Point3::new(0.2, -5.0, 0.3),
+            Point3::new(-0.1, 4.0, -0.2),
+        ] {
+            round_trip(&camera, point);
+        }
+        // Straight ahead at the centre, +X (right) a quarter to the right,
+        // up at the top row.
+        let at = |x: f64, y: f64, z: f64| camera.project(&Point3::new(x, y, z)).unwrap();
+        assert!((at(0.0, 0.0, 1.0) - Point2::new(1024.0, 512.0)).norm() < 1e-9);
+        assert!((at(1.0, 0.0, 0.0) - Point2::new(1536.0, 512.0)).norm() < 1e-9);
+        assert!((at(0.0, -1.0, 1e-9).y).abs() < 1e-6);
+        assert_eq!(camera.project(&Point3::origin()), None);
+        assert_eq!(camera.intrinsics(), None);
+        assert_eq!(
+            camera.pixels_per_radian(),
+            Some(2048.0 / (2.0 * std::f64::consts::PI))
+        );
+        // Forward hemisphere only, as with the fisheye models.
+        assert!(camera
+            .normalize_pixel(&Point2::new(1024.0, 512.0))
+            .is_some());
+        assert!(camera.normalize_pixel(&Point2::new(10.0, 512.0)).is_none());
+        assert_eq!(
+            CameraModel::from_colmap_name("EQUIRECTANGULAR"),
+            CameraModel::Equirectangular
+        );
+        assert_eq!(
+            CameraModel::Equirectangular.colmap_name(),
+            Some("EQUIRECTANGULAR")
+        );
+    }
+
+    #[test]
     fn colmap_names_round_trip_for_fisheye() {
         for name in [
             "OPENCV_FISHEYE",
@@ -1188,6 +1362,7 @@ mod tests {
             ),
             with(CameraModel::Fov, vec![500.0, 495.0, 640.0, 480.0, 0.9]),
             Camera::double_sphere(1, 1280, 960, 350.0, 352.0, 640.0, 480.0, -0.2, 0.6),
+            Camera::equirectangular(1, 2048, 1024),
         ]
     }
 

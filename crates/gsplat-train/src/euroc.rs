@@ -229,9 +229,16 @@ struct SfmOutcome {
 }
 
 /// Run the COLMAP incremental-mapper port on our features/verified pairs:
-/// write its inputs (single-sensor rig manifest, keypoints, VISLOC-COLMAP-1
-/// pairs) under `out_dir/port`, run `colmap_incremental::pipeline::run`,
-/// and read the largest model back as poses + tracks.
+/// write its inputs (rig manifest, keypoints, VISLOC-COLMAP-1 pairs) under
+/// `out_dir/port`, run `colmap_incremental::pipeline::run`, and read the
+/// largest model back as poses + tracks.
+///
+/// `rig`: `None` makes every image its own frame of a single-sensor rig.
+/// `Some(sensor_from_rig)` groups consecutive images into frames of
+/// `sensor_from_rig.len()` sensors that share one camera and one centre
+/// (image `i` is sensor `i % n` of frame `i / n`), each sensor rotated by
+/// its fixed `sensor_from_rig` (the first must be the identity): the
+/// mapper then solves one pose per frame.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_colmap_port(
     out_dir: &Path,
@@ -240,6 +247,7 @@ pub(crate) fn run_colmap_port(
     height: u32,
     features: &[FeatureSet],
     pairwise: &[PairwiseMatches],
+    rig: Option<&[nalgebra::Matrix3<f64>]>,
     mapper_overrides: &[String],
     log: &mut dyn FnMut(&str),
 ) -> Result<Vec<PortModel>, EurocError> {
@@ -249,12 +257,20 @@ pub(crate) fn run_colmap_port(
     let dir = out_dir.join("port");
     let feat_dir = dir.join("features");
     std::fs::create_dir_all(&feat_dir).map_err(|e| err(e.to_string()))?;
-    let [fx, fy, cx, cy] = [
-        camera.params[0],
-        camera.params[1],
-        camera.params[2],
-        camera.params[3],
-    ];
+    // A pinhole's `fx fy cx cy`; an equirectangular camera is its image
+    // size alone, marked by a trailing model name.
+    let spherical = camera.model.is_spherical();
+    let [fx, fy, cx, cy] = if spherical {
+        [0.0; 4]
+    } else {
+        [
+            camera.params[0],
+            camera.params[1],
+            camera.params[2],
+            camera.params[3],
+        ]
+    };
+    let model_suffix = if spherical { " EQUIRECTANGULAR" } else { "" };
     let name = |i: usize| format!("frame_{i:05}.png");
     // Only images that take part in a verified pair (the port's
     // correspondence graph has no node for an isolated image); names keep
@@ -269,11 +285,25 @@ pub(crate) fn run_colmap_port(
     for (k, &i) in order.iter().enumerate() {
         slot[i] = k;
     }
-    let mut manifest = format!(
-        "# generalized-rig-manifest-v1\nS 0 1 {width} {height} {fx} {fy} {cx} {cy} 1 0 0 0 0 0 0\n"
-    );
+    let identity = [nalgebra::Matrix3::identity()];
+    let sensors = rig.unwrap_or(&identity);
+    let mut manifest = "# generalized-rig-manifest-v1\n".to_string();
+    for (s, r) in sensors.iter().enumerate() {
+        let q = nalgebra::UnitQuaternion::from_rotation_matrix(
+            &nalgebra::Rotation3::from_matrix_unchecked(*r),
+        );
+        manifest.push_str(&format!(
+            "S {s} {} {width} {height} {fx} {fy} {cx} {cy} {} {} {} {} 0 0 0{model_suffix}\n",
+            s + 1,
+            q.w,
+            q.i,
+            q.j,
+            q.k
+        ));
+    }
     for &i in &order {
-        manifest.push_str(&format!("F {i} {} 0\n", name(i)));
+        let n = sensors.len();
+        manifest.push_str(&format!("F {} {} {}\n", i / n, name(i), i % n));
         let text: String = features[i]
             .keypoints
             .iter()
@@ -317,10 +347,13 @@ pub(crate) fn run_colmap_port(
     let mut options = PipelineOptions::default();
     // The port's default (8) is a rig-benchmark control override; use
     // COLMAP's own `Mapper.abs_pose_min_num_inliers` for single cameras,
-    // and COLMAP 4's structure-less registration fallback.
+    // and COLMAP 4's structure-less registration fallback, checked against
+    // the tracks its matches continue (on ETH3D it otherwise placed
+    // kicker's DSC_6487 66° off and electro's images up to 3 m off).
     let mut applied = vec![
         "abs_pose_min_num_inliers=30".to_string(),
         "structure_less_registration_fallback=1".to_string(),
+        "structure_less_min_verified=10".to_string(),
     ];
     applied.extend(mapper_overrides.iter().cloned());
     for o in &applied {
@@ -654,6 +687,9 @@ pub(crate) fn verify_pair(
     if dm.len() < min_matches {
         return None;
     }
+    if camera.model.is_spherical() {
+        return verify_spherical_pair(camera, fi, fj, dm, min_matches);
+    }
     let corrs: Vec<TwoViewCorrespondence> = dm
         .iter()
         .map(|m| {
@@ -677,6 +713,45 @@ pub(crate) fn verify_pair(
     Some(
         report
             .inliers
+            .iter()
+            .map(|&i| (dm[i].query_index, dm[i].train_index))
+            .collect(),
+    )
+}
+
+/// [`verify_pair`] for a spherical (equirectangular) camera: the
+/// essential matrix on unit rays (`visloc_vision::two_view::spherical`),
+/// with the pinhole path's 4 px over the panorama's pixels per radian as
+/// its angle, and its inliers that triangulate in front of both rays. A
+/// spherical camera is calibrated by construction: no fundamental matrix,
+/// homography or planar/panoramic configurations.
+fn verify_spherical_pair(
+    camera: &Camera,
+    fi: &FeatureSet,
+    fj: &FeatureSet,
+    dm: &[DescriptorMatch],
+    min_matches: usize,
+) -> Option<Vec<(usize, usize)>> {
+    use visloc_vision::two_view::spherical::{
+        estimate_spherical_relative_pose, SphericalRansacConfig,
+    };
+    let rays = |f: &FeatureSet, k: usize| camera.unit_ray_from_pixel(&f.keypoints[k]);
+    let (rays1, rays2): (Vec<_>, Vec<_>) = dm
+        .iter()
+        .map(|m| Some((rays(fi, m.query_index)?, rays(fj, m.train_index)?)))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .unzip();
+    let config = SphericalRansacConfig {
+        max_angle: 4.0 / camera.pixels_per_radian()?,
+        ..SphericalRansacConfig::default()
+    };
+    let pose = estimate_spherical_relative_pose(&rays1, &rays2, &config)?;
+    if pose.inliers.len() < min_matches {
+        return None;
+    }
+    Some(
+        pose.inliers
             .iter()
             .map(|&i| (dm[i].query_index, dm[i].train_index))
             .collect(),
@@ -1070,6 +1145,7 @@ pub fn build_euroc_dataset(
             height,
             &features,
             &pairwise,
+            None,
             &cfg.mapper_overrides,
             log,
         )?;

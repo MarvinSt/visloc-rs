@@ -78,7 +78,7 @@ impl PoseEstimator for P3PGrunert {
                     valid = false;
                     break;
                 };
-                error += (projected - c.point2d).norm_squared();
+                error += camera.pixel_residual(&projected, &c.point2d).norm_squared();
             }
             if valid && error < best_error {
                 best_error = error;
@@ -93,8 +93,12 @@ impl PoseEstimator for P3PGrunert {
     }
 }
 
-/// Unit bearing vector (camera frame) for a correspondence's image point.
+/// Unit bearing vector (camera frame) for a correspondence's image point;
+/// a spherical camera's may point behind it.
 fn bearing(camera: &Camera, c: &Correspondence2D3D) -> Option<Vector3<f64>> {
+    if camera.model.is_spherical() {
+        return camera.unit_ray_from_pixel(&c.point2d);
+    }
     let n = camera.normalize_pixel(&c.point2d)?;
     let v = Vector3::new(n.x, n.y, 1.0);
     let norm = v.norm();

@@ -327,6 +327,13 @@ before/after on training sequences.
    others; a prior on the VIO's rotation changes nothing. The wide band with
    the far offsets stays ([Matches far apart are
    wrong](lamaria_batch_ba.md#matches-far-apart-are-wrong)).
+   What the far matches had held was the warm-up: the gyro bias moves in
+   the first minutes of a recording. A random walk ten times looser at the
+   start, decaying over 300 s (`--gyro-rw-warmup`), mends sequence_2_12's
+   start (online 37.75 → 56.00) and, by day with the pass, the chain
+   averages **63.03** (2026-10-20; Medium 66.60, Long 67.66), above
+   GroundedSLAM's 62.3; low light keeps the online result without it
+   ([The first minutes, online](lamaria_batch_ba.md#the-first-minutes-online)).
 
 ## 5. Test-set operational pipeline
 

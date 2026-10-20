@@ -21,7 +21,11 @@ whole recording, it reaches 59.70 (see [Online, then one batch
 pass](#online-then-one-batch-pass)). From Basalt's default VIO, causal and
 within 4 cores, with a wider epipolar band for the matching, it averages
 60.54, and 61.19 with the batch pass after the recording (see [Matching
-guided by a drifting VIO](#matching-guided-by-a-drifting-vio)).
+guided by a drifting VIO](#matching-guided-by-a-drifting-vio)). With the gyro
+bias random walk loosened in the first minutes of a recording (day tracks),
+it averages 61.40 online and **63.03** with the pass, above GroundedSLAM's
+62.3 on the leaderboard (see [The first minutes,
+online](#the-first-minutes-online)).
 
 ## Method
 
@@ -1481,6 +1485,56 @@ tightly.
 | sequence_1_20 | 85.71 | 78.98 | 73.71 | **85.83** | 84.63 |
 | sequence_3_17 | 76.62 | | | 77.16 | **80.10** |
 
+### The first minutes, online
+
+The gyroscope disagrees with the solved rotations in the first minutes of
+every recording while the device warms up ([The first minutes of a
+recording](#the-first-minutes-of-a-recording)), and the windows' random walk
+(1e-7) keeps their bias constant there. Online, sequence_2_12 starts 3.33°
+off the pseudo-GT's heading and comes to +0.89° after 22 minutes. Ten times
+looser everywhere, its first two minutes are −1.27° off, but the heading
+wanders later in low light (sequence_4_10: 3.6° of spread per 120 s window
+against 2.9°). `--gyro-rw-warmup 10 --gyro-rw-warmup-s 300` loosens it at
+the start only: by 1 + 9 e^(−t / 300 s) at t seconds into the recording
+(10 at the start, 4.3 after five minutes, 2.2 after ten). sequence_2_12's
+heading then spans −1.33° … +0.56° online (−3.33° … +0.89° without) and
+−1.73° … +1.23° after the pass (−3.45° … +1.91°). The wide-band chain,
+online and with the batch pass after the recording, both solves of the pass
+with the same warm-up:
+
+| Sequence | Online | Random walk ×10 | Warm-up | Online + pass | Warm-up, + pass |
+|---|---:|---:|---:|---:|---:|
+| sequence_1_19 | 76.75 | **78.16** | 77.52 | **79.62** | 79.48 |
+| sequence_1_20 | 81.53 | 81.01 | **81.79** | 81.71 | 81.71 |
+| sequence_2_11 | **79.97** | 76.57 | 78.39 | 89.84 | **90.13** |
+| sequence_2_12 | 37.75 | 51.51 | **56.00** | 27.15 | **43.07** |
+| sequence_3_17 | **74.95** | 70.91 | 72.63 | 74.04 | **76.37** |
+| sequence_3_18 | **54.40** | 53.11 | 53.93 | **59.16** | 58.94 |
+| sequence_4_10 | **64.18** | 52.68 | 61.09 | | |
+| sequence_4_11 | 71.07 | **71.43** | 68.47 | | |
+| sequence_5_11 | **57.56** | 56.80 | 56.98 | 57.53 | **58.02** |
+| sequence_5_12 | **7.24** | 7.12 | 7.15 | **7.57** | 7.32 |
+| **Mean** | 60.54 | 59.93 | **61.40** | 61.19¹ | **63.03**² |
+
+¹ Low light: the online result. ² Low light: the online result without the
+warm-up, which costs both low-light sequences (−3.1 and −2.6; with it the
+mean is 62.46). In low light the matches pin a moving bias less well, as
+with the looser random walk throughout.
+
+By track, with the leaderboard's GroundedSLAM (test set, 2026-10-17):
+
+| Track | Online + pass | Warm-up, + pass | GroundedSLAM |
+|---|---:|---:|---:|
+| Short | **80.67** | 80.60 | 80.2 |
+| Medium | 58.50 | **66.60** | 61.6 |
+| Long | 66.60 | **67.66** | 59.9 |
+| Low light (online, no warm-up) | 67.63 | 67.63 | **67.7** |
+| Moving platform | 32.55 | 32.67 | **41.9** |
+| **Mean** | 61.19 | **63.03** | 62.3 |
+
+The pass still costs sequence_2_12 13 points (56.00 online): its solves keep
+one bias for the whole 28 minutes after the warm-up.
+
 ## Usage
 
 ```bash
@@ -1540,7 +1594,9 @@ python scripts/lamaria_batch_ba.py solve --work work/$S --vio out/$S.lc.tum --ca
   recording (see [Online, then one batch pass](#online-then-one-batch-pass)).
   From Basalt's default VIO (`euroc_config`, the real-time chain), match
   with `--tau-slope 0.3 --tau-max 20` (see [Matching guided by a drifting
-  VIO](#matching-guided-by-a-drifting-vio)).
+  VIO](#matching-guided-by-a-drifting-vio)); by day, `online` and both solves
+  of the pass with `--gyro-rw-warmup 10 --gyro-rw-warmup-s 300` (see [The
+  first minutes, online](#the-first-minutes-online)).
   `BASALT_EUROC_WAIT_S=120` lets the VIO demo wait for frames that a
   streaming reader has not written yet.
 - **Heading drift.** `--modes yaw` lets the solve correct a slow heading

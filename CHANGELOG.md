@@ -106,6 +106,30 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **COLMAP-port mapper: structure-less poses next to views panned from one
+  spot.** With `structure_less_min_verified` set (`gsplat_photos` and
+  `gsplat_euroc` write 10), a structure-less pose that fails the track
+  check gets a second try.
+  - **The second try.** GR6P's rotation and direction from the matched
+    cameras are kept. The distance comes from the continuing tracks,
+    then the pose is refined on the 2D–2D inliers' epipolar errors and
+    the distance is chosen again (`RESCUE path=SL` in the log).
+  - **Parallax.** Any structure-less pose now also needs half its
+    inliers to see their point at 1.5° or more.
+  - **ETH3D electro (visloc-rs's L4 matches):** DSC_9289, DSC_9290 and
+    DSC_9298 see ground that only three registered views taken 5 cm apart
+    also see. GR6P put them 9 to 36 cm off, and the check refused them.
+    Mapper replays now register 44 of 45 images instead of 41 (seeds 0
+    to 4, largest centre error 1.7 to 2.3 cm).
+  - **DSC_9291, 8 cm from a registered view,** stays out. Its matches to
+    that view hold wherever it is, and its wrong ones put it 6.6 m off.
+    8 to 13% of its inliers have parallax.
+  - **Other scenes:** meadow's seed 1 keeps DSC_6553 like seeds 0 and 2.
+    The other scenes do not change.
+  - **What the images are worth (r51):** with the ground-truth poses
+    electro scores 89.4% F1 at 2 cm with all 45 images and 80.6% without
+    the four.
+
 - **Mesh: empty for cameras close together looking out.** The TSDF voxel
   (scale / 256) and depth cut-off (2 x scale) were sized by the rig scale,
   the median distance of the camera centres from their centroid. A 360

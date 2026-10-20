@@ -529,6 +529,35 @@ repeat r49's within 0.6 points, so the other GPU moves little. F1 at
   ground-truth poses' 83.7%. The other 11 scenes keep r49's orientation
   scores, as the new fit moves them by at most 1 mm.
 
+### electro: what the unregistered images cost (r51)
+
+electro trails its ground-truth-pose F1 by 11 points end to end (78.3%
+against 89.5% in r49), almost all of it completeness: 66.9% against
+83.9% at 2 cm. r51 (L4, commit `f10462d`) took the end-to-end images
+(resampled onto one camera) and r49a's SfM model (the same as r49's).
+It ran visloc-mvs on four sparse models, F1 at 2 cm:
+
+| Sparse model | Images | F1 (accuracy / completeness) |
+|---|---|---|
+| Ground-truth poses and ETH3D's points | 45 | 89.4% (95.9 / 83.8) |
+| The same | 41 | 80.6% (96.1 / 69.4) |
+| Ground-truth poses, the SfM's points | 41 | 80.8% (96.4 / 69.5) |
+| The SfM's poses, ETH3D's points | 41 | 78.2% (93.5 / 67.1) |
+
+- **The four images the SfM leaves out cost 8.8 points**, all in
+  completeness. They are 1.5% of ETH3D's sparse points, but the MVS
+  loses far more surface without them.
+- **The sparse points cost nothing.** Depth ranges and view selection
+  from the SfM's points do as well as from ETH3D's.
+- **The SfM's poses cost 2.4 points** (median centre error 0.15 cm,
+  largest 1.8 cm).
+- **One camera costs nothing:** 89.4% against r45's 89.5% on the
+  original images.
+
+Three of the four images now register
+([eth3d_auc_benchmark.md](eth3d_auc_benchmark.md#views-panned-from-one-spot)).
+Their end-to-end F1 is not measured yet.
+
 ### Against ACMMP on the same GPU
 
 ACMMP's released code (GhiXu/ACMMP, built for the L4) on the same

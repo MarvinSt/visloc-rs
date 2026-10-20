@@ -135,15 +135,27 @@ pub struct Options {
     /// almost as well supported. On an L4, ETH3D kicker's DSC_6487 came
     /// out 66° off that way, its 175 matches all but 17 to one image and 3
     /// continuing tracks.
+    ///
+    /// With the check on, a structure-less pose also needs
+    /// [`STRUCTURE_LESS_MIN_PARALLAX_RATIO`] of its inliers to see their
+    /// point with parallax, and a pose that fails the track check gets a
+    /// second try with its distance from the matched cameras taken from
+    /// the tracks (see `rescue_structure_less_pose`): views panned from one
+    /// spot fix the direction to a new image but hardly its distance.
     pub structure_less_min_verified: usize,
 }
 
 /// See [`Options::structure_less_min_verified`].
 pub const STRUCTURE_LESS_MIN_VERIFIED_RATIO: f64 = 0.7;
 
-/// The triangulation angle a rescued structure-less pose's inliers need to
-/// count as fixing its position (COLMAP's default `min_tri_angle`).
-const MIN_RESCUE_TRIANGULATION_ANGLE_DEG: f64 = 1.5;
+/// See [`Options::structure_less_min_verified`]: the share of a
+/// structure-less registration's inliers that must see their point at
+/// [`STRUCTURE_LESS_MIN_TRI_ANGLE_DEG`] or more.
+pub const STRUCTURE_LESS_MIN_PARALLAX_RATIO: f64 = 0.5;
+
+/// See [`STRUCTURE_LESS_MIN_PARALLAX_RATIO`] (COLMAP's default
+/// `min_tri_angle`).
+pub const STRUCTURE_LESS_MIN_TRI_ANGLE_DEG: f64 = 1.5;
 
 impl Default for Options {
     fn default() -> Self {
@@ -706,42 +718,67 @@ impl IncrementalMapper {
                 )
             })
             .collect();
-        if !passes(verified) {
-            let rescued = rescue_structure_less_pose(
-                &camera,
-                &cam_from_world,
+        // Matches to a view taken from the same spot hold wherever the camera
+        // is, so most inliers must also see their point with parallax.
+        let parallax = |pose: &SE3| {
+            epipolar_support(
+                pose,
                 &epipolar,
-                &tracks,
                 options.abs_pose_max_error,
                 pixels_per_radian,
-                min_num_inliers,
             )
-            .map(|pose| {
-                let count = count_reprojected(&camera, &pose, &tracks, options.abs_pose_max_error);
-                (pose, count)
-            })
-            .filter(|&(_, count)| passes(count));
-            let Some((pose, count)) = rescued else {
+            .1
+        };
+        let has_parallax = |count: usize| {
+            options.structure_less_min_verified == 0
+                || (count as f64) >= STRUCTURE_LESS_MIN_PARALLAX_RATIO * epipolar.len() as f64
+        };
+        let mut with_parallax = parallax(&cam_from_world);
+        if !passes(verified) || !has_parallax(with_parallax) {
+            let rescued = if passes(verified) {
+                None
+            } else {
+                rescue_structure_less_pose(
+                    &camera,
+                    &cam_from_world,
+                    &epipolar,
+                    &tracks,
+                    options.abs_pose_max_error,
+                    pixels_per_radian,
+                )
+                .map(|pose| {
+                    let count =
+                        count_reprojected(&camera, &pose, &tracks, options.abs_pose_max_error);
+                    let with_parallax = parallax(&pose);
+                    (pose, count, with_parallax)
+                })
+                .filter(|&(_, count, with_parallax)| passes(count) && has_parallax(with_parallax))
+            };
+            let Some((pose, count, rescued_parallax)) = rescued else {
                 self.log_event(format!(
-                    "REJECT path=SL image={} inliers={} inliers_per_image={:?} verified={}/{}",
+                    "REJECT path=SL image={} inliers={} inliers_per_image={:?} verified={}/{} parallax={}",
                     image_id,
                     report.inliers.len(),
                     &per_world[..per_world.len().min(4)],
                     verified,
-                    tracks.len()
+                    tracks.len(),
+                    with_parallax
                 ));
                 return false;
             };
             self.log_event(format!(
-                "RESCUE path=SL image={} verified={}/{} -> {}/{}",
+                "RESCUE path=SL image={} verified={}/{} -> {}/{} parallax={} -> {}",
                 image_id,
                 verified,
                 tracks.len(),
                 count,
-                tracks.len()
+                tracks.len(),
+                with_parallax,
+                rescued_parallax
             ));
             cam_from_world = pose;
             verified = count;
+            with_parallax = rescued_parallax;
         }
         let camera_id = recon.image(image_id).camera_id;
         let rig = recon.rig(recon.frame(frame_id).rig_id()).clone();
@@ -751,7 +788,7 @@ impl IncrementalMapper {
         self.obs.register_frame(recon, graph, frame_id);
         self.register_frame_event(recon, frame_id);
         self.log_event(format!(
-            "REGISTER path=SL frame={} image={} inliers={} correspondences={} num_reg_frames={} num_points3d={} inliers_per_image={:?} continuing={} verified={}/{}",
+            "REGISTER path=SL frame={} image={} inliers={} correspondences={} num_reg_frames={} num_points3d={} inliers_per_image={:?} continuing={} verified={}/{} parallax={}",
             frame_id,
             image_id,
             report.inliers.len(),
@@ -761,7 +798,8 @@ impl IncrementalMapper {
             &per_world[..per_world.len().min(4)],
             continuing,
             verified,
-            tracks.len()
+            tracks.len(),
+            with_parallax
         ));
 
         // Inlier correspondences per 2D point, in COLMAP's order.
@@ -1683,7 +1721,7 @@ impl IncrementalMapper {
 /// Of the GR6P inliers `epipolar` (query ray, world centre, world ray):
 /// those within `max_error / 2` pixels of their epipolar planes under
 /// `cam_from_world`, and those of them whose two rays meet at
-/// [`MIN_RESCUE_TRIANGULATION_ANGLE_DEG`] or more.
+/// [`STRUCTURE_LESS_MIN_TRI_ANGLE_DEG`] or more.
 fn epipolar_support(
     cam_from_world: &SE3,
     epipolar: &[(Vector3<f64>, Vector3<f64>, Vector3<f64>)],
@@ -1692,7 +1730,7 @@ fn epipolar_support(
 ) -> (usize, usize) {
     let world_from_cam = cam_from_world.rotation.inverse();
     let centre = -(world_from_cam * cam_from_world.translation);
-    let min_cos = MIN_RESCUE_TRIANGULATION_ANGLE_DEG.to_radians().cos();
+    let min_cos = STRUCTURE_LESS_MIN_TRI_ANGLE_DEG.to_radians().cos();
     let (mut kept, mut parallax) = (0, 0);
     for (query, origin, world_ray) in epipolar {
         let normal = (centre - origin).cross(world_ray);
@@ -1745,15 +1783,10 @@ fn count_reprojected(
 ///   pixels (Levenberg-Marquardt, Huber at `max_error / 6`);
 /// - the distance chosen again along the refined direction.
 ///
-/// Returns `None` unless a track agrees, 90% of the inliers stay within
-/// `max_error / 2` of their epipolar planes, and `min_parallax_inliers` of
-/// those see their point at an angle of at least
-/// [`MIN_RESCUE_TRIANGULATION_ANGLE_DEG`] between the two rays. Matches to
-/// a view taken from the same spot satisfy the epipolar constraint
-/// wherever the camera is: electro's DSC_9291, 8 cm from the registered
-/// DSC_9292, had 159 such matches and 29 wrong ones that put it 6.6 m off.
-/// `epipolar` holds, per GR6P inlier, the query camera's ray and the world
-/// camera's centre and ray.
+/// Returns `None` unless a track agrees and 90% of the inliers stay within
+/// `max_error / 2` of their epipolar planes. `epipolar` holds, per GR6P
+/// inlier, the query camera's ray and the world camera's centre and ray.
+/// The caller checks the result as it checks GR6P's pose.
 fn rescue_structure_less_pose(
     camera: &visloc_core::types::Camera,
     pose: &SE3,
@@ -1761,7 +1794,6 @@ fn rescue_structure_less_pose(
     tracks: &[(Point2<f64>, Vector3<f64>)],
     max_error: f64,
     pixels_per_radian: f64,
-    min_parallax_inliers: usize,
 ) -> Option<SE3> {
     use nalgebra::{Matrix6, UnitQuaternion, Vector6};
     if epipolar.is_empty() || tracks.is_empty() {
@@ -1779,7 +1811,7 @@ fn rescue_structure_less_pose(
     // point from one distance.
     let place = |rotation: UnitQuaternion<f64>, centre: Vector3<f64>| {
         let distance = (centre - cluster).norm();
-        if !(distance > 1e-12) {
+        if distance.is_nan() || distance <= 1e-12 {
             return None;
         }
         let direction = (centre - cluster) / distance;
@@ -1909,9 +1941,8 @@ fn rescue_structure_less_pose(
     let (rotation, centre) = unpack(&p);
     let (count, centre) = place(rotation, centre)?;
     let rescued = at(rotation, centre);
-    let (kept, parallax) = epipolar_support(&rescued, epipolar, max_error, pixels_per_radian);
-    if count == 0 || (kept as f64) < 0.9 * epipolar.len() as f64 || parallax < min_parallax_inliers
-    {
+    let (kept, _) = epipolar_support(&rescued, epipolar, max_error, pixels_per_radian);
+    if count == 0 || (kept as f64) < 0.9 * epipolar.len() as f64 {
         return None;
     }
     Some(rescued)
@@ -2019,11 +2050,15 @@ mod tests {
 
     /// A camera whose 2D-2D matches all go to three views 2 cm apart, 1 m
     /// away: started 30% short of that distance and 0.6° off, the rescue
-    /// puts it back from 15 tracks; at 1 cm from them (no parallax) it
-    /// gives up.
+    /// puts it back from 15 tracks, with parallax on most inliers. At 1 cm
+    /// from them, whatever it returns lacks that parallax, and the caller
+    /// refuses it.
     #[test]
     fn rescue_sets_the_distance_from_a_panned_cluster() {
-        use super::{count_reprojected, rescue_structure_less_pose};
+        use super::{
+            count_reprojected, epipolar_support, rescue_structure_less_pose,
+            STRUCTURE_LESS_MIN_PARALLAX_RATIO,
+        };
         use nalgebra::{Point2, UnitQuaternion, Vector3};
         use visloc_core::geometry::SE3;
         use visloc_core::types::Camera;
@@ -2080,9 +2115,8 @@ mod tests {
         let short = mean + 0.7 * (centre - mean);
         let start = SE3::new(tilt * rotation, -((tilt * rotation) * short));
         assert_eq!(count_reprojected(&camera, &start, &tracks, 12.0), 0);
-        let rescued =
-            rescue_structure_less_pose(&camera, &start, &epipolar, &tracks, 12.0, 1000.0, 60)
-                .expect("rescued pose");
+        let rescued = rescue_structure_less_pose(&camera, &start, &epipolar, &tracks, 12.0, 1000.0)
+            .expect("rescued pose");
         let rescued_centre = -(rescued.rotation.inverse() * rescued.translation);
         assert!(
             (rescued_centre - centre).norm() < 1e-3,
@@ -2093,15 +2127,20 @@ mod tests {
             count_reprojected(&camera, &rescued, &tracks, 12.0),
             tracks.len()
         );
+        let share = |pose: &SE3, epipolar: &[(Vector3<f64>, Vector3<f64>, Vector3<f64>)]| {
+            epipolar_support(pose, epipolar, 12.0, 1000.0).1 as f64 / epipolar.len() as f64
+        };
+        assert!(share(&rescued, &epipolar) >= STRUCTURE_LESS_MIN_PARALLAX_RATIO);
 
         let centre = mean + Vector3::new(0.01, 0.0, 0.0);
         let (_, epipolar, tracks) = scene(centre, rotation);
         let far = mean + Vector3::new(1.0, 0.0, 0.0);
         let start = SE3::new(rotation, -(rotation * far));
-        assert!(
-            rescue_structure_less_pose(&camera, &start, &epipolar, &tracks, 12.0, 1000.0, 60)
-                .is_none()
-        );
+        if let Some(pose) =
+            rescue_structure_less_pose(&camera, &start, &epipolar, &tracks, 12.0, 1000.0)
+        {
+            assert!(share(&pose, &epipolar) < STRUCTURE_LESS_MIN_PARALLAX_RATIO);
+        }
     }
 
     #[test]

@@ -508,8 +508,26 @@ as r49's), with the ground-truth cameras and the scan:
     digits, and the angles taken by arccos near the identity magnified
     that rounding to about 0.1°. The orientation check had dropped half
     the cameras of relief and delivery area for that noise.
-  - The F1 of the r49 table above was scored with the previous fit.
-    facade's F1 under this one is not measured yet.
+
+r50 (commit `3178986`) scored meadow and facade again under the new fit.
+No L4 was free on RunPod, so it took r49a's L4 SfM models (the same as
+r49's) and ran the MVS on an A40. The centre-aligned and ICP scores
+repeat r49's within 0.6 points, so the other GPU moves little. F1 at
+2 cm:
+
+| Scene | Ground-truth poses | Centres (r49 / r50) | r49's orientation fit | New fit (r50) | ICP (r49 / r50) |
+|---|---|---|---|---|---|
+| meadow | 75.2% | 25.5% / 25.5% | 63.1% | **64.9%** | 47.2% / 47.3% |
+| facade | 67.3% | 49.0% / 48.5% | 49.4% | **70.7%** | 64.2% / 64.2% |
+
+- **facade goes from 49.4% to 70.7%** (accuracy 77.0%, completeness
+  65.3%). That is above ICP's 64.2%. It is also above MVS from the
+  ground-truth poses (67.3%), whose far-end poses sit a few centimetres
+  off the scan.
+- **meadow gains 1.8 points.**
+- **Over the 13 scenes the mean is 81.0%**, 2.7 points under the
+  ground-truth poses' 83.7%. The other 11 scenes keep r49's orientation
+  scores, as the new fit moves them by at most 1 mm.
 
 ### Against ACMMP on the same GPU
 

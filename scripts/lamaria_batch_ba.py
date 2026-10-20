@@ -962,14 +962,16 @@ class Reprojection:
 
 
 def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_rw_scale=1.0, gyro_rw_scale=1.0,
-               prior_rot_sigma=1e-4, omega_coriolis=None, init=None):
+               prior_rot_sigma=1e-4, omega_coriolis=None, init=None, warmup=(1.0, 300.0, None)):
     """GTSAM values and factors for poses, velocities, biases, the IMU and the gauge priors.
 
     The first keyframe's position is pinned (1e-4 m); its rotation gets prior_rot_sigma (rad). Gravity
     makes roll and pitch observable, so a loose rotation prior lets the solve fix a tilt the VIO got
     wrong at its start instead of pinning it there. Velocities start from the trajectory's finite
     differences and biases from zero, or from init (kf_ns, vel, bias of an earlier solve) where it has the
-    keyframe; keyframes after its last one start from its last bias.
+    keyframe; keyframes after its last one start from its last bias. warmup (scale, seconds, start_ns) loosens the
+    gyro bias random walk at the start of the recording, by 1 + (scale - 1) exp(-t / seconds) at t seconds after
+    start_ns (default: the first keyframe), while the device warms up.
     """
     import gtsam
     from gtsam.symbol_shorthand import B, V, X
@@ -977,14 +979,26 @@ def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_r
     imu = np.loadtxt(imu_path, delimiter=",", comments="#")
     imu_ns = imu[:, 0].astype(np.int64)
 
-    params = gtsam.PreintegrationCombinedParams.MakeSharedU(9.81)
-    params.setAccelerometerCovariance(np.eye(3) * (noise_scale * noise["accel_noise_std"]) ** 2)
-    params.setGyroscopeCovariance(np.eye(3) * (noise_scale * noise["gyro_noise_std"]) ** 2)
-    params.setIntegrationCovariance(np.eye(3) * 1e-8)
-    params.setBiasAccCovariance(np.eye(3) * (accel_rw_scale * noise["accel_bias_std"]) ** 2)
-    params.setBiasOmegaCovariance(np.eye(3) * (gyro_rw_scale * noise["gyro_bias_std"]) ** 2)
-    if omega_coriolis is not None:  # Earth's rotation in the world frame, which the gyroscope also measures
-        params.setOmegaCoriolis(np.asarray(omega_coriolis, float))
+    def make_params(gyro_rw):
+        params = gtsam.PreintegrationCombinedParams.MakeSharedU(9.81)
+        params.setAccelerometerCovariance(np.eye(3) * (noise_scale * noise["accel_noise_std"]) ** 2)
+        params.setGyroscopeCovariance(np.eye(3) * (noise_scale * noise["gyro_noise_std"]) ** 2)
+        params.setIntegrationCovariance(np.eye(3) * 1e-8)
+        params.setBiasAccCovariance(np.eye(3) * (accel_rw_scale * noise["accel_bias_std"]) ** 2)
+        params.setBiasOmegaCovariance(np.eye(3) * (gyro_rw * noise["gyro_bias_std"]) ** 2)
+        if omega_coriolis is not None:  # Earth's rotation in the world frame, which the gyroscope also measures
+            params.setOmegaCoriolis(np.asarray(omega_coriolis, float))
+        return params
+
+    warm_scale, warm_s, warm_t0 = warmup
+    warm_t0 = kf_ns[0] if warm_t0 is None else warm_t0
+    by_scale = {1.0: make_params(gyro_rw_scale)}
+
+    def factor_params(t_ns):  # the gyro bias random walk of the warm-up at t_ns, rounded to share the params
+        f = max(round(1.0 + (warm_scale - 1.0) * np.exp(-(t_ns - warm_t0) * 1e-9 / warm_s), 2), 1.0)
+        if f not in by_scale:
+            by_scale[f] = make_params(f * gyro_rw_scale)
+        return by_scale[f]
     graph, values = gtsam.NonlinearFactorGraph(), gtsam.Values()
     imu_factors = []
     zero_bias = gtsam.imuBias.ConstantBias()
@@ -1010,7 +1024,7 @@ def _imu_graph(kf_ns, kf_p, kf_r, vio, imu_path, noise, noise_scale=1.0, accel_r
                 np.array([0.1, 0.1, 0.1, 1e-3, 1e-3, 1e-3]))))
     for k in range(n - 1):
         ta, tb = kf_ns[k], kf_ns[k + 1]
-        pim = gtsam.PreintegratedCombinedMeasurements(params, zero_bias)
+        pim = gtsam.PreintegratedCombinedMeasurements(factor_params(ta), zero_bias)
         s = max(np.searchsorted(imu_ns, ta, side="right") - 1, 0)
         e = np.searchsorted(imu_ns, tb, side="left")
         for i in range(s, min(e, len(imu_ns) - 1)):
@@ -1135,6 +1149,7 @@ def cmd_solve(a):
 
     t0 = time.time()
     kf_ns, offsets, xy, _ = load_features(a.work, desc=False)
+    kf_ns_all = kf_ns
     cams, noise = load_calib(a.calib)
     vio = load_tum(a.vio)
     kf_p, kf_r = keyframe_poses(kf_ns, a.vio)
@@ -1191,7 +1206,8 @@ def cmd_solve(a):
     omega = [float(v) for v in a.omega_coriolis.split(",")] if a.omega_coriolis else None
     graph, values, index, imu_factors = _imu_graph(kf_ns, kf_p, kf_r, vio, a.imu, noise, a.imu_noise_scale,
                                                    a.accel_rw_scale, a.gyro_rw_scale, a.prior_rot_sigma, omega,
-                                                   getattr(a, "init_states", None))
+                                                   getattr(a, "init_states", None),
+                                                   (a.gyro_rw_warmup, a.gyro_rw_warmup_s, kf_ns_all[0]))
     n = len(kf_ns)
     nb, ne, npar = n * DOF, rp.n_par * rp.n_ext, rp.n_par
     modes = expand_modes(a.modes)
@@ -1876,6 +1892,10 @@ def main():
                        help="multiplies the calibration's accelerometer and gyroscope noise densities")
         s.add_argument("--accel-rw-scale", type=float, default=1.0, help="multiplies the accel bias random walk")
         s.add_argument("--gyro-rw-scale", type=float, default=1.0, help="multiplies the gyro bias random walk")
+        s.add_argument("--gyro-rw-warmup", type=float, default=1.0,
+                       help="the gyro bias random walk is this many times looser at the recording's first keyframe, "
+                            "decaying to 1 over --gyro-rw-warmup-s (the device warming up)")
+        s.add_argument("--gyro-rw-warmup-s", type=float, default=300.0)
         s.add_argument("--loops", action="store_true", help="add the revisit matches of the loops stage")
         s.add_argument("--modes", default="", help="undamped deformation modes of the whole solution: yaw, scale "
                        "(comma-separated); they let LM move along slow drifts the damped steps cannot follow. "

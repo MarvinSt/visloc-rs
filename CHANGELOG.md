@@ -821,6 +821,10 @@ All notable changes to `visloc-rs` will be documented here.
     centre error from 1.7-2.3 to 1.3-1.8 cm. meadow's goes from 0.13 and
     0.15° to 0.10 and 0.11° on seeds 0 and 1 (seed 2 stays at 0.10°). The
     others change by under a millimetre, at a few seconds more.
+  - **End to end on electro (r53, L4):** F1 at 2 cm goes from 78.7%
+    (r52) to 84.5%, and from 86.4% to 92.5% at 5 cm, against 89.4% and
+    95.1% with the ground-truth poses. The 13-scene end-to-end mean
+    becomes 81.5%.
 
 - **`scripts/align_colmap_model.py` takes the rotation from the cameras'
   orientations by default.** The centres are still fitted first. The

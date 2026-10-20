@@ -588,7 +588,22 @@ SfM registered 44 of 45 images, as the replays had (largest centre error
   - The other scenes change by under a millimetre: delivery area's p90
     centre error goes from 0.39 to 0.45 cm, courtyard's and facade's
     largest errors come down 2 mm. The mapper takes a few seconds more.
-  - The end-to-end F1 with it is not measured yet.
+- **r53 (L4, commit `371c47e`) measured it end to end.** The SfM again
+  registered 44 of 45 images, now with the three at 0.02 to 0.04° and 0.3
+  to 1.0 cm (largest centre error 1.8 cm, DSC_9292). F1 aligned by the
+  orientations:
+
+  | Run | F1 at 2 cm (accuracy / completeness) | F1 at 5 cm |
+  |---|---|---|
+  | r52 | 78.7% (94.8 / 67.3) | 86.4% |
+  | r53 | **84.5%** (94.3 / 76.5) | **92.5%** |
+  | Ground-truth poses (r51) | 89.4% (95.9 / 83.8) | 95.1% |
+
+  electro now trails its ground-truth poses by 5.0 points, against 11.1
+  in r49. With r53's electro, the 13-scene mean is 81.5% (81.0% before).
+  The other scenes keep their r49 and r50 runs: replays put them within a
+  millimetre, except meadow, whose rotations improve, but which is not
+  re-measured.
 
 ### Against ACMMP on the same GPU
 

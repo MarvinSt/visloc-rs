@@ -330,8 +330,9 @@ before/after on training sequences.
    What the far matches had held was the warm-up: the gyro bias moves in
    the first minutes of a recording. A random walk ten times looser at the
    start, decaying over 300 s (`--gyro-rw-warmup`), mends sequence_2_12's
-   start (online 37.75 → 56.00) and, by day with the pass, the chain
-   averages **63.03** (2026-10-20; Medium 66.60, Long 67.66), above
+   start (online 37.75 → 56.00) and, by day with the pass (whose random
+   walk is ten times looser throughout), the chain averages **64.35**
+   (2026-10-20; Short 83.78, Medium 69.81, Long 67.40), above
    GroundedSLAM's 62.3; low light keeps the online result without it
    ([The first minutes, online](lamaria_batch_ba.md#the-first-minutes-online)).
 

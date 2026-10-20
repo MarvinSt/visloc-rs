@@ -34,7 +34,7 @@ results plug into existing tools.
 | **Photo SfM** (unordered images) | ETH3D Electro 1,200 images: **3.46× faster**, **25% lower** camera-centre error; 9,996 / 10,008 cameras registered across all ten ETH3D many-view scenes | COLMAP 3.9 CPU |
 | **GPU SfM** (video frames) | EuRoC: **faster on 8/8** sequences (1.4–7.5×), **more accurate on 4/8**, equal on 1; COLMAP breaks on MH_05 (194 cm vs 2.6 cm) | COLMAP 4.1 CUDA |
 | **Stereo-inertial VI-SLAM** (Basalt port + online mapper) | **Real time on 11/11** EuRoC sequences on the dev machine (1.06–1.68×, thin margin on the slowest); **beats ORB-SLAM3 on 9/11** | ORB-SLAM3, Basalt |
-| **Egocentric VI-SLAM** (Project Aria, both SLAM cameras + IMU) | LaMAria, all 5 tracks: mean Score **63.0**, on par with GroundedSLAM (62.3); ahead on Short, Medium and Long, level on Low light, behind on Moving; causal and real time on 4 CPU cores (training sequences; the leaderboard's are test) | GroundedSLAM, Aria's SLAM |
+| **Egocentric VI-SLAM** (Project Aria, both SLAM cameras + IMU) | LaMAria, all 5 tracks: mean Score **64.3**, above GroundedSLAM (62.3); ahead on Short, Medium and Long, level on Low light, behind on Moving; causal and real time on 4 CPU cores (training sequences; the leaderboard's are test) | GroundedSLAM, Aria's SLAM |
 | **Photos → 3D Gaussian Splatting + mesh** | **Faster than brush on 5/5** benchmark scenes, PSNR within 0.05 dB on 4 | brush 0.3 |
 | **Localization against a prebuilt map** | OpenLORIS robot rig: **98.96%** of 1,250 held-out frames localized, median 2.9 mm; simulated house: 38 ms / frame | — |
 | **Stereo / RGB-D VO** | KITTI 00 **1.23 m** and 09 **2.07 m** (ORB-SLAM2: 1.3 m / 3.2 m); TUM fr1_xyz 1.4 cm | ORB-SLAM2 |
@@ -390,14 +390,15 @@ and the last 240 s solved again every 30 s, with the gyro bias free to move
 in the first minutes while the device warms up (by day). Cameras and IMU
 only: no GPS, no magnetometer. The chain is causal and keeps up with the
 recording on 4 CPU cores (about 4 CPU seconds per second of recording); one
-batch pass after the recording adds the revisits over the whole sequence. Score per track
+batch pass after the recording, its gyro bias free to drift slowly, adds the
+revisits over the whole sequence. Score per track
 (official evaluator, higher is better):
 
 | Method | Sequences | Short | Medium | Long | Low light | Moving | Mean |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Aria's SLAM (closed source) | test | 90.7 | 78.5 | 70.9 | 84.2 | 55.0 | 75.9 |
 | GroundedSLAM | test | 80.2 | 61.6 | 59.9 | 67.7 | 41.9 | 62.3 |
-| **visloc-rs**, online + one pass after the recording¹ | training | 80.6 | 66.6 | 67.7 | 67.6 | 32.7 | 63.0 |
+| **visloc-rs**, online + one pass after the recording¹ | training | 83.8 | 69.8 | 67.4 | 67.6 | 33.1 | 64.3 |
 | **visloc-rs**, online (causal, real time) | training | 79.7 | 67.2 | 63.3 | 67.6 | 32.1 | 62.0 |
 | OpenVINS + Maplab | test | 27.7 | 23.4 | 12.8 | 19.8 | 13.9 | 19.5 |
 
@@ -405,9 +406,9 @@ batch pass after the recording adds the revisits over the whole sequence. Score 
 are the ten training sequences, two per track, scored locally with the
 official evaluator: not a submission, so the comparison is indicative.
 ¹ Low light keeps the online result, and runs without the warm-up, which
-lowers it there. On par with GroundedSLAM: ahead on Short, Medium and Long,
-level on Low light, behind on Moving (sequence_5_12's tram ride, which the
-solve halves: 7.3). Per sequence:
+lowers it there. Above GroundedSLAM on the mean: ahead on Short, Medium and
+Long, level on Low light, behind on Moving (sequence_5_12's tram ride, which
+the solve halves: 7.4). Per sequence:
 [the real-time chain](docs/lamaria_batch_ba.md#the-first-minutes-online);
 the leaderboard and the steps that led here: [LaMAria plan](docs/lamaria_plan.md).</sub>
 

@@ -556,7 +556,22 @@ It ran visloc-mvs on four sparse models, F1 at 2 cm:
 
 Three of the four images now register
 ([eth3d_auc_benchmark.md](eth3d_auc_benchmark.md#views-panned-from-one-spot)).
-Their end-to-end F1 is not measured yet.
+r52 (L4, commit `87f25fe`) ran electro end to end with that mapper. The
+SfM registered 44 of 45 images, as the replays had (largest centre error
+2.3 cm). F1 aligned by the orientations:
+
+| Run | Images | F1 at 2 cm (accuracy / completeness) | F1 at 5 cm (accuracy / completeness) |
+|---|---|---|---|
+| r49 | 41 | 78.3% (94.6 / 66.9) | 82.9% (97.5 / 72.1) |
+| r52 | 44 | 78.7% (94.8 / 67.3) | 86.4% (97.7 / 77.4) |
+| Ground-truth poses (r51) | 45 | 89.4% (95.9 / 83.8) | 95.1% (97.8 / 92.6) |
+
+- **At 5 cm the three images add 5.3 points of completeness.**
+- **At 2 cm they add 0.4.** Their poses are 0.6 to 1.5 cm and 0.17 to
+  0.27° off (DSC_9292, which sees the same ground, 2.3 cm and 0.32°). At a
+  few metres' depth that puts their surfaces 1 to 3 cm off, outside the
+  2 cm tolerance.
+- **DSC_9291 stays out.**
 
 ### Against ACMMP on the same GPU
 

@@ -129,6 +129,10 @@ All notable changes to `visloc-rs` will be documented here.
   - **What the images are worth (r51):** with the ground-truth poses
     electro scores 89.4% F1 at 2 cm with all 45 images and 80.6% without
     the four.
+  - **End to end (r52, L4):** the SfM registers 44 of 45 images. F1
+    rises from 82.9% to 86.4% at 5 cm, where completeness gains 5.3
+    points. At 2 cm it goes from 78.3% to 78.7%: the three images' poses
+    are 0.6 to 1.5 cm and up to 0.27° off.
 
 - **Mesh: empty for cameras close together looking out.** The TSDF voxel
   (scale / 256) and depth cut-off (2 x scale) were sized by the rig scale,

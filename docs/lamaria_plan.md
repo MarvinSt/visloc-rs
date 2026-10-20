@@ -316,7 +316,17 @@ before/after on training sequences.
    the recording (sequence_1_20 81.53, sequence_2_11 89.84, sequence_3_17
    74.95, sequence_4_11 71.07); sequence_2_12, whose VIO heading was good,
    falls to 37.75 ([Matching guided by a drifting
-   VIO](lamaria_batch_ba.md#matching-guided-by-a-drifting-vio)).
+   VIO](lamaria_batch_ba.md#matching-guided-by-a-drifting-vio)). What the
+   band changed were the matches 96–256 keyframes apart, and nearly all of
+   them are wrong (2026-10-20: no peak at the pseudo-GT's epipolar lines on
+   six sequences): matching only up to 64 keyframes, sequence_3_17 scores
+   76.8 with either band and the windows hold the heading within ±0.55° on
+   the five day sequences whose VIO drifts, but the wrong matches had held
+   the starts of sequence_2_12 and 4_11, and the mean falls to 55.20 /
+   56.76. A looser gyro bias random walk mends those starts and costs the
+   others; a prior on the VIO's rotation changes nothing. The wide band with
+   the far offsets stays ([Matches far apart are
+   wrong](lamaria_batch_ba.md#matches-far-apart-are-wrong)).
 
 ## 5. Test-set operational pipeline
 

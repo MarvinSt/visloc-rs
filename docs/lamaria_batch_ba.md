@@ -700,7 +700,9 @@ options of the table above:
 sequence_4_11 starts from the VIO of the test-submission pipeline
 (`scripts/run_lamaria_test_submission.py --split training`), with denoised
 features. These are now the defaults (`match --offsets`, `match
---max-dist`, `solve --max-offset`).
+--max-dist`, `solve --max-offset`). Nearly all the matches beyond 64
+keyframes are wrong, though; what they change is how far the solve stays
+from its start (see [Matches far apart are wrong](#matches-far-apart-are-wrong)).
 
 ### Two sequences per track
 
@@ -1360,7 +1362,9 @@ barely move it. Both chains have as many matches per keyframe offset, but
 those only the default VIO's guidance finds lie further off the pseudo-GT's
 epipolar geometry (offsets 192–256: median 4.1 px against 3.2 px): the band
 (2 px + 0.1 px per keyframe offset, at most 6 px) lets a drifting guide pick
-the matches that agree with its drift. A wider band, `match --tau-slope 0.3
+the matches that agree with its drift (at those offsets nearly all of them
+are wrong: see [Matches far apart are
+wrong](#matches-far-apart-are-wrong)). A wider band, `match --tau-slope 0.3
 --tau-max 20`, on the online result of the chain:
 
 | Band | sequence_3_17 | sequence_2_12 | Mean of ten |
@@ -1404,6 +1408,77 @@ sequence_2_12 loses: there the default VIO's heading was already good, and
 the wide band's extra matches turn its first two minutes 3.3° off (1.3°
 with the default band). The matching takes about 0.27 cores instead of
 0.22.
+
+### Matches far apart are wrong
+
+The matches between keyframes 96 to 256 apart are nearly all wrong. Their
+signed distance from the pseudo-GT's epipolar lines (image b; 600 image
+pairs per range of offsets) has a sharp peak at zero up to 48 keyframes
+apart, a trace of one at 64 and 96, and none at 192–256, where the matches
+spread evenly over the band.
+Density in % per px on sequence_2_12, wide band:
+
+| Offset (keyframes) | −20 … −8 px | −2 … −1 | −1 … 0 | 0 … 1 | 1 … 2 | 8 … 20 px |
+|---|---:|---:|---:|---:|---:|---:|
+| 1–4 | 0.2 | 9.1 | 27.7 | 31.4 | 11.9 | 0.2–0.3 |
+| 24–48 | 1.0–1.2 | 7.6 | 13.9 | 17.3 | 9.8 | 0.9–1.3 |
+| 64 | 1.7–2.2 | 3.5 | 5.2 | 4.1 | 3.6 | 2.3–2.8 |
+| 96 | 2.0–2.5 | 3.1 | 3.8 | 4.0 | 2.7 | 2.4–2.6 |
+| 192–256 | 2.4–2.7 | 2.9 | 2.0 | 2.4 | 2.3 | 2.1–2.8 |
+
+With the default band they fill its ±6 px the same way, on the real-time
+chain's matches of sequence_2_12 and 3_17 and the big-window chain's of
+sequence_1_19, 2_11, 3_18 and 4_10 (a small peak at 96–128 on
+sequence_2_11 and 4_10 only). Their SIFT distances are those of the right
+ones (median 254 against 254 at 192–256 on sequence_2_12), so neither the
+descriptor nor the band tells them apart. Within a window they mostly merge
+tracks: the triangulation against the trajectory so far (4 px) decides
+which observations of a merged track stay, and `--band` drops those more
+than 64 keyframes after its first. What the band changed on sequence_3_17
+was these matches, not the ones nearer in time. The real-time chain matched
+only up to 64 keyframes apart (`--offsets 1,2,3,4,6,8,12,16,24,32,48,64`),
+online:
+
+| Sequence | Default band, to 256 | Wide band, to 256 | Default band, to 64 | Wide band, to 64 |
+|---|---:|---:|---:|---:|
+| sequence_1_19 | **78.20** | 76.75 | 76.07 | 73.28 |
+| sequence_1_20 | 56.92 | 81.53 | 61.58 | **85.71** |
+| sequence_2_11 | 72.48 | **79.97** | 76.99 | 79.85 |
+| sequence_2_12 | **56.41** | 37.75 | 23.18 | 10.58 |
+| sequence_3_17 | 37.58 | 74.95 | **76.82** | 76.62 |
+| sequence_3_18 | 43.61 | 54.40 | 61.32 | **64.70** |
+| sequence_4_10 | 63.58 | **64.18** | 62.20 | 54.63 |
+| sequence_4_11 | 53.58 | **71.07** | 50.97 | 55.45 |
+| sequence_5_11 | 52.68 | 57.56 | 54.45 | **58.73** |
+| sequence_5_12 | 6.89 | 7.24 | **8.43** | 8.07 |
+| **Mean** | 52.19 | **60.54** | 55.20 | 56.76 |
+
+Without the far matches the windows hold the heading on their own: per
+120 s window against the pseudo-GT, within ±0.55° on sequence_1_19, 1_20,
+2_11, 3_17 and 3_18 (wide band), where the VIO's error reaches 2.3°, 5.7°,
+5.2°, 8.8° and 13.0°. Where they lose is the start of sequence_2_12
+(−7.05° in the first two minutes, 9.4° of turn over the first 22 minutes)
+and of sequence_4_11 (−3.47°), and low light on sequence_4_10 (−1.2° …
++2.2°). There the far matches pull the solve back: on sequence_2_12 to the
+VIO's heading, which stays within ±1.1° for 20 minutes (the default band
+−1.32° … +0.84°, the wide band −3.33° … +0.89°); on sequence_4_11 the wide
+band starts at −0.67°, better than the VIO's −3.29°. On the mean the wide
+band with the far offsets stays ahead, and stays the chain's.
+
+Two ways to get the pull without the wrong matches do not. A looser gyro
+bias random walk online (wide band to 64) mends the starts (sequence_2_12
+−2.66° in the first two minutes, sequence_4_11 −0.58°) but turns the others
+off (sequence_3_18 +1.24° against +0.23°). A prior that keeps the rotation
+change over every 64 keyframes within 0.3° or 1° of the VIO's changes
+nothing: over 32 s the solve's own matches fix the rotation far more
+tightly.
+
+| Sequence | Wide band, to 64 | Gyro bias random walk ×10 | ×100 | VIO rotation prior 1° | 0.3° |
+|---|---:|---:|---:|---:|---:|
+| sequence_2_12 | 10.58 | 30.17 | 30.05 | 10.67 | 12.48 |
+| sequence_4_11 | 55.45 | 65.71 | **65.94** | 55.28 | 53.74 |
+| sequence_3_18 | **64.70** | 58.58 | 56.83 | 64.67 | 63.08 |
+| sequence_1_20 | 85.71 | 78.98 | 73.71 | **85.83** | 84.63 |
 
 ## Usage
 

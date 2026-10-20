@@ -464,7 +464,9 @@ F1 at 2 cm:
 - **The mapper's final converged BA** (`ba_global_final_converge_min_frames=0`)
   was replayed on r49's L4 matches (r49a, seeds 0 to 2). It lowers
   meadow's relative-rotation error from 0.13° to 0.10° and changes the
-  other scenes within noise, so the default stays.
+  other scenes within noise, so the default stayed. Once electro's
+  rescued images were in, `gsplat_photos` took it up
+  ([below](#electro-what-the-unregistered-images-cost-r51)).
 
 ### facade's far end
 
@@ -572,6 +574,21 @@ SfM registered 44 of 45 images, as the replays had (largest centre error
   few metres' depth that puts their surfaces 1 to 3 cm off, outside the
   2 cm tolerance.
 - **DSC_9291 stays out.**
+- **Those poses are not converged.** A BA run to convergence, started
+  from the mapper's model or from the ground-truth poses, lands on the
+  same poses: DSC_9289, DSC_9290 and DSC_9298 at 0.04, 0.02 and 0.03°
+  and 0.8, 1.0 and 0.3 cm. The incremental loop's global BAs stop after
+  a step or two, and the pipeline's converged final BA only runs from
+  1,000 frames. `gsplat_photos` now runs it on every model
+  (`ba_global_final_converge_min_frames=0`).
+  - Mapper replays (seeds 0 to 2): electro's relative-rotation error
+    goes from 0.040° to 0.031° and its largest centre error from 1.7-2.3
+    to 1.3-1.8 cm. meadow's goes from 0.13 and 0.15° to 0.10 and 0.11° on
+    seeds 0 and 1 (seed 2 stays at 0.10°).
+  - The other scenes change by under a millimetre: delivery area's p90
+    centre error goes from 0.39 to 0.45 cm, courtyard's and facade's
+    largest errors come down 2 mm. The mapper takes a few seconds more.
+  - The end-to-end F1 with it is not measured yet.
 
 ### Against ACMMP on the same GPU
 

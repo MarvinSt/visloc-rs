@@ -828,6 +828,7 @@ impl SiftGpu {
             Image {
                 pipe: usize,
                 slot: u64,
+                octave: usize,
                 src: (usize, usize),
                 dst: (usize, usize),
                 groups: (u32, u32, u32),
@@ -859,6 +860,7 @@ impl SiftGpu {
                     0
                 };
                 ops.push(Op::Image {
+                    octave: o,
                     pipe: upsample_pipe,
                     slot,
                     src: (0, 0),
@@ -867,6 +869,7 @@ impl SiftGpu {
                 });
                 let slot = params.push(&[wu, hu, lvl as u32, 0, r, wo, wu, hu]);
                 ops.push(Op::Image {
+                    octave: o,
                     pipe: 1,
                     slot,
                     src: (gid(0), 0),
@@ -875,6 +878,7 @@ impl SiftGpu {
                 });
                 let slot = params.push(&[wu, hu, 0, 0, r, wo, wu, hu]);
                 ops.push(Op::Image {
+                    octave: o,
                     pipe: 2,
                     slot,
                     src: (1, 0),
@@ -894,6 +898,7 @@ impl SiftGpu {
                     ph as u32,
                 ]);
                 ops.push(Op::Image {
+                    octave: o,
                     pipe: 3,
                     slot,
                     src: (gid(o - 1), 0),
@@ -904,6 +909,7 @@ impl SiftGpu {
             for (j, &(wo, r)) in kernels.iter().enumerate().skip(1) {
                 let slot = params.push(&[wu, hu, ((j - 1) * lvl) as u32, 0, r, wo, wu, hu]);
                 ops.push(Op::Image {
+                    octave: o,
                     pipe: 1,
                     slot,
                     src: (gid(o), 0),
@@ -923,6 +929,7 @@ impl SiftGpu {
                     ((j - 1) * lvl) as u32,
                 ]);
                 ops.push(Op::Image {
+                    octave: o,
                     pipe: 6,
                     slot,
                     src: (1, gid(o)),
@@ -1000,16 +1007,21 @@ impl SiftGpu {
         ];
 
         macro_rules! encode_ops {
-            ($pass:ident, $phase:expr) => {
+            ($pass:ident, $phase:expr, $min_octave:expr, $max_octave:expr) => {
+                #[allow(unused_comparisons)]
                 for op in &ops {
                     match *op {
                         Op::Image {
                             pipe,
                             slot,
+                            octave,
                             src,
                             dst,
                             groups,
-                        } if $phase == 0 || $phase == 3 => {
+                        } if ($phase == 0 || $phase == 3)
+                            && octave >= $min_octave
+                            && octave < $max_octave =>
+                        {
                             let pl = &image_pipes[pipe];
                             let mut entries = vec![
                                 wgpu::BindGroupEntry {
@@ -1056,9 +1068,11 @@ impl SiftGpu {
                             $pass.dispatch_workgroups(gx, gy, groups.2);
                         }
                         Op::Detect { pipe, slot, octave }
-                            if ($phase == 1 && pipe == 0)
+                            if (($phase == 1 && pipe == 0)
                                 || ($phase == 2 && pipe != 0)
-                                || $phase == 3 =>
+                                || $phase == 3)
+                                && octave >= $min_octave
+                                && octave < $max_octave =>
                         {
                             let pl = &detect_pipes[pipe];
                             let mut entries = vec![wgpu::BindGroupEntry {
@@ -1106,6 +1120,13 @@ impl SiftGpu {
             };
         }
 
+        let max = config.max_keypoints;
+        let early_break = !config.prefer_larger_scale && !config.full_pyramid;
+        // On the default capped path the CPU stops as soon as octave 0 alone
+        // fills the budget. Build later octaves only when octave 0 cannot.
+        let octave0_only = early_break && max != usize::MAX && n > 1;
+        let phase_a_end = if octave0_only { 1 } else { n };
+
         // Phase A: scale space + extrema. Orientation is submitted separately
         // so capped runs can preselect candidates first.
         let mut encoder = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1123,7 +1144,7 @@ impl SiftGpu {
                         }
                     }),
                 });
-                encode_ops!(pass, 0);
+                encode_ops!(pass, 0, 0, phase_a_end);
             }
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1136,15 +1157,15 @@ impl SiftGpu {
                         }
                     }),
                 });
-                encode_ops!(pass, 1);
+                encode_ops!(pass, 1, 0, phase_a_end);
             }
         } else {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("sift-detect-phase-a"),
                 timestamp_writes: None,
             });
-            encode_ops!(pass, 0);
-            encode_ops!(pass, 1);
+            encode_ops!(pass, 0, 0, phase_a_end);
+            encode_ops!(pass, 1, 0, phase_a_end);
         }
         {
             let counter_staging = self
@@ -1155,7 +1176,7 @@ impl SiftGpu {
         }
         queue.submit(Some(encoder.finish()));
 
-        let counts = self.map_counter_staging().await;
+        let mut counts = self.map_counter_staging().await;
         if std::env::var_os("SIFT_GPU_DEBUG_COUNTS").is_some() {
             eprintln!(
                 "sift counts candidates={:?} caps={:?}",
@@ -1163,16 +1184,15 @@ impl SiftGpu {
                 &caps[..n]
             );
         }
-        if (0..n).any(|o| counts[o] as usize > caps[o]) {
+        if (0..phase_a_end).any(|o| counts[o] as usize > caps[o]) {
             return Ok(None);
         }
 
-        let max = config.max_keypoints;
         if max == 0 {
             return Ok(Some(Vec::new()));
         }
-        let total_candidates: usize = counts[..n].iter().map(|&c| c as usize).sum();
-        if total_candidates == 0 {
+        let total_candidates: usize = counts[..phase_a_end].iter().map(|&c| c as usize).sum();
+        if total_candidates == 0 && !octave0_only {
             return Ok(Some(Vec::new()));
         }
 
@@ -1180,9 +1200,9 @@ impl SiftGpu {
         // alone fills the budget, so capping within octave 0 is sufficient.
         // Full-pyramid / larger-scale modes walk every octave and rank
         // globally instead.
-        let early_break = !config.prefer_larger_scale && !config.full_pyramid;
-        if max != usize::MAX && total_candidates > max {
-            let candidates = self.read_candidates(&cands, &counts, n).await;
+        if max != usize::MAX && (total_candidates > max || octave0_only) {
+            let pool_octaves = if octave0_only { 1 } else { n };
+            let candidates = self.read_candidates(&cands, &counts, pool_octaves).await;
             let pool = if early_break {
                 candidates
                     .into_iter()
@@ -1354,6 +1374,75 @@ impl SiftGpu {
             }
         }
 
+        if octave0_only {
+            // Octave 0 did not fill the budget. Build the remaining octaves
+            // only now; they are not needed on the common fast path.
+            let mut encoder = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sift-detect-phase-a-rest"),
+            });
+            if self.timestamps.is_some() {
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("sift-scale-space-rest"),
+                        timestamp_writes: self.timestamps.as_ref().map(|p| {
+                            wgpu::ComputePassTimestampWrites {
+                                query_set: &p.queries,
+                                beginning_of_pass_write_index: Some(0),
+                                end_of_pass_write_index: Some(1),
+                            }
+                        }),
+                    });
+                    encode_ops!(pass, 0, 1, n);
+                }
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("sift-extrema-rest"),
+                        timestamp_writes: self.timestamps.as_ref().map(|p| {
+                            wgpu::ComputePassTimestampWrites {
+                                query_set: &p.queries,
+                                beginning_of_pass_write_index: Some(2),
+                                end_of_pass_write_index: Some(3),
+                            }
+                        }),
+                    });
+                    encode_ops!(pass, 1, 1, n);
+                }
+            } else {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("sift-detect-phase-a-rest"),
+                    timestamp_writes: None,
+                });
+                encode_ops!(pass, 0, 1, n);
+                encode_ops!(pass, 1, 1, n);
+            }
+            {
+                let counter_staging = self
+                    .counter_staging
+                    .as_ref()
+                    .expect("counter staging allocated");
+                encoder.copy_buffer_to_buffer(
+                    &counters,
+                    0,
+                    counter_staging,
+                    0,
+                    counter_bytes as u64,
+                );
+            }
+            queue.submit(Some(encoder.finish()));
+
+            counts = self.map_counter_staging().await;
+            if std::env::var_os("SIFT_GPU_DEBUG_COUNTS").is_some() {
+                eprintln!(
+                    "sift counts after octave 0 fallback={:?} caps={:?}",
+                    &counts[..n],
+                    &caps[..n]
+                );
+            }
+            if (1..n).any(|o| counts[o] as usize > caps[o]) {
+                return Ok(None);
+            }
+        }
+
         // Fallback / uncapped path: orient every candidate in every octave.
         queue.write_buffer(&counters, (KP_COUNTER * 4) as u64, &[0u8; 4]);
         let mut orient = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1370,13 +1459,13 @@ impl SiftGpu {
                     }
                 }),
             });
-            encode_ops!(pass, 2);
+            encode_ops!(pass, 2, 0, n);
         } else {
             let mut pass = orient.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("sift-orientation"),
                 timestamp_writes: None,
             });
-            encode_ops!(pass, 2);
+            encode_ops!(pass, 2, 0, n);
         }
         {
             let counter_staging = self

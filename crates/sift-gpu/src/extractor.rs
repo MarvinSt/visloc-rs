@@ -1105,8 +1105,8 @@ impl SiftGpu {
                             match pipe {
                                 0 => {
                                     let (w, h) = dims[octave];
-                                    let g = groups(w, h, intervals);
-                                    $pass.dispatch_workgroups(g.0, g.1, g.2);
+                                    let g = groups(w, h, 1);
+                                    $pass.dispatch_workgroups(g.0, g.1, 1);
                                 }
                                 1 => $pass.dispatch_workgroups(1, 1, 1),
                                 _ => {

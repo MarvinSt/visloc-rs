@@ -65,15 +65,9 @@ fn dog_raw(level: u32, x: i32, y: i32) -> f32 {
     return dogs[level * p.w * p.h + u32(y) * p.w + u32(x)];
 }
 
-// One thread per interior pixel of DoG level `z + 1`.
-@compute @workgroup_size(16, 16)
-fn extrema(@builtin(global_invocation_id) g: vec3<u32>) {
-    let x = i32(g.x);
-    let y = i32(g.y);
-    if (x < 1 || y < 1 || x >= i32(p.w) - 1 || y >= i32(p.h) - 1) {
-        return;
-    }
-    let level = g.z + 1u;
+// Test one DoG level at an interior pixel. Returns after the first
+// non-extremum so the caller can continue with the next level.
+fn detect_level(level: u32, x: i32, y: i32) {
     let v = dog_raw(level, x, y);
     if (abs(v) < p.contrast) {
         return;
@@ -132,7 +126,7 @@ fn extrema(@builtin(global_invocation_id) g: vec3<u32>) {
     if (p.subpixel == 0u) {
         let slot = atomicAdd(&counters[p.octave], 1u);
         if (slot < p.cand_cap) {
-            cands[slot] = Candidate(g.x, g.y, level, v, 0.0, 0.0, 0.0);
+            cands[slot] = Candidate(u32(x), u32(y), level, v, 0.0, 0.0, 0.0);
         }
         return;
     }
@@ -217,6 +211,20 @@ fn extrema(@builtin(global_invocation_id) g: vec3<u32>) {
     let slot = atomicAdd(&counters[p.octave], 1u);
     if (slot < p.cand_cap) {
         cands[slot] = Candidate(u32(cx), u32(cy), clevel, refined, ox, oy, os);
+    }
+}
+
+// One thread per interior pixel; walk the overlapping DoG levels in z so
+// their neighborhoods can share cache lines.
+@compute @workgroup_size(16, 16)
+fn extrema(@builtin(global_invocation_id) g: vec3<u32>) {
+    let x = i32(g.x);
+    let y = i32(g.y);
+    if (x < 1 || y < 1 || x >= i32(p.w) - 1 || y >= i32(p.h) - 1) {
+        return;
+    }
+    for (var level = 1u; level < p.num_dog_levels - 1u; level = level + 1u) {
+        detect_level(level, x, y);
     }
 }
 

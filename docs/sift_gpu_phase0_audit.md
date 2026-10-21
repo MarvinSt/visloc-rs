@@ -377,9 +377,12 @@ The default five-frame set (`0,10,25,50,100`) matched byte-for-byte after both
 - `--max-orientations 2`
 - `--l1-root --magnification 3 --max-orientations 2`
 - `--prefer-larger-scale --subpixel`
-- `--keypoints 1000000` (uncapped/fallback)
+- `--full-pyramid` on the default five-frame set
+- `--full-pyramid --prefer-larger-scale --subpixel`
+- `--keypoints 1000000` (fallback path)
+- `--keypoints 18446744073709551615` on the low-texture image (unlimited)
 - a low-texture 512x512 fallback image
-- 4096x3072 frame 0 against the `2bdf090` binary
+- 4096x3072 frame 0 against the `2bdf090` binary, default and full pyramid
 
 The focused CPU differential tests for default, capped L1-root, unaligned
 193x129, full pyramid, larger-scale preference, sync/async parity, and
@@ -416,9 +419,11 @@ Timestamped 3K stage medians (32 images):
 
 The final 3K total is 24.8% below Phase 3 and 3.58x faster than the
 `2bdf090` audit baseline. The final 4K throughput is 45% above the Phase 3
-2.21 img/s sample. The 3K difference between the octave-0-only and final
-extrema runs is close to run-to-run noise; the 4K difference is larger and
-the stage medians consistently show the extrema gain.
+2.21 img/s sample. Across 128 images the 3K total fell from 26.537 s to
+25.297 s after the extrema changes; most of that is the axis-first neighbor
+order, while the incremental z-loop gain is small and within 3K run-to-run
+noise. At 4K the final run measured 12.5% lower total than the octave-0-only
+run, but these are separate runs and thermal variance is possible.
 
 ### Rejected experiments
 

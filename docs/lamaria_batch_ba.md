@@ -1159,6 +1159,39 @@ every solution (pipeline, online, ride doubled) the first one, across the
 ride, points 16–20° off, the next twelve 0.7–5.4° off, and the last three
 +21°, −68° and +23° off.
 
+### The rides, again
+
+With the chain of [The first minutes, online](#the-first-minutes-online)
+(pass with the looser random walk), sequence_5_11 scores 58.88 and
+sequence_5_12 7.41. On sequence_5_11 every CP after the funicular is within
+1.6 m and only the one before it misses (32.8 m); lengthening the ride by
+1.19 or 1.25 (diagnosis, displacements rescaled) gives 61.17 and 63.62.
+
+On sequence_5_12 the ride is not halved any more but folded. The solve
+runs forward about 220 m at 3–6 m/s from 80 s to 130 s, stops at 132 s and
+goes back 65 m by 186 s, so the first two CPs (19 s and 208 s) come out 151 m
+apart against 257 m. The tram does not stop there: in consecutive frames
+1 s apart at 146 s and 152 s the street outside shifts as much as at 95 s,
+and the outer camera's parallax after removing the rotation stays at 4–8°
+as on the ride (the inner camera, which sees the cabin and an advert inside
+it, 1–2°). The solve does not take that turn from the cameras. Without any
+camera observation from 78 s to 188 s, with the accelerometer bias held at
+zero (prior 0.003 m/s², random walk ×0.01), or with the triangulation gate
+at 20 px (and a 0.3° minimum angle), its velocities over the ride stay within
+0.5 m/s of the pass and the score at 7.36–8.00. Over 110 s the IMU alone
+cannot hold a ride: a tilt 0.3° off (a gyro bias 0.05 mrad/s off) leaks
+0.05 m/s² of gravity into the direction of travel, a few m/s after a minute,
+and the rectified IMU dead-reckoned from 78 s ends 808 m away. The solve
+keeps the ride it starts from.
+
+The last four minutes are not a scale error. Counted on the accelerometer
+(peaks of the 1–3.5 Hz band at least 3 m/s² prominent, windows of 30 s at
+1.5–2.2 steps/s), the pseudo-GT's stride varies by 4.7–11 % over the
+steady-walking windows of six day sequences, and the solve's stride on
+sequence_5_12 stays at 0.81 m (4.1 %) to the end; the CP chords there are
+off by the turns (+21°, −68°, +23°). Rescaling the end by 0.8 (diagnosis)
+gives 14.18: the walk after the ride still drifts from 2 m to 15 m.
+
 ### Low light: matching guided by the solve
 
 Matching the low-light sequences again, guided by the pipeline's final

@@ -80,24 +80,39 @@ fn extrema(@builtin(global_invocation_id) g: vec3<u32>) {
     }
     var is_min = true;
     var is_max = true;
-    for (var dz = 0u; dz < 3u; dz = dz + 1u) {
-        for (var dy = -1; dy <= 1; dy = dy + 1) {
-            for (var dx = -1; dx <= 1; dx = dx + 1) {
-                if (dz == 1u && dx == 0 && dy == 0) {
-                    continue;
-                }
-                let n = dog_raw(level + dz - 1u, x + dx, y + dy);
-                if (n >= v) {
-                    is_max = false;
-                }
-                if (n <= v) {
-                    is_min = false;
-                }
-                // A candidate with both a larger and a smaller neighbor can
-                // no longer be an extremum; skip the rest of its neighborhood.
-                if (!is_min && !is_max) {
-                    return;
-                }
+    // Check the same-level axis neighbors first, then the vertical neighbor,
+    // then diagonals. Visiting the center DoG level first makes the common
+    // reject case exit sooner than the original z-major nested loops.
+    let offsets = array<vec2<i32>, 9>(
+        vec2<i32>(1, 0),
+        vec2<i32>(-1, 0),
+        vec2<i32>(0, 1),
+        vec2<i32>(0, -1),
+        vec2<i32>(0, 0),
+        vec2<i32>(1, 1),
+        vec2<i32>(1, -1),
+        vec2<i32>(-1, 1),
+        vec2<i32>(-1, -1),
+    );
+    for (var dzi = 0u; dzi < 3u; dzi = dzi + 1u) {
+        let dz = (dzi + 1u) % 3u;
+        for (var i = 0u; i < 9u; i = i + 1u) {
+            let dx = offsets[i].x;
+            let dy = offsets[i].y;
+            if (dz == 1u && dx == 0 && dy == 0) {
+                continue;
+            }
+            let n = dog_raw(level + dz - 1u, x + dx, y + dy);
+            if (n >= v) {
+                is_max = false;
+            }
+            if (n <= v) {
+                is_min = false;
+            }
+            // A candidate with both a larger and a smaller neighbor can
+            // no longer be an extremum; skip the rest of its neighborhood.
+            if (!is_min && !is_max) {
+                return;
             }
         }
     }

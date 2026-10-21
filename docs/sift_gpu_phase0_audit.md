@@ -316,3 +316,129 @@ only the host-side candidate pre-cap remains. The next plausible gains are
 GPU-side preselection/compaction to remove the candidate readback and a
 single-sync selection path, but those need dedicated tie-preserving and
 full-feature differential tests before implementation.
+
+## Phase 4: deferred later octaves and extrema scheduling
+
+Date: 2026-10-21
+Toolchain: Rust 1.94.0 release; wgpu 30.0.1; Apple M1 / Metal
+Workload: South Building 3072x2304 (3K) and 4096x3072 upscaled (4K),
+8,192 returned features per image. Commits: `c00ca6a` (octave-0-only fast
+path), `aed6925` (axis-first extrema), `543a139` (z-loop extrema).
+
+### Retained change: build only octave 0 on the capped early-break path
+
+`c00ca6a` gates the octave-0-only path on all of the following:
+
+```text
+!prefer_larger_scale
+&& !full_pyramid
+&& max_keypoints != usize::MAX
+&& num_octaves > 1
+```
+
+Phase A then builds only octave 0. The host preselects up to
+`max_keypoints` octave-0 candidates plus any ties at the cutoff, orients that
+compact set, and returns immediately when the oriented count reaches the
+cap. Otherwise it builds octaves 1..n-1 and runs the existing full-orientation
+fallback. The default capped CPU selection already stops at octave 0 when
+that octave fills the budget, so later octaves cannot affect the returned
+prefix. Full-pyramid, larger-scale preference, and unlimited-cap runs keep
+the original full scale space and global orientation path.
+
+This removes roughly three quarters of scale-space and extrema pixel work on
+the common 3K/4K capped path. It does not add a global contrast pre-cap and
+does not change the CPU-side f64 sigma mapping, canonical ordering, tie
+handling, or final truncation.
+
+### Retained change: extrema neighbor order and z-loop
+
+`aed6925` visits the center DoG level first and checks same-level axis
+neighbors before the vertical neighbor and diagonals. The original
+z-major/dy-major nested loops spent longer finding witnesses for both the
+min and max rejection conditions. `543a139` then assigns one thread per
+interior pixel and walks the overlapping DoG levels in z, reusing the cache
+footprint of adjacent planes. Early exits remain per level and the candidate
+set is unchanged.
+
+An early axis-first draft omitted the two vertical `(0,0)` neighbors on the
+adjacent DoG levels; octave-0 candidates on frame 0 inflated from 135,452 to
+173,125. Adding the full 3x3x3 neighborhood back (skipping only the true
+center) restored the count before any benchmark or validation result was
+accepted.
+
+### Byte-identical validation
+
+All comparisons use `sift_dump_features` and retained `2bdf090` output.
+The default five-frame set (`0,10,25,50,100`) matched byte-for-byte after both
+`c00ca6a` and the final extrema changes. Frame 0 also matched under:
+
+- `--aligned-octave0`
+- `--subpixel`
+- `--max-orientations 2`
+- `--l1-root --magnification 3 --max-orientations 2`
+- `--prefer-larger-scale --subpixel`
+- `--keypoints 1000000` (uncapped/fallback)
+- a low-texture 512x512 fallback image
+- 4096x3072 frame 0 against the `2bdf090` binary
+
+The focused CPU differential tests for default, capped L1-root, unaligned
+193x129, full pyramid, larger-scale preference, sync/async parity, and
+alternating-size pooling pass. In the final validation runs the full
+`visloc-sift-gpu` suite passed 15/15; the three matcher failures recorded in
+Phase 0 did not reproduce.
+
+### Final measurements
+
+GPU-only sustained runs, single worker, no CPU comparison, 3K:
+
+| Configuration | Images | Total | Mean | Median | p95 | Throughput |
+|---|---:|---:|---:|---:|---:|---:|
+| Phase 3 (pre-cap) | 128 | 33.640 s | 0.263 s | 0.263 s | 0.279 s | 3.80 img/s |
+| Octave-0-only fast path | 128 | 26.537 s | 0.207 s | 0.206 s | 0.220 s | 4.82 img/s |
+| Final extrema changes | 128 | 25.297 s | 0.198 s | 0.196 s | 0.217 s | 5.06 img/s |
+
+4K upscaled, 32 images:
+
+| Configuration | Total | Median | p95 | Throughput |
+|---|---:|---:|---:|---:|
+| Phase 3 | - | - | - | 2.21 img/s |
+| Octave-0-only fast path | 11.432 s | 0.358 s | 0.378 s | 2.80 img/s |
+| Final extrema changes | 10.000 s | 0.312 s | 0.335 s | 3.20 img/s |
+
+Timestamped 3K stage medians (32 images):
+
+| Stage | Phase 3 | Octave-0-only | Final |
+|---|---:|---:|---:|
+| Scale space | 117.9 ms | 80.4 ms | 79.8 ms |
+| Extrema | 98.4 ms | 71.7 ms | **61.2 ms** |
+| Orientation | 1.49 ms | 1.49 ms | 1.48 ms |
+| Descriptor | 37.1 ms | 35.4 ms | 35.5 ms |
+
+The final 3K total is 24.8% below Phase 3 and 3.58x faster than the
+`2bdf090` audit baseline. The final 4K throughput is 45% above the Phase 3
+2.21 img/s sample. The 3K difference between the octave-0-only and final
+extrema runs is close to run-to-run noise; the 4K difference is larger and
+the stage medians consistently show the extrema gain.
+
+### Rejected experiments
+
+- **Descriptor level/spatial sorting.** Keypoints were sorted by sigma
+  bucket then spatial tile, with an index map restoring output order.
+  Output was byte-identical, but 3K descriptor time was 35.0 ms unsorted
+  versus 35.0-35.3 ms sorted (tiles 64/128/256), and 4K was 41.3 ms versus
+  41.4 ms. Spatial-first, sigma-only, and space-only keys were also no
+  faster. Reverted.
+- **Center-level-first with the original nested loops.** Extrema median was
+  72.2 ms versus 71.7 ms control. Reverted.
+- **32x8 extrema workgroups.** Extrema median rose to 75.6 ms. Reverted.
+- **Vertical neighbor first.** Extrema median was 67.9 ms versus 66.6 ms for
+  axis-first. Reverted.
+- **Axis-first without vertical neighbors.** Incorrect candidate set, as
+  noted above. Fixed, not retained as an optimization.
+
+The remaining measured cost is scale space (~80 ms), extrema (~61 ms), and
+descriptors (~35 ms). Further extrema work should target the remaining
+scale-space/DoG read traffic or a shared-memory design that beats the global
+read path; the previously tested shared-memory extrema tile regressed on
+this adapter. Descriptor changes need a new hypothesis beyond reordering
+keypoints, because locality sorting did not move the pass.

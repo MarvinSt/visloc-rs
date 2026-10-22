@@ -6,6 +6,17 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **`visloc-mvs`: two more parts of APD-MVS's pipeline for
+  `--deformable`** (CPU only, off by default).
+  `--deformable-local-refine` (`Deformable::local_refine`) moves each
+  pixel's depth after a deformable pass to the lowest cost within 5
+  disparity steps if that beats its own by 0.1.
+  `--deformable-strong-median` (`Deformable::strong_median`) makes a
+  deformable pass's median filter skip weak pixels and use only strong
+  neighbours. On office at 400 px (CPU), F1 at 2 cm: defaults 38.5%,
+  `--deformable` 36.3%, with the strong median 38.7%, with local
+  refinement 36.2%; details in `docs/mvs.md`.
+
 - **`gsplat_train` on an existing equirectangular COLMAP model** (#301).
   `load_colmap_dataset` (`visloc_gsplat_train::dataset`) now takes models
   whose camera is `EQUIRECTANGULAR` (model 17, parameters `width, height`),
@@ -136,6 +147,19 @@ All notable changes to `visloc-rs` will be documented here.
   and right edges are lens rims that do not meet.
 
 ### Fixed
+
+- **Rig observations in bundle adjustment use the sensor's lens model.**
+  `BaRigObservation` residuals and Jacobians projected every sensor as a
+  pinhole, while the rest of the BA (and `rig_sfm`'s inlier gate) used the
+  camera's own lens. They now go through the same projection as
+  monocular observations: radial, Brown-Conrady, rational, fisheye, FOV
+  and Double Sphere sensors are linearised as `Camera::project` measures
+  them. Distortion-free pinhole sensors keep the historical closed form
+  bit for bit. `rig_sfm` on distorted rigs (for example fisheye sensors)
+  changes; it has not been re-measured on OpenLORIS. The COLMAP-port rig
+  solver, which only solves distortion-free pinholes, now reports a
+  distorted sensor handed to it through a `BundleAdjustment` as
+  `UnsupportedCameraModel` instead of solving it as a pinhole.
 
 - **A `cameras.bin` with one `EQUIRECTANGULAR` camera did not parse.** The
   reader checked for room for three parameters per camera, the least any

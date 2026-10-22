@@ -94,11 +94,7 @@ jobs:
         run: cargo test --locked
 
   rust:
-    # Pinned like the toolchain (rust-toolchain.toml): golden outputs such as
-    # basalt's m8f_nfr_session snapshot hash were taken on Ubuntu 24.04, and
-    # ubuntu-latest's Ubuntu 26.04 glibc moves the last bit of some f32 math.
-    # Move to a newer image deliberately, re-pinning what changes.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7

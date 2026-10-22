@@ -604,6 +604,29 @@ SfM registered 44 of 45 images, as the replays had (largest centre error
   The other scenes keep their r49 and r50 runs: replays put them within a
   millimetre, except meadow, whose rotations improve, but which is not
   re-measured.
+- **What is left: DSC_9291 and DSC_9292** (local diagnosis on r49a's
+  L4 matches and the converged replays, seeds 0 to 2). The data do not
+  pin these two down, and no mapper setting seen so far would:
+  - **DSC_9291** has 3,698 keypoints, against 8,000 to 11,000 for its
+    neighbours. Its only reliable matches are 172 to DSC_9292, 8 cm away
+    (about 1° of parallax at that depth, below the structure-less
+    parallax rule), and about 11 to DSC_9293. The 101 matches to DSC_9289,
+    DSC_9290 and DSC_9298 are 82 to 98% wrong under the ground truth
+    (median Sampson error 14 to 23 px): repeated structure. Its
+    structure-less tries see 0 to 13 verified tracks and 17 to 159
+    inliers with parallax out of about 200, and are rejected.
+  - **DSC_9292** registers on 83 to 85 points at a median depth of 18.6 m,
+    seen in four views with a median triangulation angle of 3.5°. With the
+    points held fixed, 1 px of noise moves its centre by 0.17 cm, but it
+    sits 1.2 to 1.7 cm off. Its points reproject 0.9 px from the
+    estimated pose and 3.9 to 4.1 px from the ground-truth pose: the far
+    points carry the error, and the pose follows them. Its 172 good
+    matches go to DSC_9291, which is not registered, and would add no
+    parallax if it were.
+  - So the lever is in the matches, not the mapper: more features on
+    DSC_9291, or matches between these two and the registered views
+    that the current matching does not find (guided matching, for
+    example). Neither is tried yet.
 
 ### Against ACMMP on the same GPU
 
@@ -783,6 +806,32 @@ only the anchors' planes and a plane fitted to them. On an L4 at
   Matching it would mean porting that pipeline, not the patches alone.
 - **Time:** about 3.5 times the defaults on these scenes (12 and 14
   minutes with the debug statistics on).
+
+**Two more parts of APD's pipeline** (CPU only, on top of
+`--deformable`; [notes](apd_mvs_code_notes.md), §5.2 and §5.3):
+`--deformable-local-refine` moves each pixel's depth, after every
+deformable pass, to the lowest cost within 5 disparity steps along its
+ray if that beats its own by 0.1. `--deformable-strong-median` makes the
+median filter of a deformable pass leave weak pixels alone and take the
+median of a pixel and its strong neighbours (ACMM's 20-pixel pattern)
+instead of the 5×5 median of every depth. office pre-resized to 400 px,
+ground-truth poses, CPU (4 threads), F1 at 1, 2 and 5 cm:
+
+| Run | F1 | Accuracy / completeness at 2 cm | Time |
+|---|---|---|---|
+| Defaults | 23.9 / 38.5 / 58.2% | 80.2 / 25.3% | 585 s |
+| `--deformable` | 21.9 / 36.3 / 54.5% | 73.9 / 24.0% | 1033 s |
+| `--deformable`, local refinement | 21.8 / 36.2 / 54.6% | 74.8 / 23.9% | 1066 s |
+| `--deformable`, strong median | 24.0 / **38.7** / 58.3% | 77.6 / 25.8% | 1043 s |
+| `--deformable`, both | 23.6 / 38.3 / 58.3% | 77.7 / 25.4% | 1046 s |
+
+- **The strong median recovers what the deformable patches lose** (+2.4
+  points at 2 cm), most of it accuracy: the 5×5 median mixed the weak
+  pixels' depths into their strong neighbours'. It ends 0.2 point above
+  the defaults, within run-to-run noise, in 1.8 times the time.
+- **Local refinement does nothing here**, alone or with the median.
+- These are 400 px runs on one scene. Whether the strong median pays at
+  3200 px needs it on the GPU path, which it is not yet.
 
 ### Fusion settings
 

@@ -15,7 +15,7 @@ DPVO CUDA) stay as they are; nothing here depends on them.
 | --- | --- | --- |
 | 0.2.1 patch release (distortion fixes) | Done: version bumped, CHANGELOG cut | Tag `v0.2.1` after main CI is green |
 | crates.io readiness | Done: all 16 crates package and verify-build from their packaged sources; root package trimmed from ~83 MB to 0.87 MiB compressed with an `include` allowlist | `cargo publish --workspace` (needs a crates.io token) |
-| BA distortion models | Done: pose/structure BA linearises every lens model (OPENCV, FULL_OPENCV, the fisheye models, FOV, Double Sphere); opt-in p1/p2 self-calibration. Open: rig observations still project with a pinhole; matrix-free / GPU backends fall back for distorted cameras | Follow-up: lens model in rig BA |
+| BA distortion models | Done: pose/structure BA linearises every lens model (OPENCV, FULL_OPENCV, the fisheye models, FOV, Double Sphere); opt-in p1/p2 self-calibration; rig observations use the sensor's lens too (2026-10-22). Open: matrix-free / GPU backends fall back for distorted cameras | `rig_sfm` on a distorted rig re-measured (OpenLORIS) |
 
 ## Track 2: Sensor coverage (the empty cells in the README sensor table)
 

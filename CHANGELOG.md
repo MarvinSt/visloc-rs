@@ -106,6 +106,19 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Fixed
 
+- **Rig observations in bundle adjustment use the sensor's lens model.**
+  `BaRigObservation` residuals and Jacobians projected every sensor as a
+  pinhole, while the rest of the BA (and `rig_sfm`'s inlier gate) used the
+  camera's own lens. They now go through the same projection as
+  monocular observations: radial, Brown-Conrady, rational, fisheye, FOV
+  and Double Sphere sensors are linearised as `Camera::project` measures
+  them. Distortion-free pinhole sensors keep the historical closed form
+  bit for bit. `rig_sfm` on distorted rigs (for example fisheye sensors)
+  changes; it has not been re-measured on OpenLORIS. The COLMAP-port rig
+  solver, which only solves distortion-free pinholes, now reports a
+  distorted sensor handed to it through a `BundleAdjustment` as
+  `UnsupportedCameraModel` instead of solving it as a pinhole.
+
 - **COLMAP-port mapper: structure-less poses next to views panned from one
   spot.** With `structure_less_min_verified` set (`gsplat_photos` and
   `gsplat_euroc` write 10), a structure-less pose that fails the track

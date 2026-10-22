@@ -502,11 +502,37 @@ fn canonical_mapper_snapshot_hash(mapper: &NfrMapper) -> u64 {
         "result": mapper.result(),
     });
     let bytes = serde_json::to_vec(&snapshot).expect("canonical mapper snapshot");
+    // PROBE: hashes with floats rounded to n significant digits.
+    for digits in [15usize, 12, 10, 9, 8, 7, 6, 5, 4] {
+        let rounded = round_floats(&snapshot, digits);
+        let b = serde_json::to_vec(&rounded).unwrap();
+        let h = b.into_iter().fold(1469598103934665603_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(1099511628211_u64)
+        });
+        eprintln!("PROBE digits={digits} hash={h}");
+    }
     bytes
         .into_iter()
         .fold(1469598103934665603_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(1099511628211_u64)
         })
+}
+
+fn round_floats(value: &Value, digits: usize) -> Value {
+    match value {
+        Value::Number(n) if n.is_f64() => {
+            let f = n.as_f64().unwrap();
+            let r: f64 = format!("{:.*e}", digits - 1, f).parse().unwrap();
+            json!(if r == 0.0 { 0.0 } else { r })
+        }
+        Value::Array(items) => Value::Array(items.iter().map(|v| round_floats(v, digits)).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), round_floats(v, digits)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 #[test]

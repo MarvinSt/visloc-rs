@@ -91,6 +91,12 @@ low light), unless `--config` / `--low-light-config` say otherwise, and the
 BA gets the calibration with the factory camera rig, since it estimates the
 camera rotations itself. It needs numpy, scipy, opencv-python, gtsam and
 numba, and about 2 GB of disk per sequence on top of the images.
+
+`--stream` extracts the ASL zip over HTTP range requests instead of
+downloading it first (scripts/http_zip.py), so a sequence needs its images'
+size on disk, not twice that: what a GitHub runner can hold
+(.github/workflows/lamaria_submission.yml). `--log-dir` keeps the BA chain's
+step logs of each sequence before its work directory is deleted.
 """
 
 import argparse
@@ -107,6 +113,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aria_factory_imu_rectify import VRS_HEAD_BYTES, extract_record, rectify_csv  # noqa: E402
 from aria_device_refinement import lookup as device_refinement, rotate_rig  # noqa: E402
 from lamaria_ba_chain import run_chain  # noqa: E402
+import http_zip  # noqa: E402
 
 LOOP_MATCH_MAX_ROT_ERROR_DEG = 5
 TRACK_COUNTS = {1: 18, 2: 10, 3: 16, 4: 9, 5: 10}
@@ -235,6 +242,11 @@ def verify_and_extract(zip_path: Path, extract_dir: Path) -> Path:
         log(f"corrupt zip {zip_path}; deleting for a fresh retry")
         zip_path.unlink(missing_ok=True)
         raise
+    return sequence_dir(extract_dir)
+
+
+def sequence_dir(extract_dir: Path) -> Path:
+    """The extracted sequence, its `aria/` renamed to `mav0/`."""
     inner = next((p for p in extract_dir.iterdir() if p.is_dir()), None)
     if inner is None:
         raise RuntimeError(f"no extracted directory under {extract_dir}")
@@ -301,6 +313,10 @@ def main() -> int:
     parser.add_argument("--work-dir", type=Path, default=Path("lamaria_submission/work"))
     parser.add_argument("--slam-dir", type=Path, default=Path("lamaria_submission/slam"))
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--stream", action="store_true",
+                        help="extract the ASL zip over HTTP range requests instead of downloading it")
+    parser.add_argument("--log-dir", type=Path,
+                        help="keep each sequence's BA chain step logs under <log-dir>/<sequence>")
     parser.add_argument("--keep-data", action="store_true",
                         help="keep downloaded/extracted sequence data after each run")
     args = parser.parse_args()
@@ -330,17 +346,22 @@ def main() -> int:
             log(f"{seq}: download")
             pinhole = work / "pinhole.json"
             download(f"{BASE_URL}/pinhole_calibrations/{args.split}/{seq}.json", pinhole)
-            zip_path = work / f"{seq}.zip"
-            download(f"{BASE_URL}/asl_folder/{args.split}/{seq}.zip", zip_path)
-
-            log(f"{seq}: extract")
+            zip_url = f"{BASE_URL}/asl_folder/{args.split}/{seq}.zip"
             extract_dir = work / "extracted"
             extract_dir.mkdir(exist_ok=True)
-            try:
-                inner = verify_and_extract(zip_path, extract_dir)
-            except zipfile.BadZipFile:
-                download(f"{BASE_URL}/asl_folder/{args.split}/{seq}.zip", zip_path)
-                inner = verify_and_extract(zip_path, extract_dir)
+            if args.stream:
+                log(f"{seq}: extract over HTTP")
+                http_zip.extract(zip_url, extract_dir, log=lambda m, seq=seq: log(f"{seq}: {m}"))
+                inner = sequence_dir(extract_dir)
+            else:
+                zip_path = work / f"{seq}.zip"
+                download(zip_url, zip_path)
+                log(f"{seq}: extract")
+                try:
+                    inner = verify_and_extract(zip_path, extract_dir)
+                except zipfile.BadZipFile:
+                    download(zip_url, zip_path)
+                    inner = verify_and_extract(zip_path, extract_dir)
 
             refinement = None
             if args.imu_rectify:
@@ -397,6 +418,10 @@ def main() -> int:
         except Exception as error:  # keep the loop going across sequences
             log(f"{seq}: EXCEPTION {error!r}")
         finally:
+            if args.log_dir:
+                for step_log in sorted((work / "ba").glob("*.log")):
+                    (args.log_dir / seq).mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(step_log, args.log_dir / seq / step_log.name)
             # Always reclaim the sequence's download/extract work so a failure
             # cannot accumulate disk across the whole track.
             if not args.keep_data:

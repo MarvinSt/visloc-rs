@@ -4,7 +4,8 @@
 # no zip stored), runs the VIO and the BA chain and uploads `slam/<sequence>.txt`; the last job zips
 # them into the submission. Run it by hand (Actions > LaMAria submission > Run workflow): a training
 # sequence to check a run against the evaluator, or the test split (sequences left empty: all 63).
-# Uploading the zip to https://lamaria.ethz.ch stays by hand.
+# Uploading the zip to https://lamaria.ethz.ch stays by hand. On sequence_1_20 a job takes 38 min
+# (extraction, VIO and the chain) and scores 86.21, as on a workstation (86.20).
 name: LaMAria submission
 
 on:
@@ -23,11 +24,9 @@ on:
         description: Sequences at a time (spares the ETH server)
         type: number
         default: 8
-  push:  # the dry run on one training sequence; removed before the merge
-    branches: [claude/cool-johnson-3obfl8]
 
 env:
-  SPLIT: ${{ github.event_name == 'push' && 'training' || inputs.split }}
+  SPLIT: ${{ inputs.split }}
 
 jobs:
   plan:
@@ -46,7 +45,7 @@ jobs:
       - id: plan
         name: Sequences
         env:
-          SEQUENCES: ${{ github.event_name == 'push' && 'sequence_1_20' || inputs.sequences }}
+          SEQUENCES: ${{ inputs.sequences }}
         run: |
           python -m pip install --quiet --disable-pip-version-check numpy==2.5.3
           python - <<'EOF' >> "$GITHUB_OUTPUT"
@@ -92,7 +91,7 @@ jobs:
     timeout-minutes: 355
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.max_parallel || 8 }}
+      max-parallel: ${{ inputs.max_parallel }}
       matrix:
         sequence: ${{ fromJSON(needs.plan.outputs.sequences) }}
     steps:

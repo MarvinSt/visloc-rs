@@ -93,31 +93,8 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-  probe-ubuntu-26:
-    # PROBE (temporary): which tests differ on Ubuntu 26.04.
-    runs-on: ubuntu-26.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: probe-ubuntu-26
-      - name: Snapshot probe
-        run: |
-          cargo test -p visloc-basalt --test m8f_nfr_session held_out_control -- --nocapture 2>&1 | grep -E "PROBE|panicked|left:|right:|test result" || true
-      - name: Test (no fail fast)
-        run: |
-          cargo test --workspace --all-targets --no-fail-fast 2>&1 | tee test.log | grep -E "FAILED|panicked|test result: FAILED|left:|right:" || true
-
   rust:
-    # Pinned like the toolchain (rust-toolchain.toml): golden outputs such as
-    # basalt's m8f_nfr_session snapshot hash were taken on Ubuntu 24.04, and
-    # ubuntu-latest's Ubuntu 26.04 glibc moves the last bit of some f32 math.
-    # Move to a newer image deliberately, re-pinning what changes.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7

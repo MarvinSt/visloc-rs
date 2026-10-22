@@ -501,16 +501,11 @@ fn canonical_mapper_snapshot_hash(mapper: &NfrMapper) -> u64 {
         "lmdb_observations": lmdb_observations,
         "result": mapper.result(),
     });
-    let bytes = serde_json::to_vec(&snapshot).expect("canonical mapper snapshot");
-    // PROBE: hashes with floats rounded to n significant digits.
-    for digits in [15usize, 12, 10, 9, 8, 7, 6, 5, 4] {
-        let rounded = round_floats(&snapshot, digits);
-        let b = serde_json::to_vec(&rounded).unwrap();
-        let h = b.into_iter().fold(1469598103934665603_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(1099511628211_u64)
-        });
-        eprintln!("PROBE digits={digits} hash={h}");
-    }
+    // Floats to six significant digits: the hash pins the mapper's order
+    // and values, not the platform libm's last bits (Ubuntu 24.04's and
+    // 26.04's glibc differ from the tenth digit on).
+    let rounded = round_floats(&snapshot, 6);
+    let bytes = serde_json::to_vec(&rounded).expect("canonical mapper snapshot");
     bytes
         .into_iter()
         .fold(1469598103934665603_u64, |hash, byte| {
@@ -518,14 +513,20 @@ fn canonical_mapper_snapshot_hash(mapper: &NfrMapper) -> u64 {
         })
 }
 
+/// `value` with every float rounded to `digits` significant digits.
 fn round_floats(value: &Value, digits: usize) -> Value {
     match value {
-        Value::Number(n) if n.is_f64() => {
-            let f = n.as_f64().unwrap();
-            let r: f64 = format!("{:.*e}", digits - 1, f).parse().unwrap();
-            json!(if r == 0.0 { 0.0 } else { r })
+        Value::Number(number) if number.is_f64() => {
+            let float = number.as_f64().expect("an f64 number");
+            let rounded: f64 = format!("{:.*e}", digits - 1, float)
+                .parse()
+                .expect("a formatted float");
+            // One zero, whatever its sign.
+            json!(if rounded == 0.0 { 0.0 } else { rounded })
         }
-        Value::Array(items) => Value::Array(items.iter().map(|v| round_floats(v, digits)).collect()),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|v| round_floats(v, digits)).collect())
+        }
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(k, v)| (k.clone(), round_floats(v, digits)))
@@ -563,7 +564,8 @@ fn held_out_control_lifecycle_binds_order_and_snapshot_hash() {
         canonical_mapper_snapshot_hash(&first),
         // Re-pinned for the LM retry fix (retries re-solve with damped
         // landmark blocks); this control fixture exercises rejected trials.
-        12_831_308_286_871_830_055,
+        // Re-pinned again when the floats were rounded (Ubuntu 26.04).
+        13_691_810_757_751_788_245,
         "held-out control canonical snapshot changed"
     );
     assert_eq!(first.result().poses.len(), 8);

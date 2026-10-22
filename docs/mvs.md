@@ -604,6 +604,29 @@ SfM registered 44 of 45 images, as the replays had (largest centre error
   The other scenes keep their r49 and r50 runs: replays put them within a
   millimetre, except meadow, whose rotations improve, but which is not
   re-measured.
+- **What is left: DSC_9291 and DSC_9292** (local diagnosis on r49a's
+  L4 matches and the converged replays, seeds 0 to 2). The data do not
+  pin these two down, and no mapper setting seen so far would:
+  - **DSC_9291** has 3,698 keypoints, against 8,000 to 11,000 for its
+    neighbours. Its only reliable matches are 172 to DSC_9292, 8 cm away
+    (about 1° of parallax at that depth, below the structure-less
+    parallax rule), and about 11 to DSC_9293. The 101 matches to DSC_9289,
+    DSC_9290 and DSC_9298 are 82 to 98% wrong under the ground truth
+    (median Sampson error 14 to 23 px): repeated structure. Its
+    structure-less tries see 0 to 13 verified tracks and 17 to 159
+    inliers with parallax out of about 200, and are rejected.
+  - **DSC_9292** registers on 83 to 85 points at a median depth of 18.6 m,
+    seen in four views with a median triangulation angle of 3.5°. With the
+    points held fixed, 1 px of noise moves its centre by 0.17 cm, but it
+    sits 1.2 to 1.7 cm off. Its points reproject 0.9 px from the
+    estimated pose and 3.9 to 4.1 px from the ground-truth pose: the far
+    points carry the error, and the pose follows them. Its 172 good
+    matches go to DSC_9291, which is not registered, and would add no
+    parallax if it were.
+  - So the lever is in the matches, not the mapper: more features on
+    DSC_9291, or matches between these two and the registered views
+    that the current matching does not find (guided matching, for
+    example). Neither is tried yet.
 
 ### Against ACMMP on the same GPU
 

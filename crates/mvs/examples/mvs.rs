@@ -13,7 +13,7 @@
 //!     [--save-depth] [--save-maps | --load-maps] [--min-consistent 1] \
 //!     [--max-reproj 2] [--max-depth-diff 0.01] [--max-normal-angle 10] \
 //!     [--min-mean-consistency 0.15] [--no-average] \
-//!     [--deformable] \
+//!     [--deformable] [--deformable-local-refine] [--deformable-strong-median] \
 //!     [--mesh] [--mesh-voxel <world units>] [--mesh-voxel-pixels 1] [--mesh-levels 2] [--mesh-min-weight 1]
 //! ```
 //!
@@ -24,7 +24,10 @@
 //! depths that source views agree with in a TSDF (voxels of one pixel's
 //! footprint by default), extracted with surface nets. `--deformable` adds
 //! APD-MVS's deformable patches for weak-texture pixels at the finer
-//! scales (experimental: below the defaults on ETH3D, see docs/mvs.md).
+//! scales (experimental: below the defaults on ETH3D, see docs/mvs.md);
+//! `--deformable-local-refine` and `--deformable-strong-median` add APD's
+//! local refinement and strong-only median filter to those passes (CPU
+//! only).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -45,6 +48,8 @@ fn main() {
     let fusion_options = FusionOptions::default();
     let mut mesh_options: Option<MeshOptions> = None;
     let mut deformable = false;
+    let mut local_refine = false;
+    let mut strong_median = false;
     let mut geom_passes = 2usize;
     let mut geom_iterations = None;
     let mut scales = 3usize;
@@ -95,6 +100,8 @@ fn main() {
             }
             "--no-average" => fusion_options.average = false,
             "--deformable" => deformable = true,
+            "--deformable-local-refine" => local_refine = true,
+            "--deformable-strong-median" => strong_median = true,
             "--mesh" => {
                 mesh_options.get_or_insert_with(MeshOptions::default);
             }
@@ -143,6 +150,14 @@ fn main() {
     let images = images.expect("--images is required");
     let out = out.expect("--out is required");
     let planar_prior = planar_prior.unwrap_or(true);
+    assert!(
+        deformable || !(local_refine || strong_median),
+        "--deformable-local-refine and --deformable-strong-median need --deformable"
+    );
+    assert!(
+        !(use_gpu && (local_refine || strong_median)),
+        "--deformable-local-refine and --deformable-strong-median run on the CPU only"
+    );
     let restorer = match restorer.as_str() {
         "infinity" => DetailRestorer::Infinity(detail_threshold),
         "start" => DetailRestorer::Start(detail_threshold),
@@ -228,7 +243,11 @@ fn main() {
             .collect()
     } else if scales > 1 {
         let options = MultiScaleOptions {
-            deformable: deformable.then(Deformable::default),
+            deformable: deformable.then(|| Deformable {
+                local_refine,
+                strong_median,
+                ..Deformable::default()
+            }),
             geom_iterations: geom_iterations.unwrap_or(pm_options.iterations),
             patch_match: pm_options,
             scales,

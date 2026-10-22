@@ -106,9 +106,11 @@ jobs:
         with:
           key: probe-ubuntu-26
       - name: Snapshot probe
-        run: cargo test -p visloc-basalt --test m8f_nfr_session held_out_control -- --nocapture 2>&1 | grep -E "PROBE|panicked|left:|right:|test result" || true
+        run: |
+          cargo test -p visloc-basalt --test m8f_nfr_session held_out_control -- --nocapture 2>&1 | grep -E "PROBE|panicked|left:|right:|test result" || true
       - name: Test (no fail fast)
-        run: cargo test --workspace --all-targets --no-fail-fast 2>&1 | tee test.log | grep -E "FAILED|panicked|test result: FAILED|left:|right:" || true
+        run: |
+          cargo test --workspace --all-targets --no-fail-fast 2>&1 | tee test.log | grep -E "FAILED|panicked|test result: FAILED|left:|right:" || true
 
   rust:
     # Pinned like the toolchain (rust-toolchain.toml): golden outputs such as

@@ -807,6 +807,32 @@ only the anchors' planes and a plane fitted to them. On an L4 at
 - **Time:** about 3.5 times the defaults on these scenes (12 and 14
   minutes with the debug statistics on).
 
+**Two more parts of APD's pipeline** (CPU only, on top of
+`--deformable`; [notes](apd_mvs_code_notes.md), §5.2 and §5.3):
+`--deformable-local-refine` moves each pixel's depth, after every
+deformable pass, to the lowest cost within 5 disparity steps along its
+ray if that beats its own by 0.1. `--deformable-strong-median` makes the
+median filter of a deformable pass leave weak pixels alone and take the
+median of a pixel and its strong neighbours (ACMM's 20-pixel pattern)
+instead of the 5×5 median of every depth. office pre-resized to 400 px,
+ground-truth poses, CPU (4 threads), F1 at 1, 2 and 5 cm:
+
+| Run | F1 | Accuracy / completeness at 2 cm | Time |
+|---|---|---|---|
+| Defaults | 23.9 / 38.5 / 58.2% | 80.2 / 25.3% | 585 s |
+| `--deformable` | 21.9 / 36.3 / 54.5% | 73.9 / 24.0% | 1033 s |
+| `--deformable`, local refinement | 21.8 / 36.2 / 54.6% | 74.8 / 23.9% | 1066 s |
+| `--deformable`, strong median | 24.0 / **38.7** / 58.3% | 77.6 / 25.8% | 1043 s |
+| `--deformable`, both | 23.6 / 38.3 / 58.3% | 77.7 / 25.4% | 1046 s |
+
+- **The strong median recovers what the deformable patches lose** (+2.4
+  points at 2 cm), most of it accuracy: the 5×5 median mixed the weak
+  pixels' depths into their strong neighbours'. It ends 0.2 point above
+  the defaults, within run-to-run noise, in 1.8 times the time.
+- **Local refinement does nothing here**, alone or with the median.
+- These are 400 px runs on one scene. Whether the strong median pays at
+  3200 px needs it on the GPU path, which it is not yet.
+
 ### Fusion settings
 
 The same depth maps fused with different rules (CPU runs with one

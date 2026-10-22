@@ -6,6 +6,17 @@ All notable changes to `visloc-rs` will be documented here.
 
 ### Added
 
+- **`visloc-mvs`: two more parts of APD-MVS's pipeline for
+  `--deformable`** (CPU only, off by default).
+  `--deformable-local-refine` (`Deformable::local_refine`) moves each
+  pixel's depth after a deformable pass to the lowest cost within 5
+  disparity steps if that beats its own by 0.1.
+  `--deformable-strong-median` (`Deformable::strong_median`) makes a
+  deformable pass's median filter skip weak pixels and use only strong
+  neighbours. On office at 400 px (CPU), F1 at 2 cm: defaults 38.5%,
+  `--deformable` 36.3%, with the strong median 38.7%, with local
+  refinement 36.2%; details in `docs/mvs.md`.
+
 - **`gsplat_train` on an existing equirectangular COLMAP model** (#301).
   `load_colmap_dataset` (`visloc_gsplat_train::dataset`) now takes models
   whose camera is `EQUIRECTANGULAR` (model 17, parameters `width, height`),
